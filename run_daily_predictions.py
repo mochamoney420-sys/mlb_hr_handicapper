@@ -28,7 +28,7 @@ urllib.request.install_opener(opener)
 # SECTION 2: FETCH LIVE ROBUST HISTORICAL HISTORIES
 # =====================================================================
 def get_advanced_hr_metrics(days_back=60):
-    """Pulls Statcast data day-by-day, caches locally, and handles server errors safely."""
+    """Pulls Statcast data, applies Empirical Bayes shrinkage math to protect small samples."""
     cache_dir = "cache"
     os.makedirs(cache_dir, exist_ok=True)
     
@@ -73,22 +73,56 @@ def get_advanced_hr_metrics(days_back=60):
     pa_df['is_hard_hit'] = (pa_df['launch_speed'] >= 95).astype(int)
     pa_df['is_pa'] = 1
     
+    # -----------------------------------------------------------------
+    # CALCULATE LEAGUE WIDE BASELINE CONSTANTS (μ)
+    # -----------------------------------------------------------------
+    league_hr_mu = pa_df['is_hr'].mean()          # Around 0.032
+    league_barrel_mu = pa_df['is_barrel'].mean()  # Around 0.075
+    league_hard_hit_mu = pa_df['is_hard_hit'].mean() # Around 0.380
+    alpha = 75.0                                  # 75 PA Stabilization Floor
+    
+    # Aggregate raw player profiles
     batter_summary = pa_df.groupby(['batter', 'has_platoon_advantage']).agg(
         bat_pa_count=('is_pa', 'sum'), bat_hr_count=('is_hr', 'sum'),
         bat_barrel_count=('is_barrel', 'sum'), bat_hard_hit_count=('is_hard_hit', 'sum'),
         bat_avg_launch_angle=('launch_angle', 'mean')
     ).reset_index()
-    batter_summary['bat_hr_per_pa'] = batter_summary['bat_hr_count'] / batter_summary['bat_pa_count']
-    batter_summary['bat_barrel_per_pa'] = batter_summary['bat_barrel_count'] / batter_summary['bat_pa_count']
-    batter_summary['bat_hard_hit_per_pa'] = batter_summary['bat_hard_hit_count'] / batter_summary['bat_pa_count']
     
+    # -----------------------------------------------------------------
+    # SOLVE STRUCTURAL MATH FOR BATTER SHRINKAGE REGULARIZATION
+    # -----------------------------------------------------------------
+    batter_summary['bat_hr_per_pa'] = (
+        (batter_summary['bat_hr_count'] + (alpha * league_hr_mu)) / 
+        (batter_summary['bat_pa_count'] + alpha)
+    )
+    batter_summary['bat_barrel_per_pa'] = (
+        (batter_summary['bat_barrel_count'] + (alpha * league_barrel_mu)) / 
+        (batter_summary['bat_pa_count'] + alpha)
+    )
+    batter_summary['bat_hard_hit_per_pa'] = (
+        (batter_summary['bat_hard_hit_count'] + (alpha * league_hard_hit_mu)) / 
+        (batter_summary['bat_pa_count'] + alpha)
+    )
+    
+    # Aggregate raw pitcher profiles
     pitcher_summary = pa_df.groupby(['pitcher', 'stand']).agg(
         pit_pa_count=('is_pa', 'sum'), pit_hr_allowed=('is_hr', 'sum'), pit_barrel_allowed=('is_barrel', 'sum')
     ).reset_index()
-    pitcher_summary['pit_hr_per_pa'] = pitcher_summary['pit_hr_allowed'] / pitcher_summary['pit_pa_count']
-    pitcher_summary['pit_barrel_per_pa'] = pitcher_summary['pit_barrel_allowed'] / pitcher_summary['pit_pa_count']
+    
+    # -----------------------------------------------------------------
+    # SOLVE STRUCTURAL MATH FOR PITCHER SHRINKAGE REGULARIZATION
+    # -----------------------------------------------------------------
+    pitcher_summary['pit_hr_per_pa'] = (
+        (pitcher_summary['pit_hr_allowed'] + (alpha * league_hr_mu)) / 
+        (pitcher_summary['pit_pa_count'] + alpha)
+    )
+    pitcher_summary['pit_barrel_per_pa'] = (
+        (pitcher_summary['pit_barrel_allowed'] + (alpha * league_barrel_mu)) / 
+        (pitcher_summary['pit_pa_count'] + alpha)
+    )
     
     return batter_summary, pitcher_summary, pa_df
+
 
 # =====================================================================
 # SECTION 3: DAILY STARTING LINEUPS INJECTION
