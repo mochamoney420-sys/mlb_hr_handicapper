@@ -36,3 +36,15 @@ def train_hr_model(model_data):
     
     print("Model training complete!")
     return hr_model
+# ... (rest of your code above stays the same)
+
+    # 4. Train the model on your dataset
+    hr_model.fit(X_train, y_train)
+    
+    # ADD THESE LINES HERE TO SAVE IT:
+    import os
+    os.makedirs('data', exist_ok=True)
+    hr_model.save_model("data/latest_hr_model.json")
+    
+    print("Model training complete and saved to data/latest_hr_model.json!")
+    return hr_model
