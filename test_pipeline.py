@@ -1,7 +1,15 @@
 # test_pipeline.py
+import os
+import sys
+from pathlib import Path
+
 import pandas as pd
-from src.model import train_hr_model
-from src.alerts import alert_discord
+
+repo_root = Path(__file__).resolve().parent
+sys.path.insert(0, str(repo_root / "src"))
+
+from model import train_hr_model
+from alerts import alert_discord
 
 if __name__ == "__main__":
     print("🤖 Simulating 2025-2026 Statcast Data for Quick Test...")

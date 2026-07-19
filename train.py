@@ -1,14 +1,24 @@
-# run_daily_predictions.py
-import sys
+## CORRECT
 import datetime
 from pathlib import Path
-
-# Fix python paths before importing local modules
-sys.path.append(str(Path(__file__).resolve().parent))
+import importlib.util
 
 import xgboost as xgb
-from src.scraper import get_daily_statcast_baselines
-from src.model import train_hr_model
+
+def import_module_from_file(module_name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+project_root = Path(__file__).resolve().parent
+src_dir = project_root / "src"
+
+scraper = import_module_from_file("src.scraper", src_dir / "scraper.py")
+model = import_module_from_file("src.model", src_dir / "model.py")
+
+get_daily_statcast_baselines = scraper.get_daily_statcast_baselines
+train_hr_model = model.train_hr_model
 
 if __name__ == "__main__":
     today = datetime.datetime.today().weekday()

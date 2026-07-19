@@ -1,18 +1,15 @@
-# TOP OF THE FILE
 import sys
+import datetime
 from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parent))
 
-# NOW your local imports will never break!
+import xgboost as xgb
+
 root_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(root_dir))
 sys.path.insert(0, str(root_dir / "src"))
 
 from scraper import get_daily_statcast_baselines
 from model import train_hr_model
-
-# run_daily_predictions.py
-import datetime
-import xgboost as xgb
 
 if __name__ == "__main__":
     # Check if today is Monday (0 = Monday, 1 = Tuesday... 6 = Sunday)
@@ -33,18 +30,3 @@ if __name__ == "__main__":
         hr_model.load_model(str(model_path))
         
     print("🚀 Model is ready for today's predictions!")
-
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Python: Current File",
-      "type": "python",
-      "request": "launch",
-      "program": "${file}",
-      "env": {
-        "PYTHONPATH": "${workspaceFolder}"
-      }
-    }
-  ]
-}
