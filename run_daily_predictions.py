@@ -202,7 +202,7 @@ except Exception as e:
 SECTION 6: AUTOMATED EXECUTION CORE
 
 =====================================================================
-if name == "main":
+if __name__ == "__main__":
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1528513802881073313/xVsb81UEWitAaR5vbiVbyP3XHkL2XVzG8ATTSlz3Q9IYt-EbhQUTCmiRK5IHFFEivuj0")
 print("🚀 Initializing Verified Live MLB Learning Pipeline...")
 try:
