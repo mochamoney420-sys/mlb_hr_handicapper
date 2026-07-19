@@ -7,18 +7,15 @@ import requests
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+import mlbgame  # Optional backup
 try:
-    import mlbgame  # Optional backup
-except Exception:
-    mlbgame = None
-try:
-    import statsapi as statsapi
+    import statsapi
 except ImportError:
-    try:
-        import mlbstatsapi as statsapi
-    except ImportError:
-        statsapi = None
+    statsapi = None
 from datetime import datetime, timedelta
+
+if statsapi is None:
+    raise ImportError("'statsapi' package not found. Please install it with: pip install statsapi")
 from pybaseball import statcast
 
 # Fix Pybaseball/Savant blocking by forcing a global browser user-agent header
@@ -134,10 +131,7 @@ def get_today_live_lineups():
             'player_name': 'Aaron Judge', 'batter': 592450, 'stand': 'R', 'pitcher': 669203, 'p_throws': 'L'
         }])
         
-    # If no matchups found, return a small mock row instead of recursing indefinitely
-    return pd.DataFrame(matchup_rows) if matchup_rows else pd.DataFrame([{
-        'player_name': 'Aaron Judge', 'batter': 592450, 'stand': 'R', 'pitcher': 669203, 'p_throws': 'L'
-    }])
+    return pd.DataFrame(matchup_rows) if matchup_rows else get_today_live_lineups()
 
 # =====================================================================
 # SECTION 4: DATA COMPILATION & MACHINE LEARNING MODEL
@@ -172,8 +166,7 @@ def alert_to_discord(webhook_url, message_content):
 # SECTION 6: AUTOMATED MODEL EXECUTION CORE
 # =====================================================================
 if __name__ == "__main__":
-    # Read webhook from environment variable DISCORD_WEBHOOK, fallback to placeholder
-    DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "YOUR_ID_HERE")
+    DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1525525618861543654/jBzZ7vTarJs-j2apC7Ws2M29cF5aaJ9-0JkvdyyK9aJUJRziU9MXqfHyzx0roW4HVHIZ")
     print("🚀 Initializing Live MLB HR Prediction System Workflow...")
     
     try:
@@ -203,4 +196,4 @@ if __name__ == "__main__":
             
         alert_to_discord(DISCORD_WEBHOOK, alert_msg)
     except Exception as e:
-        print(f"Runtime failure during daily prediction run: {e}")
+        print(f"Error running MLB HR prediction workflow: {e}")
