@@ -235,7 +235,6 @@ def generate_daily_predictions():
     X_live = live[features]
     probs = model.predict_proba(X_live)[:, 1]
     live['pred_hr_prob'] = probs
-
     # Sort and present elite values
     rankings = live[['batter_name', 'pitcher_name', 'pred_hr_prob']].rename(columns={'pred_hr_prob': 'hr_probability'})
     top_5 = rankings.sort_values(by='hr_probability', ascending=False).head(5).reset_index(drop=True)
