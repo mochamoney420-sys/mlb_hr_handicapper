@@ -8,8 +8,9 @@ import MLB
 import requests
 import pandas as pd
 import numpy as np
-import xgboost as xgb
 import statsapi
+import xgboost as xgb
+import mlbstatsapi
 from datetime import datetime, timedelta
 from pybaseball import statcast
 
