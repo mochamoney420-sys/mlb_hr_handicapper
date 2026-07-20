@@ -23,67 +23,67 @@ urllib.request.install_opener(opener)
 # SECTION 2: ADAPTIVE STATCAST DATA TRACKING WITH SHRINKAGE
 # =====================================================================
 def get_advanced_hr_metrics(days_back=60):
-	cache_dir = "cache"
-	os.makedirs(cache_dir, exist_ok=True)
-	all_days_data = []
-	today = datetime.today()
+    cache_dir = "cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    all_days_data = []
+    today = datetime.today()
+    
+    print(f"Syncing player matrices from the last {days_back} days...")
+    for i in range(1, days_back + 1):
+        target_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+        cache_file = os.path.join(cache_dir, f"statcast_{target_date}.csv")
+        
+        if os.path.exists(cache_file):
+            all_days_data.append(pd.read_csv(cache_file))
+            continue
+        
+        try:
+            day_df = statcast(start_dt=target_date, end_dt=target_date)
+            if day_df is not None and not day_df.empty:
+                day_df.to_csv(cache_file, index=False)
+                all_days_data.append(day_df)
+            time.sleep(1.5)
+        except Exception:
+            continue
+    
+    if not all_days_data:
+        raise ValueError("Critical Error: Missing base training vectors.")
+    
+    df = pd.concat(all_days_data, ignore_index=True)
+    # process plate appearances and compute shrinkage-adjusted rates
+    pa_df = df.dropna(subset=['events']).drop_duplicates(subset=['game_pk', 'batter', 'at_bat_number']).copy()
+    pa_df['has_platoon_advantage'] = (pa_df['stand'] != pa_df['p_throws']).astype(int)
 
-	print(f"Syncing historical metrics from the last {days_back} days...")
-	for i in range(1, days_back + 1):
-		target_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
-		cache_file = os.path.join(cache_dir, f"statcast_{target_date}.csv")
+    pa_df['launch_speed'] = pd.to_numeric(pa_df['launch_speed'], errors='coerce').fillna(0)
+    pa_df['launch_angle'] = pd.to_numeric(pa_df['launch_angle'], errors='coerce').fillna(0)
+    pa_df['is_hr'] = (pa_df['events'] == 'home_run').astype(int)
+    pa_df['is_barrel'] = ((pa_df['launch_speed'] >= 98) & (pa_df['launch_angle'] >= 4) &
+                          (pa_df['launch_angle'] <= 50) & ((pa_df['launch_speed'] * 1.5 - pa_df['launch_angle']) >= 117)).astype(int)
+    pa_df['is_hard_hit'] = (pa_df['launch_speed'] >= 95).astype(int)
+    pa_df['is_pa'] = 1
 
-		if os.path.exists(cache_file):
-			all_days_data.append(pd.read_csv(cache_file))
-			continue
+    league_hr_mu = pa_df['is_hr'].mean()
+    league_barrel_mu = pa_df['is_barrel'].mean()
+    league_hard_hit_mu = pa_df['is_hard_hit'].mean()
+    alpha = 75.0
 
-		try:
-			day_df = statcast(start_dt=target_date, end_dt=target_date)
-			if day_df is not None and not day_df.empty:
-				day_df.to_csv(cache_file, index=False)
-				all_days_data.append(day_df)
-			time.sleep(1)
-		except Exception:
-			continue
+    batter_summary = pa_df.groupby(['batter', 'has_platoon_advantage']).agg(
+        bat_pa_count=('is_pa', 'sum'), bat_hr_count=('is_hr', 'sum'),
+        bat_barrel_count=('is_barrel', 'sum'), bat_hard_hit_count=('is_hard_hit', 'sum'),
+        bat_avg_launch_angle=('launch_angle', 'mean')
+    ).reset_index()
 
-	if not all_days_data:
-		raise ValueError("Critical Error: Missing training baseline vectors.")
+    batter_summary['bat_hr_per_pa'] = (batter_summary['bat_hr_count'] + (alpha * league_hr_mu)) / (batter_summary['bat_pa_count'] + alpha)
+    batter_summary['bat_barrel_per_pa'] = (batter_summary['bat_barrel_count'] + (alpha * league_barrel_mu)) / (batter_summary['bat_pa_count'] + alpha)
+    batter_summary['bat_hard_hit_per_pa'] = (batter_summary['bat_hard_hit_count'] + (alpha * league_hard_hit_mu)) / (batter_summary['bat_pa_count'] + alpha)
 
-	df = pd.concat(all_days_data, ignore_index=True)
-	pa_df = df.dropna(subset=['events']).drop_duplicates(subset=['game_pk', 'batter', 'at_bat_number']).copy()
-	pa_df['has_platoon_advantage'] = (pa_df['stand'] != pa_df['p_throws']).astype(int)
+    pitcher_summary = pa_df.groupby(['pitcher', 'stand']).agg(
+        pit_pa_count=('is_pa', 'sum'), pit_hr_allowed=('is_hr', 'sum'), pit_barrel_allowed=('is_barrel', 'sum')
+    ).reset_index()
 
-	pa_df['launch_speed'] = pd.to_numeric(pa_df['launch_speed'], errors='coerce').fillna(0)
-	pa_df['launch_angle'] = pd.to_numeric(pa_df['launch_angle'], errors='coerce').fillna(0)
-	pa_df['is_hr'] = (pa_df['events'] == 'home_run').astype(int)
-	pa_df['is_barrel'] = ((pa_df['launch_speed'] >= 98) & (pa_df['launch_angle'] >= 4) &
-						  (pa_df['launch_angle'] <= 50) & ((pa_df['launch_speed'] * 1.5 - pa_df['launch_angle']) >= 117)).astype(int)
-	pa_df['is_hard_hit'] = (pa_df['launch_speed'] >= 95).astype(int)
-	pa_df['is_pa'] = 1
-
-	league_hr_mu = pa_df['is_hr'].mean()
-	league_barrel_mu = pa_df['is_barrel'].mean()
-	league_hard_hit_mu = pa_df['is_hard_hit'].mean()
-	alpha = 75.0
-
-	batter_summary = pa_df.groupby(['batter', 'has_platoon_advantage']).agg(
-		bat_pa_count=('is_pa', 'sum'), bat_hr_count=('is_hr', 'sum'),
-		bat_barrel_count=('is_barrel', 'sum'), bat_hard_hit_count=('is_hard_hit', 'sum'),
-		bat_avg_launch_angle=('launch_angle', 'mean')
-	).reset_index()
-
-	batter_summary['bat_hr_per_pa'] = (batter_summary['bat_hr_count'] + (alpha * league_hr_mu)) / (batter_summary['bat_pa_count'] + alpha)
-	batter_summary['bat_barrel_per_pa'] = (batter_summary['bat_barrel_count'] + (alpha * league_barrel_mu)) / (batter_summary['bat_pa_count'] + alpha)
-	batter_summary['bat_hard_hit_per_pa'] = (batter_summary['bat_hard_hit_count'] + (alpha * league_hard_hit_mu)) / (batter_summary['bat_pa_count'] + alpha)
-
-	pitcher_summary = pa_df.groupby(['pitcher', 'stand']).agg(
-		pit_pa_count=('is_pa', 'sum'), pit_hr_allowed=('is_hr', 'sum'), pit_barrel_allowed=('is_barrel', 'sum')
-	).reset_index()
-
-	pitcher_summary['pit_hr_per_pa'] = (pitcher_summary['pit_hr_allowed'] + (alpha * league_hr_mu)) / (pitcher_summary['pit_pa_count'] + alpha)
-	pitcher_summary['pit_barrel_per_pa'] = (pitcher_summary['pit_barrel_allowed'] + (alpha * league_barrel_mu)) / (pitcher_summary['pit_pa_count'] + alpha)
-
-	return batter_summary, pitcher_summary, pa_df
+    pitcher_summary['pit_hr_per_pa'] = (pitcher_summary['pit_hr_allowed'] + (alpha * league_hr_mu)) / (pitcher_summary['pit_pa_count'] + alpha)
+    pitcher_summary['pit_barrel_per_pa'] = (pitcher_summary['pit_barrel_allowed'] + (alpha * league_barrel_mu)) / (pitcher_summary['pit_pa_count'] + alpha)
+    return batter_summary, pitcher_summary, pa_df
 
 # =====================================================================
 # SECTION 3: LINEUPS INTERFACE
