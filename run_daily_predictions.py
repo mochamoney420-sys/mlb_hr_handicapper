@@ -251,7 +251,7 @@ def generate_daily_predictions():
     # =====================================================================
     # DISCORD WEBHOOK INTEGRATION
     # =====================================================================
-    WEBHOOK_URL = os.getenv("DISCORD_MLB_WEBHOOK", "YOUR_DISCORD_WEBHOOK_URL_HERE")
+    WEBHOOK_URL = os.getenv("DISCORD_MLB_WEBHOOK", "YOhttps://discord.com/api/webhooks/1525525618861543654/jBzZ7vTarJs-j2apC7Ws2M29cF5aaJ9-0JkvdyyK9aJUJRziU9MXqfHyzx0roW4HVHIZ")
 
     if WEBHOOK_URL != "YOUR_DISCORD_WEBHOOK_URL_HERE":
         # Format rows for markdown table presentation
