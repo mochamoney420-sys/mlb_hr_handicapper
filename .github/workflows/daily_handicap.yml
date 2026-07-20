@@ -25,7 +25,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install pandas numpy xgboost requests pybaseball
 
+    - name: Install dependencies
+      run: |
+        pip install MLB-StatsAPI 
     - name: Execute handicapping model script
       env:
-        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        DISCORD_WEBHOOK_URL: "${{ secrets.DISCORD_WEBHOOK_URL }}"
       run: python run_daily_predictions.py
