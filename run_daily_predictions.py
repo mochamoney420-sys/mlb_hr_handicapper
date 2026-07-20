@@ -4,10 +4,21 @@
 # =====================================================================
 import os
 import time
-import requests
+import json as _json
+try:
+    import requests
+except ImportError:
+    requests = None
 import pandas as pd
 import statsapi
-import xgboost as xgb
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+    except ImportError:
+        RandomForestClassifier = None
 from datetime import datetime, timedelta
 from pybaseball import statcast
 
@@ -16,6 +27,32 @@ import urllib.request
 opener = urllib.request.build_opener()
 opener.addheaders = [('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')]
 urllib.request.install_opener(opener)
+
+if requests is None:
+    class _RequestsFallback:
+        @staticmethod
+        def get(url, timeout=5):
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                text = response.read().decode('utf-8')
+                class Resp:
+                    def __init__(self, text, status_code):
+                        self.text = text
+                        self.status_code = status_code
+                    def json(self):
+                        return _json.loads(self.text)
+                return Resp(text, response.getcode())
+
+        @staticmethod
+        def post(url, json=None, timeout=5):
+            body = _json.dumps(json).encode('utf-8') if json is not None else None
+            req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                class Resp:
+                    def __init__(self, status_code):
+                        self.status_code = status_code
+                return Resp(response.getcode())
+
+    requests = _RequestsFallback()
 
 # =====================================================================
 # HARDCODED STATIC LOOKUPS: PARK FACTORS (3-Year HR Multipliers)
@@ -214,7 +251,21 @@ def generate_daily_predictions():
     X_train = train_df[features]
     y_train = train_df['is_hr']
     
-    model = xgb.XGBClassifier(n_estimators=150, max_depth=5, learning_rate=0.04, eval_metric='logloss')
+    if xgb is not None:
+        model = xgb.XGBClassifier(
+            n_estimators=150,
+            max_depth=5,
+            learning_rate=0.04,
+            eval_metric='logloss'
+        )
+    elif RandomForestClassifier is not None:
+        model = RandomForestClassifier(
+            n_estimators=150,
+            max_depth=5,
+            random_state=42
+        )
+    else:
+        raise ImportError("Missing required ML package: install xgboost or scikit-learn.")
     model.fit(X_train, y_train)
     
     live_matchups = get_today_matchups()

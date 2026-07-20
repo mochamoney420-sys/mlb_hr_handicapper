@@ -3,5 +3,6 @@
         "${workspaceFolder}",
         "./src/src",
         "./src"
-    ]
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }
