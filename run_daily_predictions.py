@@ -2,15 +2,12 @@
 # =====================================================================
 # SECTION 1: IMPORTS
 # =====================================================================
-import mlb
 import os
 import time
 import requests
 import pandas as pd
-import numpy as np
 import statsapi
 import xgboost as xgb
-import mlbstatsapi
 from datetime import datetime, timedelta
 from pybaseball import statcast
 
