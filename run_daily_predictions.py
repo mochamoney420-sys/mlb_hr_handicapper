@@ -236,5 +236,48 @@ def generate_daily_predictions():
     probs = model.predict_proba(X_live)[:, 1]
     live['pred_hr_prob'] = probs
 
+    # Sort and present elite values
+    rankings = live[['batter_name', 'pitcher_name', 'pred_hr_prob']].rename(columns={'pred_hr_prob': 'hr_probability'})
+    top_5 = rankings.sort_values(by='hr_probability', ascending=False).head(5).reset_index(drop=True)
+
+    print("\nTop 5 Daily Projected HR Probabilities:")
+    print(top_5.to_string(index=False))
+
+    # =====================================================================
+    # DISCORD WEBHOOK INTEGRATION
+    # =====================================================================
+    WEBHOOK_URL = os.getenv("DISCORD_MLB_WEBHOOK", "YOUR_DISCORD_WEBHOOK_URL_HERE")
+
+    if WEBHOOK_URL != "YOUR_DISCORD_WEBHOOK_URL_HERE":
+        # Format rows for markdown table presentation
+        table_rows = []
+        for _, row in top_5.iterrows():
+            pct = f"{row['hr_probability'] * 100:.1f}%"
+            table_rows.append(f"| {row['batter_name'][:18]:<18} | {row['pitcher_name'][:18]:<18} | {pct:<6} |")
+
+        table_str = "\n".join(table_rows)
+
+        # Build a structured Discord code-block message
+        message_content = (
+            "**⚾ Today's Top 5 MLB Home Run Predictions**\n"
+            "```\n"
+            f"| {'Batter':<18} | {'Pitcher':<18} | {'Prob':<6} |\n"
+            f"|{'-'*20}|{'-'*20}|{'-'*8}|\n"
+            f"{table_str}\n"
+            "```"
+        )
+
+        try:
+            response = requests.post(WEBHOOK_URL, json={"content": message_content}, timeout=5)
+            if response.status_code == 204:
+                print("Successfully sent predictions to Discord.")
+            else:
+                print(f"Discord returned unexpected status: {response.status_code}")
+        except Exception as e:
+            print(f"Failed to transmit data to Discord webhook: {e}")
+
     # Return sorted predictions
     return live.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
+
+if __name__ == "__main__":
+	generate_daily_predictions()
