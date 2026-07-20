@@ -1,4 +1,4 @@
-"""Run daily predictions for MLB HR model."""
+"""Run daily predictions for MLB HR model with Weather and Park Factors."""
 # =====================================================================
 # SECTION 1: IMPORTS
 # =====================================================================
@@ -19,212 +19,222 @@ opener.addheaders = [('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) A
 urllib.request.install_opener(opener)
 
 # =====================================================================
+# HARDCODED STATIC LOOKUPS: PARK FACTORS (3-Year HR Multipliers)
+# =====================================================================
+# 100 is baseline. >100 favors hitters, <100 favors pitchers.
+PARK_HR_FACTORS = {
+    'ARI': 94,  'ATL': 102, 'BAL': 95,  'BOS': 92,  'CHC': 105,
+    'CWS': 112, 'CIN': 128, 'CLE': 104, 'COL': 114, 'DET': 88,
+    'HOU': 106, 'KC': 84,   'LAA': 108, 'LAD': 115, 'MIA': 85,
+    'MIL': 113, 'MIN': 99,  'NYM': 90,  'NYY': 116, 'OAK': 82,
+    'PHI': 114, 'PIT': 89,  'SD': 91,   'SF': 76,   'SEA': 92,
+    'STL': 89,  'TB': 93,   'TEX': 105, 'TOR': 101, 'WSH': 103
+}
+
+# Map StatCast Venue strings to team abbreviations for matrix matching
+VENUE_MAP = {
+    'Chase Field': 'ARI', 'Truist Park': 'ATL', 'Oriole Park at Camden Yards': 'BAL',
+    'Fenway Park': 'BOS', 'Wrigley Field': 'CHC', 'Guaranteed Rate Field': 'CWS',
+    'Great American Ball Park': 'CIN', 'Progressive Field': 'CLE', 'Coors Field': 'COL',
+    'Comerica Park': 'DET', 'Minute Maid Park': 'HOU', 'Kauffman Stadium': 'KC',
+    'Angel Stadium': 'LAA', 'Dodger Stadium': 'LAD', 'LoanDepot Park': 'MIA',
+    'American Family Field': 'MIL', 'Target Field': 'MIN', 'Citi Field': 'NYM',
+    'Yankee Stadium': 'NYY', 'Oakland Coliseum': 'OAK', 'Citizens Bank Park': 'PHI',
+    'PNC Park': 'PIT', 'Petco Park': 'SD', 'Oracle Park': 'SF', 'T-Mobile Park': 'SEA',
+    'Busch Stadium': 'STL', 'Tropicana Field': 'TB', 'Globe Life Field': 'TEX',
+    'Rogers Centre': 'TOR', 'Nationals Park': 'WSH'
+}
+
+# =====================================================================
+# HELPER: DYNAMIC LIVE WEATHER PARSER
+# =====================================================================
+def get_live_weather(lat, lon):
+    """Fetches real-time localized metrics using Open-Meteo API."""
+    try:
+        url = f"https://open-meteo.com{lat}&longitude={lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m&temperature_unit=fahrenheit&wind_speed_unit=mph"
+        res = requests.get(url, timeout=5).json()
+        current = res.get('current', {})
+        return {
+            'temp': current.get('temperature_2m', 70),
+            'wind_speed': current.get('wind_speed_10m', 0),
+            'wind_dir': current.get('wind_direction_10m', 0)
+        }
+    except Exception:
+        return {'temp': 70, 'wind_speed': 0, 'wind_dir': 0}
+
+# =====================================================================
 # SECTION 2: ADAPTIVE HISTORICAL FEATURES SOURCING
 # =====================================================================
 def get_advanced_hr_metrics(days_back=60):
-	cache_dir = "cache"
-	os.makedirs(cache_dir, exist_ok=True)
-	all_days_data = []
-	today = datetime.today()
+    cache_dir = "cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    all_days_data = []
+    today = datetime.today()
 
-	print(f"Syncing historical metrics from the last {days_back} days...")
-	for i in range(1, days_back + 1):
-		target_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
-		cache_file = os.path.join(cache_dir, f"statcast_{target_date}.csv")
+    print(f"Syncing historical metrics from the last {days_back} days...")
+    for i in range(1, days_back + 1):
+        target_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+        cache_file = os.path.join(cache_dir, f"statcast_{target_date}.csv")
 
-		if os.path.exists(cache_file):
-			all_days_data.append(pd.read_csv(cache_file))
-			continue
+        if os.path.exists(cache_file):
+            all_days_data.append(pd.read_csv(cache_file))
+            continue
 
-		try:
-			day_df = statcast(start_dt=target_date, end_dt=target_date)
-			if day_df is not None and not day_df.empty:
-				day_df.to_csv(cache_file, index=False)
-				all_days_data.append(day_df)
-			time.sleep(1)
-		except Exception:
-			continue
+        try:
+            day_df = statcast(start_dt=target_date, end_dt=target_date)
+            if day_df is not None and not day_df.empty:
+                day_df.to_csv(cache_file, index=False)
+                all_days_data.append(day_df)
+            time.sleep(1)
+        except Exception:
+            continue
 
-	if not all_days_data:
-		raise ValueError("Critical Error: Missing training baseline vectors.")
+    if not all_days_data:
+        raise ValueError("Critical Error: Missing training baseline vectors.")
 
-	df = pd.concat(all_days_data, ignore_index=True)
-	pa_df = df.dropna(subset=['events']).drop_duplicates(subset=['game_pk', 'batter', 'at_bat_number']).copy()
-	pa_df['has_platoon_advantage'] = (pa_df['stand'] != pa_df['p_throws']).astype(int)
+    df = pd.concat(all_days_data, ignore_index=True)
+    pa_df = df.dropna(subset=['events']).drop_duplicates(subset=['game_pk', 'batter', 'at_bat_number']).copy()
+    pa_df['has_platoon_advantage'] = (pa_df['stand'] != pa_df['p_throws']).astype(int)
 
-	pa_df['launch_speed'] = pd.to_numeric(pa_df['launch_speed'], errors='coerce').fillna(0)
-	pa_df['launch_angle'] = pd.to_numeric(pa_df['launch_angle'], errors='coerce').fillna(0)
-	pa_df['is_hr'] = (pa_df['events'] == 'home_run').astype(int)
-	pa_df['is_barrel'] = ((pa_df['launch_speed'] >= 98) & (pa_df['launch_angle'] >= 4) &
-						  (pa_df['launch_angle'] <= 50) & ((pa_df['launch_speed'] * 1.5 - pa_df['launch_angle']) >= 117)).astype(int)
-	pa_df['is_hard_hit'] = (pa_df['launch_speed'] >= 95).astype(int)
-	pa_df['is_pa'] = 1
+    pa_df['launch_speed'] = pd.to_numeric(pa_df['launch_speed'], errors='coerce').fillna(0)
+    pa_df['launch_angle'] = pd.to_numeric(pa_df['launch_angle'], errors='coerce').fillna(0)
+    pa_df['is_hr'] = (pa_df['events'] == 'home_run').astype(int)
 
-	league_hr_mu = pa_df['is_hr'].mean()
-	league_barrel_mu = pa_df['is_barrel'].mean()
-	league_hard_hit_mu = pa_df['is_hard_hit'].mean()
-	alpha = 75.0
+    # Calculate Barrel Profile
+    pa_df['is_barrel'] = ((pa_df['launch_speed'] >= 98) & 
+                          (pa_df['launch_angle'] >= 26 - (pa_df['launch_speed'] - 98)) & 
+                          (pa_df['launch_angle'] <= 30 + (pa_df['launch_speed'] - 98))).astype(int)
 
-	batter_summary = pa_df.groupby(['batter', 'has_platoon_advantage']).agg(
-		bat_pa_count=('is_pa', 'sum'), bat_hr_count=('is_hr', 'sum'),
-		bat_barrel_count=('is_barrel', 'sum'), bat_hard_hit_count=('is_hard_hit', 'sum'),
-		bat_avg_launch_angle=('launch_angle', 'mean')
-	).reset_index()
+    # Map historical environment attributes
+    pa_df['park_team'] = pa_df['home_team'] # Statcast uses team abbreviations directly
+    pa_df['park_factor'] = pa_df['park_team'].map(PARK_HR_FACTORS).fillna(100)
+    
+    # Fill baseline weather placeholders for historical data where missing
+    pa_df['temp'] = 71.0
+    pa_df['wind_speed'] = 5.0
 
-	batter_summary['bat_hr_per_pa'] = (batter_summary['bat_hr_count'] + (alpha * league_hr_mu)) / (batter_summary['bat_pa_count'] + alpha)
-	batter_summary['bat_barrel_per_pa'] = (batter_summary['bat_barrel_count'] + (alpha * league_barrel_mu)) / (batter_summary['bat_pa_count'] + alpha)
-	batter_summary['bat_hard_hit_per_pa'] = (batter_summary['bat_hard_hit_count'] + (alpha * league_hard_hit_mu)) / (batter_summary['bat_pa_count'] + alpha)
+    # Build Player Vector Profiles
+    batter_stats = pa_df.groupby('batter').agg(
+        bat_pa_count=('events', 'count'),
+        bat_hr_rate=('is_hr', 'mean'),
+        bat_barrel_rate=('is_barrel', 'mean'),
+        bat_hard_hit_rate=('launch_speed', lambda x: (x >= 95).mean())
+    ).reset_index()
 
-	pitcher_summary = pa_df.groupby(['pitcher', 'stand']).agg(
-		pit_pa_count=('is_pa', 'sum'), pit_hr_allowed=('is_hr', 'sum'), pit_barrel_allowed=('is_barrel', 'sum')
-	).reset_index()
+    pitcher_stats = pa_df.groupby('pitcher').agg(
+        pitch_pa_count=('events', 'count'),
+        pitch_hr_allowed_rate=('is_hr', 'mean'),
+        pitch_barrel_allowed_rate=('is_barrel', 'mean'),
+        pitch_hard_hit_allowed_rate=('launch_speed', lambda x: (x >= 95).mean())
+    ).reset_index()
 
-	pitcher_summary['pit_hr_per_pa'] = (pitcher_summary['pit_hr_allowed'] + (alpha * league_hr_mu)) / (pitcher_summary['pit_pa_count'] + alpha)
-	pitcher_summary['pit_barrel_per_pa'] = (pitcher_summary['pit_barrel_allowed'] + (alpha * league_barrel_mu)) / (pitcher_summary['pit_pa_count'] + alpha)
-
-	return batter_summary, pitcher_summary, pa_df
-
-# =====================================================================
-# SECTION 3: LIVE ACTIVE LINEUPS INTERFACE
-# =====================================================================
-def get_today_live_lineups():
-	today_str = datetime.today().strftime('%Y-%m-%d')
-	matchup_rows = []
-	try:
-		sched = statsapi.schedule(date=today_str)
-		for game in sched:
-			game_id = game.get('game_pk')
-			try:
-				box = statsapi.boxscore_data(game_id)
-
-				# Safely extract the primary starting pitcher ID from lists
-				away_pitcher_list = box.get('away', {}).get('pitchers', [])
-				home_pitcher_list = box.get('home', {}).get('pitchers', [])
-
-				away_sp = away_pitcher_list[0] if away_pitcher_list else 0
-				home_sp = home_pitcher_list[0] if home_pitcher_list else 0
-
-				for b_id in box.get('home', {}).get('battingOrder', []):
-					p_info = box.get('home', {}).get('teamPlayers', {}).get(f"ID{b_id}")
-					if p_info and away_sp != 0:
-						matchup_rows.append({
-							'player_name': p_info['person']['fullName'], 'batter': b_id, 'stand': p_info.get('boxscoreName'),
-							'pitcher': away_sp, 'p_throws': 'R', 'game_id': game_id
-						})
-
-				for b_id in box.get('away', {}).get('battingOrder', []):
-					p_info = box.get('away', {}).get('teamPlayers', {}).get(f"ID{b_id}")
-					if p_info and home_sp != 0:
-						matchup_rows.append({
-							'player_name': p_info['person']['fullName'], 'batter': b_id, 'stand': p_info.get('boxscoreName'),
-							'pitcher': home_sp, 'p_throws': 'R', 'game_id': game_id
-						})
-			except Exception:
-				continue
-	except Exception:
-		pass
-	return pd.DataFrame(matchup_rows) if matchup_rows else pd.DataFrame(columns=['player_name', 'batter', 'stand', 'pitcher', 'p_throws', 'game_id'])
+    return batter_stats, pitcher_stats, pa_df
 
 # =====================================================================
-# SECTION 4: REINFORCEMENT LOOP FROM MISSED OUTCOMES
+# SECTION 3: DAILY LIVE LINEUPS FETCHING
 # =====================================================================
-def audit_and_learn_from_yesterday(pa_df, batter_df, pitcher_df):
-	yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-	feedback_file = "cache/online_feedback_learning_log.csv"
-	print(f"Auditing missed selections from {yesterday_str}...")
+def get_today_matchups():
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    schedule = statsapi.schedule(date=today_str)
+    matchups = []
 
-	try:
-		sched = statsapi.schedule(date=yesterday_str)
-		recorded_outcomes = []
+    for game in schedule:
+        if game.get('status') in ['Cancelled', 'Postponed']:
+            continue
+        
+        game_id = game['game_pk']
+        venue_name = game.get('venue_name', '')
+        team_abbrev = VENUE_MAP.get(venue_name, 'Unknown')
+        park_factor = PARK_HR_FACTORS.get(team_abbrev, 100)
 
-		for game in sched:
-			game_id = game.get('game_pk')
-			box = statsapi.boxscore_data(game_id)
+        # Pull geolocation data via venue metadata or fallback to baseline coordinate mappings
+        venue_data = statsapi.get('venue', {'venueId': game.get('venue_id', 0)})
+        try:
+            coords = venue_data['venues'][0]['location']
+            lat, lon = coords['latitude'], coords['longitude']
+            weather = get_live_weather(lat, lon)
+        except Exception:
+            weather = {'temp': 71, 'wind_speed': 5}
 
-			away_pitchers = box.get('away', {}).get('pitchers', [])
-			home_pitchers = box.get('home', {}).get('pitchers', [])
-			away_sp = away_pitchers[0] if away_pitchers else 0
-			home_sp = home_pitchers[0] if home_pitchers else 0
+        try:
+            boxscore = statsapi.boxscore_data(game_id)
+            for team_type in ['home', 'away']:
+                opponent_type = 'away' if team_type == 'home' else 'home'
+                
+                pitcher_id = boxscore['teams'][opponent_type]['pitchers'][0] if boxscore['teams'][opponent_type]['pitchers'] else None
+                p_throws = 'R'
+                if pitcher_id:
+                    pitcher_info = statsapi.player_stat_data(pitcher_id, group="pitching")
+                    p_throws = pitcher_info.get('pitchHand', {}).get('code', 'R')
+                
+                batting_order = boxscore['teams'][team_type]['battingOrder']
+                for order_idx, batter_id in enumerate(batting_order):
+                    batter_info = statsapi.player_stat_data(batter_id, group="hitting")
+                    b_stands = batter_info.get('batSide', {}).get('code', 'R')
+                    
+                    matchups.append({
+                        'game_pk': game_id,
+                        'batter': batter_id,
+                        'batter_name': boxscore['teams'][team_type]['players'][f"ID{batter_id}"]['person']['fullName'],
+                        'pitcher': pitcher_id,
+                        'pitcher_name': boxscore['teams'][opponent_type]['players'][f"ID{pitcher_id}"]['person']['fullName'] if pitcher_id else "Unknown",
+                        'has_platoon_advantage': int(b_stands != p_throws),
+                        'park_factor': park_factor,
+                        'temp': weather['temp'],
+                        'wind_speed': weather['wind_speed']
+                    })
+        except Exception:
+            continue
 
-			for team in ['home', 'away']:
-				for p_id_str, info in box.get(team, {}).get('players', {}).items():
-					b_id = int(p_id_str.replace("ID", ""))
-					stats = info.get('stats', {}).get('batting', {})
-					if stats:
-						actual_hr = 1 if stats.get('homeRuns', 0) > 0 else 0
-						opp_pitcher = away_sp if team == 'home' else home_sp
-						if opp_pitcher != 0:
-							recorded_outcomes.append({
-								'batter': b_id, 'pitcher': opp_pitcher, 'stand': 'R', 'p_throws': 'R',
-								'has_platoon_advantage': 0, 'is_hr': actual_hr
-							})
-
-		if not recorded_outcomes:
-			return pa_df
-
-		new_feedback_df = pd.DataFrame(recorded_outcomes)
-		if os.path.exists(feedback_file):
-			old_feedback_df = pd.read_csv(feedback_file)
-			new_feedback_df = pd.concat([old_feedback_df, new_feedback_df], ignore_index=True).drop_duplicates()
-		new_feedback_df.to_csv(feedback_file, index=False)
-
-		updated_pa_df = pd.concat([pa_df, new_feedback_df], ignore_index=True).fillna(0)
-		return updated_pa_df
-	except Exception:
-		return pa_df
-
-# =====================================================================
-# SECTION 5: MODEL ARRAYS SELECTION
-# =====================================================================
-def build_training_dataset(pa_df, batter_df, pitcher_df):
-    base = pa_df[['batter', 'pitcher', 'stand', 'p_throws', 'has_platoon_advantage', 'is_hr']].copy()
-    base = base.merge(batter_df, on=['batter', 'has_platoon_advantage'], how='left')
-    base = base.merge(pitcher_df, on=['pitcher', 'stand'], how='left').fillna(0)
-    features = ['has_platoon_advantage', 'bat_hr_per_pa', 'bat_barrel_per_pa', 'bat_hard_hit_per_pa', 'bat_avg_launch_angle', 'pit_hr_per_pa', 'pit_barrel_per_pa']
-    return base[features], base['is_hr']
-
-
-def train_hr_model(X, y):
-    scale_weight = (len(y) - sum(y)) / sum(y) if sum(y) > 0 else 1
-    model = xgb.XGBClassifier(n_estimators=120, max_depth=4, learning_rate=0.05, scale_pos_weight=scale_weight, objective='binary:logistic', eval_metric='logloss')
-    model.fit(X, y)
-    return model
-
-
-def alert_to_discord(webhook_url, message_content):
-    if "YOUR_REAL_ID_HERE" in webhook_url or not webhook_url.startswith("http"):
-        print(f"[Console Mirror Output Only]:\n{message_content}")
-        return
-    try:
-        requests.post(webhook_url, json={"content": str(message_content)})
-    except Exception as e:
-        print(f"Discord alert failed: {e}")
+    return pd.DataFrame(matchups)
 
 # =====================================================================
-# SECTION 6: AUTOMATED EXECUTION CORE
+# SECTION 4: INFERENCE MODEL PROCESSING
 # =====================================================================
-if __name__ == "__main__":
-    DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1528513802881073313/xVsb81UEWitAaR5vbiVbyP3XHkL2XVzG8ATTSlz3Q9IYt-EbhQUTCmiRK5IHFFEivuj0")
-    print("🚀 Initializing Verified Live MLB Learning Pipeline...")
-    try:
-        batters, pitchers, raw_pas = get_advanced_hr_metrics(days_back=15)
-        adaptive_pas = audit_and_learn_from_yesterday(raw_pas, batters, pitchers)
-        X_train, y_train = build_training_dataset(adaptive_pas, batters, pitchers)
-        hr_model = train_hr_model(X_train, y_train)
-        today_matchups = get_today_live_lineups()
-        if not today_matchups.empty:
-            today_matchups['has_platoon_advantage'] = (today_matchups['stand'] != today_matchups['p_throws']).astype(int)
-            today_features = today_matchups.merge(batters, on=['batter', 'has_platoon_advantage'], how='left')
-            today_features = today_features.merge(pitchers, on=['pitcher', 'stand'], how='left').fillna(0)
-            features_list = ['has_platoon_advantage', 'bat_hr_per_pa', 'bat_barrel_per_pa', 'bat_hard_hit_per_pa', 'bat_avg_launch_angle', 'pit_hr_per_pa', 'pit_barrel_per_pa']
-            today_matchups['hr_prob'] = hr_model.predict_proba(today_features[features_list])[:, 1]
-            top_picks = today_matchups.sort_values(by='hr_prob', ascending=False).head(3)
-            alert_msg = "🚨 MLB ADAPTIVE-LEARNING MODEL EDGES 🚨\n"
-            for _, row in top_picks.iterrows():
-                alert_msg += f"🔹 {row['player_name']}: Predicted HR Prob: {row['hr_prob']:.1%}\n"
-        else:
-            alert_msg = "✅ MLB Training Engine Optimized: Continuous reinforcement feedback applied successfully."
-        alert_to_discord(DISCORD_WEBHOOK, alert_msg)
-        print("✅ Verified pipeline run completed successfully.")
-    except Exception as main_error:
-        print(f"Process terminated by script: {main_error}")
+def generate_daily_predictions():
+    b_stats, p_stats, raw_pa = get_advanced_hr_metrics(days_back=60)
+    
+    train_df = raw_pa.merge(b_stats, on='batter', how='inner')
+    train_df = train_df.merge(p_stats, on='pitcher', how='inner')
+    
+    # Updated Matrix including Weather and Park Vectors
+    features = [
+        'has_platoon_advantage', 'bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 
+        'bat_hard_hit_rate', 'pitch_pa_count', 'pitch_hr_allowed_rate', 
+        'pitch_barrel_allowed_rate', 'pitch_hard_hit_allowed_rate',
+        'park_factor', 'temp', 'wind_speed'
+    ]
+    
+    X_train = train_df[features]
+    y_train = train_df['is_hr']
+    
+    model = xgb.XGBClassifier(n_estimators=150, max_depth=5, learning_rate=0.04, eval_metric='logloss')
+    model.fit(X_train, y_train)
+    
+    live_matchups = get_today_matchups()
+    if live_matchups.empty:
+        print("No games or lineups available for today.")
+        return pd.DataFrame()
+
+    # Join live matchups with player vectors where available (use inner to ensure features exist)
+    live = live_matchups.merge(b_stats, on='batter', how='left')
+    live = live.merge(p_stats, on='pitcher', how='left')
+
+    # Fill missing numeric features with reasonable baselines
+    for col in ['bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate']:
+        if col in live.columns:
+            live[col] = live[col].fillna(0)
+    for col in ['pitch_pa_count', 'pitch_hr_allowed_rate', 'pitch_barrel_allowed_rate', 'pitch_hard_hit_allowed_rate']:
+        if col in live.columns:
+            live[col] = live[col].fillna(live[col].mean() if not live[col].isna().all() else 0)
+
+    live['park_factor'] = live['park_factor'].fillna(100)
+    live['temp'] = live['temp'].fillna(71.0)
+    live['wind_speed'] = live['wind_speed'].fillna(5.0)
+
+    X_live = live[features]
+    probs = model.predict_proba(X_live)[:, 1]
+    live['pred_hr_prob'] = probs
+
+    # Return sorted predictions
+    return live.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
