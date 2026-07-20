@@ -142,13 +142,14 @@ def get_today_matchups():
         if game.get('status') in ['Cancelled', 'Postponed']:
             continue
         
-        game_id = game['game_pk']
+        game_id = game.get('game_pk')
         venue_name = game.get('venue_name', '')
         team_abbrev = VENUE_MAP.get(venue_name, 'Unknown')
         park_factor = PARK_HR_FACTORS.get(team_abbrev, 100)
 
         # Pull geolocation data via venue metadata or fallback to baseline coordinate mappings
-        venue_data = statsapi.get('venue', {'venueId': game.get('venue_id', 0)})
+        venue_id = game.get('venue_id', 0)
+        venue_data = statsapi.get('venue', {'venueIds': str(venue_id)})
         try:
             coords = venue_data['venues'][0]['location']
             lat, lon = coords['latitude'], coords['longitude']
@@ -279,4 +280,4 @@ def generate_daily_predictions():
     return live.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
 
 if __name__ == "__main__":
-	generate_daily_predictions()
+	generate_daily_predictions
