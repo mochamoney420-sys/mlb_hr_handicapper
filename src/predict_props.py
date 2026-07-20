@@ -10,9 +10,13 @@ API_KEY = "f983b6d08915175390d5e308e1207041"
 def get_todays_games():
     params = {"apiKey": API_KEY, "regions": "us", "markets": "h2h"}
     response = requests.get(API_URL, params=params)
-    return print("Status Code:", response.status_code)
-print("Raw Response:", response.text)
-data = response.json()
+    print("Status Code:", response.status_code)
+    if not response.ok:
+        print("Failed to fetch games.")
+        return None
+
+    print("Raw Response:", response.text)
+    return response.json()
 
 def run_predictions():
     print(f"Starting daily prediction run for {datetime.date.today()}...")
