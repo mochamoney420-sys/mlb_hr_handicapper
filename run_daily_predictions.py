@@ -4,7 +4,6 @@
 # =====================================================================
 import os
 import time
-import MLB
 import requests
 import pandas as pd
 import numpy as np
@@ -53,13 +52,17 @@ VENUE_MAP = {
 def get_live_weather(lat, lon):
     """Fetches real-time localized metrics using Open-Meteo API."""
     try:
-        url = f"https://open-meteo.com{lat}&longitude={lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m&temperature_unit=fahrenheit&wind_speed_unit=mph"
+        url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}&current_weather=true"
+            f"&temperature_unit=fahrenheit&windspeed_unit=mph"
+        )
         res = requests.get(url, timeout=5).json()
-        current = res.get('current', {})
+        current = res.get('current_weather', {})
         return {
-            'temp': current.get('temperature_2m', 70),
-            'wind_speed': current.get('wind_speed_10m', 0),
-            'wind_dir': current.get('wind_direction_10m', 0)
+            'temp': current.get('temperature', 70),
+            'wind_speed': current.get('windspeed', 0),
+            'wind_dir': current.get('winddirection', 0)
         }
     except Exception:
         return {'temp': 70, 'wind_speed': 0, 'wind_dir': 0}
@@ -160,20 +163,22 @@ def get_today_matchups():
             weather = {'temp': 71, 'wind_speed': 5}
 
         try:
-            boxscore = MLB.StatsAPI.boxscore_data(game_id)
+            boxscore = statsapi.boxscore_data(game_id)
             for team_type in ['home', 'away']:
                 opponent_type = 'away' if team_type == 'home' else 'home'
                 
                 pitcher_id = boxscore['teams'][opponent_type]['pitchers'][0] if boxscore['teams'][opponent_type]['pitchers'] else None
                 p_throws = 'R'
                 if pitcher_id:
-                    pitcher_info = MLB.StatsAPI.player_stat_data(pitcher_id, group="pitching")
-                    p_throws = pitcher_info.get('pitchHand', {}).get('code', 'R')
+                    pitcher_info = statsapi.get('people', {'personIds': str(pitcher_id)})
+                    pitcher_person = pitcher_info.get('people', [{}])[0]
+                    p_throws = pitcher_person.get('pitchHand', {}).get('code', 'R')
                 
                 batting_order = boxscore['teams'][team_type]['battingOrder']
                 for order_idx, batter_id in enumerate(batting_order):
-                    batter_info = MLB.StatsAPI.player_stat_data(batter_id, group="hitting")
-                    b_stands = batter_info.get('batSide', {}).get('code', 'R')
+                    batter_info = statsapi.get('people', {'personIds': str(batter_id)})
+                    batter_person = batter_info.get('people', [{}])[0]
+                    b_stands = batter_person.get('batSide', {}).get('code', 'R')
                     
                     matchups.append({
                         'game_pk': game_id,
@@ -282,4 +287,4 @@ def generate_daily_predictions():
     return live.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
 
 if __name__ == "__main__":
-	generate_daily_predictions
+    generate_daily_predictions()
