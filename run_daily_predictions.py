@@ -4,6 +4,7 @@
 # =====================================================================
 import os
 import time
+import MLB
 import requests
 import pandas as pd
 import numpy as np
@@ -158,19 +159,19 @@ def get_today_matchups():
             weather = {'temp': 71, 'wind_speed': 5}
 
         try:
-            boxscore = statsapi.boxscore_data(game_id)
+            boxscore = MLB.StatsAPI.boxscore_data(game_id)
             for team_type in ['home', 'away']:
                 opponent_type = 'away' if team_type == 'home' else 'home'
                 
                 pitcher_id = boxscore['teams'][opponent_type]['pitchers'][0] if boxscore['teams'][opponent_type]['pitchers'] else None
                 p_throws = 'R'
                 if pitcher_id:
-                    pitcher_info = statsapi.player_stat_data(pitcher_id, group="pitching")
+                    pitcher_info = MLB.StatsAPI.player_stat_data(pitcher_id, group="pitching")
                     p_throws = pitcher_info.get('pitchHand', {}).get('code', 'R')
                 
                 batting_order = boxscore['teams'][team_type]['battingOrder']
                 for order_idx, batter_id in enumerate(batting_order):
-                    batter_info = statsapi.player_stat_data(batter_id, group="hitting")
+                    batter_info = MLB.StatsAPI.player_stat_data(batter_id, group="hitting")
                     b_stands = batter_info.get('batSide', {}).get('code', 'R')
                     
                     matchups.append({
