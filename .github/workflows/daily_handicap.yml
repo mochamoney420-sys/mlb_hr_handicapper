@@ -18,16 +18,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pandas numpy xgboost requests pybaseball MLB-StatsAPI
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy xgboost requests pybaseball MLB-StatsAPI; fi
       - name: Execute handicapping model script
         env:
-          DISCORD_MLB_WEBHOO: "${{ secrets.DISCORD_WEBHOOK_URL }}"
-        run: |
-          python run_daily_predictions.py
-                - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Execute handicapping model script
+          DISCORD_MLB_WEBHOOK: "${{ secrets.DISCORD_WEBHOOK_URL }}"
         run: python run_daily_predictions.py
