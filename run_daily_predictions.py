@@ -977,13 +977,8 @@ def generate_daily_predictions():
     missed_count = int((sample_weights > 1.2).sum())
     print(f"Feedback weights loaded — {missed_count} training rows upweighted from past misses.")
     
-    # Updated Matrix including Weather, Park Factors, Batted Balls, and Professional Features
-    features = [
-        # Platoon & Matchup Features (Advanced Handedness)
-        'has_platoon_advantage', 'platoon_advantage_multiplier',
-        'breaking_pitch_vulnerability', 'left_on_right_fade_score',
-        'reverse_split_anomaly_score',
-        
+    # Feature list for MODEL TRAINING (only features that exist in train_df)
+    features_train = [
         # Batter Features (20 batted ball metrics)
         'bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate',
         'bat_hr_fb_rate', 'bat_pull_rate', 'bat_ev90', 'bat_iso_proxy', 'bat_days_since_last_game',
@@ -1003,18 +998,26 @@ def generate_daily_predictions():
         
         # Stadium & Weather Features
         'park_factor', 'temp', 'wind_speed', 'wind_out_component',
+    ]
+    
+    # Feature list for LIVE PREDICTIONS (includes calculated multipliers)
+    features_live = features_train + [
+        # Platoon & Matchup Features (Advanced Handedness) - CALCULATED FOR LIVE ONLY
+        'has_platoon_advantage', 'platoon_advantage_multiplier',
+        'breaking_pitch_vulnerability', 'left_on_right_fade_score',
+        'reverse_split_anomaly_score',
         
-        # Ballpark Dimensions Features (NEW)
+        # Ballpark Dimensions Features (CALCULATED FOR LIVE ONLY)
         'ballpark_park_factor', 'porch_advantage_bonus',
         'death_valley_penalty', 'would_be_hr_differential',
         
-        # Professional Bettor Features
+        # Professional Bettor Features (CALCULATED FOR LIVE ONLY)
         'bullpen_quality_score_home', 'bullpen_quality_score_away',
         'umpire_strike_zone_impact', 'density_altitude_factor',
         'weather_extremes_multiplier', 'sportsbook_value_score'
     ]
     
-    X_train = train_df[features]
+    X_train = train_df[features_train]
     y_train = train_df['is_hr']
 
     cv_splitter = TimeSeriesSplit(n_splits=3) if TimeSeriesSplit is not None else 3
@@ -1062,7 +1065,7 @@ def generate_daily_predictions():
         elif hasattr(_base, 'feature_importances_'):
             _fi = _base.feature_importances_
         if _fi is not None:
-            _fi_series = pd.Series(_fi, index=features).sort_values(ascending=False).head(10)
+            _fi_series = pd.Series(_fi, index=features_train).sort_values(ascending=False).head(10)
             print("\nTop 10 Feature Importances:")
             for _fname, _fval in _fi_series.items():
                 print(f"  {_fname:<40} {_fval:.4f}")
@@ -1289,7 +1292,7 @@ def generate_daily_predictions():
             else:
                 live[col] = live[col].fillna(50.0)
 
-    X_live = live[features]
+    X_live = live[features_train]
     all_probs = [m.predict_proba(X_live)[:, 1] for m in trained_models]
     probs = sum(all_probs) / len(all_probs)
 
