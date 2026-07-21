@@ -341,85 +341,59 @@ def generate_daily_predictions():
     else:
         print("Model tracking skipped: 'top_5' data framework is empty or not yet generated.")
 
-def main():
-    generate_daily_predictions()
-
-if __name__ == "__main__":
-    main()
-import argparse
-import os
-import sys
-import time
-from datetime import datetime
-import requests
-import statsapi  # Handles real-time MLB live data event streams
-from pybaseball import statcast
-
 WEBHOOK_URL = os.getenv("DISCORD_MLB_WEBHOOK", "https://discord.com")
+
 
 # ==========================================
 # NEW FEATURE: LIVE HOME RUN WATCHER
 # ==========================================
 def monitor_live_home_runs():
-    """
-    Loops indefinitely, checking live game data for home runs
-    and alerting Discord immediately when they happen.
-    """
+    """Loop indefinitely, checking live game data for home runs and alerting Discord."""
     print("🚀 Monitoring started: Waiting for live MLB home run events...")
-    
-    # Keeps track of event IDs we've already sent to Discord to prevent duplicates
     processed_home_runs = set()
 
     while True:
         try:
             today_str = datetime.today().strftime('%m/%d/%Y')
-            # Fetch all games scheduled or active today
-            games = statsapi.schedule(date=today_str)
-            
+            games = statsapi.schedule(date=today_str) or []
             for game in games:
-                # Only check games that are actively being played
-                if game.get('status') == 'In Progress':
-                    game_id = game['game_id']
-                    
-                    # Fetch live play-by-play breakdown for the specific game
-                    live_feed = statsapi.game_pace_data(game_id) 
-                    # Fallback to general play-by-play parsing if pace mapping is clean
-                    play_by_play = statsapi.get(f"game/{game_id}/feed/live")
-                    
-                    all_plays = play_by_play.get('liveData', {}).get('plays', {}).get('allPlays', [])
-                    
-                    for play in all_plays:
-                        result = play.get('result', {})
-                        event_id = play.get('about', {}).get('playId')
-                        
-                        # Identify home run events that haven't been processed yet
-                        if result.get('event') == 'Home Run' and event_id not in processed_home_runs:
-                            description = result.get('description', 'A home run was hit!')
-                            inning = play.get('about', {}).get('halfInning', '').upper()
-                            num_inning = play.get('about', {}).get('inning', '')
-                            
-                            # Construct an active embed notification alert
-                            payload = {
-                                "content": f"🚨 **LIVE HOME RUN ALERT** 🚨\n"
-                                           f"🏟️ *{game['away_name']} @ {game['home_name']}* ({inning} {num_inning})\n"
-                                           f"⚾ {description}"
-                            }
-                            
-                            # Dispatch to your exact Discord channel via Webhook
-                            requests.post(WEBHOOK_URL, json=payload, timeout=5)
-                            processed_home_runs.add(event_id)
-                            
+                if game.get('status') != 'In Progress':
+                    continue
+                game_id = game.get('game_pk') or game.get('game_id')
+                if not game_id:
+                    continue
+                play_by_play = statsapi.get(f"game/{game_id}/feed/live") or {}
+                all_plays = play_by_play.get('liveData', {}).get('plays', {}).get('allPlays', [])
+                for play in all_plays:
+                    result = play.get('result', {})
+                    event_id = play.get('about', {}).get('playId')
+                    if not event_id:
+                        continue
+                    if result.get('event') in ('Home Run', 'home_run') and event_id not in processed_home_runs:
+                        description = result.get('description', 'A home run was hit!')
+                        inning_half = play.get('about', {}).get('halfInning', '')
+                        num_inning = play.get('about', {}).get('inning', '')
+                        payload = {
+                            "content": (
+                                f"🚨 **LIVE HOME RUN ALERT** 🚨\n"
+                                f"🏟️ *{game.get('away_name','Away')} @ {game.get('home_name','Home')}* ({inning_half} {num_inning})\n"
+                                f"⚾ {description}"
+                            )
+                        }
+                        if WEBHOOK_URL:
+                            try:
+                                requests.post(WEBHOOK_URL, json=payload, timeout=5)
+                            except Exception as e:
+                                print("Webhook post failed:", e)
+                        processed_home_runs.add(event_id)
+            time.sleep(30)
         except Exception as e:
-            print(f"Error checking live feeds: {e}")
-            
-        # Poll the live MLB server feeds every 30 seconds to maintain rate-limits
-        time.sleep(30)
+            print("Error checking live feeds:", e)
+            time.sleep(10)
 
 
-# ==========================================
-# PRE-EXISTING STATCAST & CLI PIPELINE LAYER
-# ==========================================
 def pull_games(date_str):
+    """Fetch and return Statcast data for a given date (YYYY-MM-DD)."""
     print(f"Initiating Statcast pitch metric ingestion tracking for: {date_str}")
     try:
         df = statcast(start_dt=date_str, end_dt=date_str)
@@ -428,33 +402,30 @@ def pull_games(date_str):
         print(f"Error fetching data via pybaseball module: {e}")
         return None
 
+
 def main():
     parser = argparse.ArgumentParser(description="MLB Daily HR Handicapper CLI Core Process")
     parser.add_argument("--today", action="store_true", help="Ingest Statcast data files for today's active games")
     parser.add_argument("--date", type=str, help="Ingest Statcast records using explicit format: YYYY-MM-DD")
-    # Added new command-line argument switch to start the live notification tracker loop
     parser.add_argument("--live", action="store_true", help="Launch real-time Discord home run notifications watch script")
-    
+
     args = parser.parse_args()
-    
-    # Branching decision execution logic mapping based on user CLI command flags
+
     if args.live:
         monitor_live_home_runs()
-        sys.exit(0)
-        
+        return
+
+    if args.today:
+        date_str = datetime.today().strftime('%Y-%m-%d')
+        pull_games(date_str)
+        return
+
     if args.date:
-        target_date = args.date
-    else:
-        target_date = datetime.today().strftime('%Y-%m-%d')
-        
-    raw_pitch_data = pull_games(target_date)
-    
-    if raw_pitch_data is None or raw_pitch_data.empty:
-        print("Pipeline terminated: No tracking data generated.")
-        sys.exit(1)
-        
-    # [Your prediction and top_5 DataFrame table generation block stays here untouched]
-    print("Model tracking skipped: Run pipeline with `--live` flag to stream live home run alerts.")
+        pull_games(args.date)
+        return
+
+    generate_daily_predictions()
+
 
 if __name__ == "__main__":
     main()
