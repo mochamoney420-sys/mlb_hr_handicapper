@@ -38,28 +38,38 @@ def get_game_lineups(game_id):
             'home_players': []
         }
         
-        # Parse away team lineup
+        # Try to get batting orders from the official batting order first
+        away_batting_order = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('batters', [])
+        home_batting_order = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('batters', [])
+        
+        # Parse away team lineup - include all players, not just confirmed batters
         away_lineup = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('players', {})
         for player_id, player_data in away_lineup.items():
             player_info = player_data.get('person', {})
+            position = player_data.get('position', {}).get('abbreviation', 'UNK')
+            # Include if in batting order OR if position suggests batter (not pitcher)
+            is_batter = player_id.replace('ID', '') in away_batting_order or position not in ['P', 'UNK']
             lineups['away_players'].append({
                 'id': player_id,
                 'name': player_info.get('fullName', 'Unknown'),
                 'number': player_data.get('jerseyNumber', 0),
-                'position': player_data.get('position', {}).get('abbreviation', 'UNK'),
-                'is_batter': player_data.get('stats', {}).get('batting', {}).get('summary', '') != ''
+                'position': position,
+                'is_batter': is_batter
             })
         
-        # Parse home team lineup
+        # Parse home team lineup - include all players, not just confirmed batters
         home_lineup = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('players', {})
         for player_id, player_data in home_lineup.items():
             player_info = player_data.get('person', {})
+            position = player_data.get('position', {}).get('abbreviation', 'UNK')
+            # Include if in batting order OR if position suggests batter (not pitcher)
+            is_batter = player_id.replace('ID', '') in home_batting_order or position not in ['P', 'UNK']
             lineups['home_players'].append({
                 'id': player_id,
                 'name': player_info.get('fullName', 'Unknown'),
                 'number': player_data.get('jerseyNumber', 0),
-                'position': player_data.get('position', {}).get('abbreviation', 'UNK'),
-                'is_batter': player_data.get('stats', {}).get('batting', {}).get('summary', '') != ''
+                'position': position,
+                'is_batter': is_batter
             })
         
         return lineups
@@ -84,21 +94,43 @@ def get_batting_orders_for_games():
         try:
             game_data = statsapi.get('game', {'gamePk': game_id})
             
-            # Get away team batting order
+            # Get away team batting order - try multiple sources
             away_order = []
-            away_lineup = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('batters', [])
-            for idx, batter_id in enumerate(away_lineup, 1):
-                batter_data = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('players', {}).get(f'ID{batter_id}', {})
-                batter_name = batter_data.get('person', {}).get('fullName', 'Unknown')
-                away_order.append({'slot': idx, 'player_id': batter_id, 'name': batter_name})
+            # First try the batters array in boxscore
+            away_batters = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('batters', [])
+            # If empty, try to get all non-pitcher players from players dict
+            if not away_batters:
+                away_players = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('players', {})
+                away_batters = [pid.replace('ID', '') for pid, pdata in away_players.items() 
+                               if pdata.get('position', {}).get('abbreviation') != 'P']
             
-            # Get home team batting order
+            for idx, batter_id in enumerate(away_batters[:9], 1):  # Max 9 batters
+                try:
+                    batter_key = f'ID{batter_id}' if not str(batter_id).startswith('ID') else batter_id
+                    batter_data = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('players', {}).get(batter_key, {})
+                    batter_name = batter_data.get('person', {}).get('fullName', f'Unknown (#{batter_id})')
+                    away_order.append({'slot': idx, 'player_id': batter_id, 'name': batter_name})
+                except Exception:
+                    pass
+            
+            # Get home team batting order - try multiple sources
             home_order = []
-            home_lineup = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('batters', [])
-            for idx, batter_id in enumerate(home_lineup, 1):
-                batter_data = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('players', {}).get(f'ID{batter_id}', {})
-                batter_name = batter_data.get('person', {}).get('fullName', 'Unknown')
-                home_order.append({'slot': idx, 'player_id': batter_id, 'name': batter_name})
+            # First try the batters array in boxscore
+            home_batters = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('batters', [])
+            # If empty, try to get all non-pitcher players from players dict
+            if not home_batters:
+                home_players = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('players', {})
+                home_batters = [pid.replace('ID', '') for pid, pdata in home_players.items() 
+                               if pdata.get('position', {}).get('abbreviation') != 'P']
+            
+            for idx, batter_id in enumerate(home_batters[:9], 1):  # Max 9 batters
+                try:
+                    batter_key = f'ID{batter_id}' if not str(batter_id).startswith('ID') else batter_id
+                    batter_data = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('players', {}).get(batter_key, {})
+                    batter_name = batter_data.get('person', {}).get('fullName', f'Unknown (#{batter_id})')
+                    home_order.append({'slot': idx, 'player_id': batter_id, 'name': batter_name})
+                except Exception:
+                    pass
             
             batting_orders[game_id] = {
                 'away_team': away_team,

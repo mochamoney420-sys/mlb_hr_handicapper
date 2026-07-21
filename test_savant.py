@@ -2,7 +2,14 @@
 """Quick test of Baseball Savant integration."""
 
 import sys
+import os
 from pathlib import Path
+
+# UTF-8 encoding fix for Windows
+if sys.platform == 'win32':
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from baseball_savant import get_todays_games, get_batting_orders_for_games
