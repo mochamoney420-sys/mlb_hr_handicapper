@@ -1,0 +1,10 @@
+{
+  "last_check": "2026-07-21T00:29:36.396125",
+  "main_pipeline_running": false,
+  "live_monitor_running": true,
+  "last_main_run": null,
+  "last_live_run": null,
+  "crash_count": 0,
+  "recovery_attempts": 2,
+  "status": "DEGRADED"
+}
