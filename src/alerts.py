@@ -3,9 +3,9 @@ import requests
 import os
 
 def alert_discord(bet_message):
-    webhook_url = os.environ.get("https://discord.com/api/webhooks/1525525618861543654/jBzZ7vTarJs-j2apC7Ws2M29cF5aaJ9-0JkvdyyK9aJUJRziU9MXqfHyzx0roW4HVHIZ")
+    webhook_url = os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook_url:
-        print("Error: DISCORD_WEBHOOK_URL environment variable is missing!")
+        print("Error: DISCORD_MLB_WEBHOOK or DISCORD_WEBHOOK_URL environment variable is missing!")
         return
 
     payload = {"content": f"🚨 **Value HR Prop Found!** 🚨\n{bet_message}"}
