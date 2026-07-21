@@ -53,11 +53,11 @@ def init_status_file():
 def save_status(status):
     """Persist health status to file."""
     status['last_check'] = datetime.now().isoformat()
-    STATUS_FILE.write_text(json.dumps(status, indent=2))
+    STATUS_FILE.write_text(json.dumps(status, indent=2), encoding='utf-8')
 
 def log_recovery(message):
     """Log recovery attempts to file."""
-    with open(RECOVERY_LOG, 'a') as f:
+    with open(RECOVERY_LOG, 'a', encoding='utf-8') as f:
         f.write(f"[{datetime.now().isoformat()}] {message}\n")
     print(f"🔧 {message}")
 

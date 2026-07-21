@@ -1,13 +1,23 @@
 """Run daily predictions for MLB HR model with Weather and Park Factors."""
 # =====================================================================
+# UNICODE & ENCODING FIX (Windows Console Support)
+# =====================================================================
+import io
+import sys
+if sys.platform == 'win32':
+    # Enable UTF-8 output on Windows
+    import os
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    # Reconfigure stdout for UTF-8
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+# =====================================================================
 # SECTION 1: IMPORTS & ENV LOADING
 # =====================================================================
 import argparse
-import sys
 import subprocess
 from datetime import datetime
 from pathlib import Path
-import os
 
 # Load environment variables from .vscode/.env
 env_file = Path(__file__).parent / '.vscode' / '.env'
@@ -47,6 +57,21 @@ except ImportError:
     TimeSeriesSplit = None
 from datetime import datetime, timedelta
 from pybaseball import statcast
+
+# Import Baseball Savant integration
+try:
+    from src.baseball_savant import (
+        check_lineups_morning, check_lineups_pregame, 
+        save_lineup_report, get_batted_balls_quality_metrics,
+        get_todays_games
+    )
+except ImportError:
+    print("Warning: baseball_savant module not available")
+    check_lineups_morning = None
+    check_lineups_pregame = None
+    save_lineup_report = None
+    get_batted_balls_quality_metrics = None
+    get_todays_games = None
 
 # Fix Pybaseball/Savant blocking by forcing a global browser user-agent header
 import urllib.request
@@ -869,6 +894,27 @@ def generate_daily_predictions():
         print(f"⚠️  HR pattern learning failed: {e}")
     
     # =====================================================================
+    # PHASE 0.5: BASEBALL SAVANT LINEUP VERIFICATION
+    # =====================================================================
+    print("\n" + "="*70)
+    print("PHASE 0.5: VERIFYING LINEUPS FROM BASEBALL SAVANT")
+    print("="*70)
+    try:
+        if check_lineups_morning is not None:
+            morning_lineups = check_lineups_morning()
+            if morning_lineups:
+                save_lineup_report(morning_lineups, "_morning_check")
+                print(f"\n✅ Lineup verification complete: {len(morning_lineups)} games confirmed")
+                print("   • All lineups from Baseball Savant verified")
+                print("   • Report saved for prediction matching")
+            else:
+                print("⚠️  No games found for today")
+        else:
+            print("⚠️  baseball_savant module not available, skipping lineup check")
+    except Exception as e:
+        print(f"⚠️  Lineup verification failed: {e}")
+    
+    # =====================================================================
     # PHASE 1: LOAD TRAINING DATA
     # =====================================================================
     print("\n" + "="*70)
@@ -1445,6 +1491,23 @@ def main():
         return
 
     generate_daily_predictions()
+    
+    # Pre-game lineup check (2-3 hours before first pitch)
+    try:
+        print("\n" + "="*70)
+        print("PRE-GAME LINEUP CHECK — Confirming final lineups before games")
+        print("="*70)
+        if check_lineups_pregame is not None:
+            pregame_lineups = check_lineups_pregame()
+            if pregame_lineups:
+                save_lineup_report(pregame_lineups, "_pregame_check")
+                print(f"\n✅ Pre-game lineup check complete: {len(pregame_lineups)} games verified")
+            else:
+                print("⚠️  No games within 6 hours of first pitch")
+        else:
+            print("⚠️  baseball_savant module not available for pre-game check")
+    except Exception as e:
+        print(f"⚠️  Pre-game lineup check failed: {e}")
     
     # Spawn background live monitor process to catch home runs throughout the day
     try:

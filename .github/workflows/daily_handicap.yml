@@ -2,7 +2,11 @@ name: Daily MLB HR Prediction Pipeline
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    # 9:00 AM Eastern Time (market open)
+    # During EDT: 1:00 PM UTC (cron 0 13)
+    # During EST: 2:00 PM UTC (cron 0 14)
+    # GitHub uses UTC only, so we use 13:00 UTC as approximation
+    - cron: '0 13 * * *'
   workflow_dispatch:
 
 jobs:
@@ -23,3 +27,10 @@ jobs:
         env:
           DISCORD_MLB_WEBHOOK: "${{ secrets.DISCORD_WEBHOOK_URL }}"
         run: python run_daily_predictions.py
+      - name: Upload predictions CSV
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daily-predictions
+          path: data/predictions_*.csv
+          retention-days: 30

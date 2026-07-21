@@ -8,6 +8,14 @@ Runs daily before model retraining to create an intelligent feedback loop.
 
 import os
 import sys
+
+# Fix UTF-8 encoding on Windows
+if sys.platform == 'win32':
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except:
+        pass
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
