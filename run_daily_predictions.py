@@ -90,6 +90,19 @@ except ImportError:
     get_batted_balls_quality_metrics = None
     get_todays_games = None
 
+# Import Ballpark Dimensions features
+try:
+    from src.ballpark_dimensions import (
+        get_ballpark_factor, calculate_would_be_homers,
+        get_porch_advantage_bonus, get_death_valley_penalty,
+        calculate_park_adjustment_multiplier, get_stadium_info,
+        BALLPARK_DATA
+    )
+except ImportError:
+    print("Warning: ballpark_dimensions module not available")
+    get_ballpark_factor = None
+    BALLPARK_DATA = {}
+
 # Fix Pybaseball/Savant blocking by forcing a global browser user-agent header
 import urllib.request
 opener = urllib.request.build_opener()
@@ -988,7 +1001,11 @@ def generate_daily_predictions():
         # Stadium & Weather Features
         'park_factor', 'temp', 'wind_speed', 'wind_out_component',
         
-        # Professional Bettor Features (NEW)
+        # Ballpark Dimensions Features (NEW)
+        'ballpark_park_factor', 'porch_advantage_bonus',
+        'death_valley_penalty', 'would_be_hr_differential',
+        
+        # Professional Bettor Features
         'bullpen_quality_score_home', 'bullpen_quality_score_away',
         'umpire_strike_zone_impact', 'density_altitude_factor',
         'weather_extremes_multiplier', 'sportsbook_value_score'
@@ -1187,11 +1204,71 @@ def generate_daily_predictions():
     live['sportsbook_value_score'] = 1.0
     
     # =====================================================================
+    # SECTION: BALLPARK DIMENSIONS FEATURES
+    # =====================================================================
+    live['ballpark_park_factor'] = 1.0
+    live['porch_advantage_bonus'] = 1.0
+    live['death_valley_penalty'] = 1.0
+    live['would_be_hr_differential'] = 0.0
+    
+    if get_ballpark_factor is not None:
+        for idx, row in live.iterrows():
+            try:
+                batter_id = row.get('batter')
+                pitcher_id = row.get('pitcher')
+                batter_hand = row.get('batter_stand', 'R')
+                home_team = row.get('home_team')
+                away_team = row.get('away_team')
+                is_home = row.get('is_home_game', True)
+                
+                # Get ballpark factor for home team
+                if is_home:
+                    park_data = get_ballpark_factor(home_team, batter_hand)
+                else:
+                    park_data = get_ballpark_factor(away_team, batter_hand)
+                
+                live.at[idx, 'ballpark_park_factor'] = park_data.get('park_factor', 1.0)
+                
+                # Porch advantage: detect short porch + recent warning-track fly balls
+                recent_fb_dist = row.get('recent_flyball_distance')  # Optional
+                porch_bonus = get_porch_advantage_bonus(
+                    home_team if is_home else away_team,
+                    batter_hand,
+                    recent_fb_dist
+                )
+                live.at[idx, 'porch_advantage_bonus'] = porch_bonus
+                
+                # Death valley penalty
+                exit_velo = row.get('bat_ev90', 90)
+                penalty = get_death_valley_penalty(
+                    home_team if is_home else away_team,
+                    exit_velo
+                )
+                live.at[idx, 'death_valley_penalty'] = penalty
+                
+                # Would-Be HR differential (simplified - uses park factor difference)
+                # In production, could pull from actual Statcast "would-be" calculation
+                park_chars = park_data.get('characteristics', [])
+                if 'short_porch' in park_chars or 'short_rf_porch' in park_chars:
+                    live.at[idx, 'would_be_hr_differential'] = 0.10  # +10% for short porch
+                elif 'death_valley' in park_chars or 'deep_cf' in park_chars:
+                    live.at[idx, 'would_be_hr_differential'] = -0.08  # -8% for death valley
+                elif 'lh_inflated' in park_chars and batter_hand.upper() == 'L':
+                    live.at[idx, 'would_be_hr_differential'] = 0.08  # +8% for LHH in LH-friendly park
+                elif 'rh_inflated' in park_chars and batter_hand.upper() == 'R':
+                    live.at[idx, 'would_be_hr_differential'] = 0.08  # +8% for RHH in RH-friendly park
+                    
+            except Exception:
+                pass
+    
+    # =====================================================================
     # FILL ALL PROFESSIONAL FEATURES WITH DEFAULTS
     # =====================================================================
     professional_features = [
         'platoon_advantage_multiplier', 'breaking_pitch_vulnerability',
         'left_on_right_fade_score', 'reverse_split_anomaly_score',
+        'ballpark_park_factor', 'porch_advantage_bonus',
+        'death_valley_penalty', 'would_be_hr_differential',
         'bullpen_quality_score_home', 'bullpen_quality_score_away',
         'umpire_strike_zone_impact', 'density_altitude_factor',
         'weather_extremes_multiplier', 'sportsbook_value_score'
