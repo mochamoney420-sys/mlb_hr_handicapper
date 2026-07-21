@@ -951,6 +951,9 @@ def generate_daily_predictions():
     print("PHASE 1: LOADING TRAINING DATA")
     print("="*70)
     b_stats, p_stats, raw_pa = get_advanced_hr_metrics(days_back=60)
+    
+    # Store raw Statcast data for professional bettor feature calculations
+    statcast_df = raw_pa.copy()
 
     # Drop columns from raw_pa that also exist in b_stats/p_stats to avoid
     # pandas creating _x/_y suffixes on merge (rolling features live in both).
