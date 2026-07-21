@@ -1,12 +1,24 @@
 """Run daily predictions for MLB HR model with Weather and Park Factors."""
 # =====================================================================
-# SECTION 1: IMPORTS
+# SECTION 1: IMPORTS & ENV LOADING
 # =====================================================================
 import argparse
 import sys
+import subprocess
 from datetime import datetime
 from pathlib import Path
 import os
+
+# Load environment variables from .vscode/.env
+env_file = Path(__file__).parent / '.vscode' / '.env'
+if env_file.exists():
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            key, val = line.split('=', 1)
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            os.environ.setdefault(key.strip(), val.strip())
 import time
 import math
 import json as _json
@@ -1220,6 +1232,19 @@ def main():
         return
 
     generate_daily_predictions()
+    
+    # Spawn background live monitor process to catch home runs throughout the day
+    try:
+        print("\n📡 Starting live home run monitor in background...")
+        subprocess.Popen(
+            [sys.executable, __file__, "--live"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        )
+        print("✅ Live monitor launched. Alerts will post to Discord throughout the day.")
+    except Exception as e:
+        print(f"⚠️ Could not start live monitor: {e}")
 
 
 if __name__ == "__main__":
