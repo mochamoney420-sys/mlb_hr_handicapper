@@ -68,6 +68,23 @@ try:
 except ImportError:
     print("Warning: baseball_savant module not available")
     check_lineups_morning = None
+
+# Import Professional Bettor features
+try:
+    from src.professional_bettors import (
+        get_pitcher_platoon_splits, identify_platoon_mismatches,
+        calculate_bullpen_fatigue_score, get_bullpen_quality_multiplier,
+        get_umpire_strike_zone_profile, get_todays_umpires,
+        calculate_density_altitude, get_gameday_conditions,
+        detect_weather_extremes, get_sportsbook_comparison,
+        find_optimal_pairings, generate_professional_recommendations,
+        detect_breaking_pitch_vulnerability, identify_left_on_right_fade_opportunity,
+        detect_reverse_split_anomaly
+    )
+    from src.stadium_info import get_stadium_elevation, STADIUM_INFO
+except ImportError:
+    print("Warning: professional_bettors module not available")
+    get_pitcher_platoon_splits = None
     check_lineups_pregame = None
     save_lineup_report = None
     get_batted_balls_quality_metrics = None
@@ -944,15 +961,22 @@ def generate_daily_predictions():
     missed_count = int((sample_weights > 1.2).sum())
     print(f"Feedback weights loaded — {missed_count} training rows upweighted from past misses.")
     
-    # Updated Matrix including Weather, Park Factors, and recent performance vectors
+    # Updated Matrix including Weather, Park Factors, Batted Balls, and Professional Features
     features = [
-        'has_platoon_advantage',
+        # Platoon & Matchup Features (Advanced Handedness)
+        'has_platoon_advantage', 'platoon_advantage_multiplier',
+        'breaking_pitch_vulnerability', 'left_on_right_fade_score',
+        'reverse_split_anomaly_score',
+        
+        # Batter Features (20 batted ball metrics)
         'bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate',
         'bat_hr_fb_rate', 'bat_pull_rate', 'bat_ev90', 'bat_iso_proxy', 'bat_days_since_last_game',
         'bat_15pa_barrel_rate', 'bat_30pa_barrel_rate',
         'bat_15pa_hard_hit_rate', 'bat_30pa_hard_hit_rate',
         'bat_15pa_sweet_spot_rate', 'bat_30pa_sweet_spot_rate',
         'bat_15pa_fb_rate', 'bat_30pa_fb_rate',
+        
+        # Pitcher Features (20 batted ball allowed metrics)
         'pitch_pa_count', 'pitch_hr_allowed_rate', 'pitch_barrel_allowed_rate',
         'pitch_hard_hit_allowed_rate', 'pitch_hr_fb_allowed_rate', 'pitch_days_since_last_start',
         'pitch_avg_velocity',
@@ -960,7 +984,14 @@ def generate_daily_predictions():
         'pitch_15pa_barrel_allowed_rate', 'pitch_30pa_barrel_allowed_rate',
         'pitch_15pa_hard_hit_allowed_rate', 'pitch_30pa_hard_hit_allowed_rate',
         'pitch_15pa_fb_allowed_rate', 'pitch_30pa_fb_allowed_rate',
-        'park_factor', 'temp', 'wind_speed', 'wind_out_component'
+        
+        # Stadium & Weather Features
+        'park_factor', 'temp', 'wind_speed', 'wind_out_component',
+        
+        # Professional Bettor Features (NEW)
+        'bullpen_quality_score_home', 'bullpen_quality_score_away',
+        'umpire_strike_zone_impact', 'density_altitude_factor',
+        'weather_extremes_multiplier', 'sportsbook_value_score'
     ]
     
     X_train = train_df[features]
@@ -1048,6 +1079,135 @@ def generate_daily_predictions():
     live['wind_out_component'] = live['wind_out_component'].fillna(0.0)
     live['bat_pull_rate'] = live['bat_pull_rate'].fillna(0.38)
     live['game_time'] = live['game_time'].fillna('') if 'game_time' in live.columns else ''
+    
+    # =====================================================================
+    # PROFESSIONAL BETTOR FEATURES CALCULATION
+    # =====================================================================
+    
+    # 1. Platoon Advantage Multiplier & Advanced Handedness Analysis (Pitcher L/R vs Batter L/R)
+    live['platoon_advantage_multiplier'] = 1.0
+    live['breaking_pitch_vulnerability'] = 1.0
+    live['left_on_right_fade_score'] = 1.0
+    live['reverse_split_anomaly_score'] = 1.0
+    
+    if get_pitcher_platoon_splits is not None and not statcast_df.empty:
+        for idx, row in live.iterrows():
+            try:
+                pitcher_id = row.get('pitcher')
+                batter_id = row.get('batter')
+                batter_hand = row.get('batter_hand', 'R')
+                
+                if pitcher_id and batter_id:
+                    # Main platoon advantage (includes sightline, breaking ball vulnerability, reverse splits)
+                    mult = identify_platoon_mismatches(batter_id, pitcher_id, batter_hand, statcast_df)
+                    live.at[idx, 'platoon_advantage_multiplier'] = mult
+                    
+                    # Breaking pitch vulnerability (slider breaks into power zone)
+                    bp_vuln = detect_breaking_pitch_vulnerability(pitcher_id, batter_hand, statcast_df)
+                    live.at[idx, 'breaking_pitch_vulnerability'] = bp_vuln
+                    
+                    # Left-on-right fade opportunity (RHP without changeup vs LHH)
+                    if batter_hand == 'L':
+                        lor_fade = identify_left_on_right_fade_opportunity(pitcher_id, statcast_df)
+                        live.at[idx, 'left_on_right_fade_score'] = lor_fade
+                    
+                    # Reverse split anomaly (same-handed guy crushing it)
+                    is_anomaly, anomaly_mult = detect_reverse_split_anomaly(pitcher_id, statcast_df)
+                    if is_anomaly:
+                        live.at[idx, 'reverse_split_anomaly_score'] = anomaly_mult
+            except Exception:
+                pass
+    
+    # 2. Bullpen Quality Scores
+    live['bullpen_quality_score_home'] = 50.0  # Neutral default
+    live['bullpen_quality_score_away'] = 50.0
+    if get_pitcher_platoon_splits is not None:  # Use as marker for professional module availability
+        for idx, row in live.iterrows():
+            try:
+                home_team = row.get('home_team', '')
+                away_team = row.get('away_team', '')
+                
+                if home_team:
+                    live.at[idx, 'bullpen_quality_score_home'] = calculate_bullpen_fatigue_score(home_team, datetime.today(), statcast_df)
+                if away_team:
+                    live.at[idx, 'bullpen_quality_score_away'] = calculate_bullpen_fatigue_score(away_team, datetime.today(), statcast_df)
+            except Exception:
+                pass
+    
+    # 3. Umpire Strike Zone Impact
+    live['umpire_strike_zone_impact'] = 1.0
+    if get_todays_umpires is not None:
+        try:
+            umpires = get_todays_umpires()
+            for idx, row in live.iterrows():
+                game_id = row.get('game_id')
+                if game_id and game_id in umpires:
+                    profile = umpires[game_id].get('profile', {})
+                    live.at[idx, 'umpire_strike_zone_impact'] = profile.get('impact', 1.0)
+        except Exception:
+            pass
+    
+    # 4. Density Altitude Factor
+    live['density_altitude_factor'] = 1.0
+    if calculate_density_altitude is not None:
+        for idx, row in live.iterrows():
+            try:
+                temp = row.get('temp', 70)
+                elevation = row.get('elevation', 0)
+                humidity = row.get('humidity', 50)
+                
+                if elevation == 0:
+                    # Try to get from stadium info
+                    game_id = row.get('game_id')
+                    venue_id = row.get('venue_id')
+                    if venue_id:
+                        elevation = STADIUM_INFO.get(venue_id, {}).get('elevation', 0)
+                
+                da_calc = calculate_density_altitude(float(temp), float(elevation), float(humidity))
+                live.at[idx, 'density_altitude_factor'] = da_calc.get('ball_carry_factor', 1.0)
+            except Exception:
+                pass
+    
+    # 5. Weather Extremes Multiplier
+    live['weather_extremes_multiplier'] = 1.0
+    if detect_weather_extremes is not None:
+        for idx, row in live.iterrows():
+            try:
+                temp = row.get('temp', 70)
+                wind = row.get('wind_speed', 0)
+                humidity = row.get('humidity', 50)
+                
+                conditions = {'temperature': float(temp), 'wind_speed': float(wind), 'humidity': float(humidity)}
+                mult = detect_weather_extremes(conditions)
+                live.at[idx, 'weather_extremes_multiplier'] = mult
+            except Exception:
+                pass
+    
+    # 6. Sportsbook Value Score (placeholder - requires odds data)
+    live['sportsbook_value_score'] = 1.0
+    
+    # =====================================================================
+    # FILL ALL PROFESSIONAL FEATURES WITH DEFAULTS
+    # =====================================================================
+    professional_features = [
+        'platoon_advantage_multiplier', 'breaking_pitch_vulnerability',
+        'left_on_right_fade_score', 'reverse_split_anomaly_score',
+        'bullpen_quality_score_home', 'bullpen_quality_score_away',
+        'umpire_strike_zone_impact', 'density_altitude_factor',
+        'weather_extremes_multiplier', 'sportsbook_value_score'
+    ]
+    
+    for col in professional_features:
+        if col not in live.columns:
+            if 'score' in col or 'multiplier' in col or 'impact' in col or 'factor' in col or 'value' in col:
+                live[col] = 1.0
+            else:
+                live[col] = 50.0
+        else:
+            if 'score' in col or 'multiplier' in col or 'impact' in col or 'factor' in col or 'value' in col:
+                live[col] = live[col].fillna(1.0)
+            else:
+                live[col] = live[col].fillna(50.0)
 
     X_live = live[features]
     all_probs = [m.predict_proba(X_live)[:, 1] for m in trained_models]
