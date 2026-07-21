@@ -28,7 +28,15 @@ if env_file.exists():
             key, val = line.split('=', 1)
             if val.startswith('"') and val.endswith('"'):
                 val = val[1:-1]
-            os.environ.setdefault(key.strip(), val.strip())
+            key = key.strip()
+            val = val.strip()
+
+            # Discord keys must come from project env file so stale shell vars
+            # do not keep pointing at deleted/rotated webhooks.
+            if key.startswith('DISCORD_'):
+                os.environ[key] = val
+            else:
+                os.environ.setdefault(key, val)
 import time
 import math
 import json as _json
@@ -89,6 +97,22 @@ except ImportError:
     save_lineup_report = None
     get_batted_balls_quality_metrics = None
     get_todays_games = None
+
+try:
+    from src.pa_physics_pipeline import apply_physics_pipeline_to_live
+except ImportError:
+    print("Warning: pa_physics_pipeline module not available")
+    apply_physics_pipeline_to_live = None
+
+try:
+    from src.free_odds_sources import (
+        load_free_odds_sources,
+        build_devigged_probs_from_books,
+    )
+except ImportError:
+    print("Warning: free_odds_sources module not available")
+    load_free_odds_sources = None
+    build_devigged_probs_from_books = None
 
 # Import Ballpark Dimensions features
 try:
@@ -153,7 +177,7 @@ VENUE_MAP = {
     'Chase Field': 'ARI', 'Truist Park': 'ATL', 'Oriole Park at Camden Yards': 'BAL',
     'Fenway Park': 'BOS', 'Wrigley Field': 'CHC', 'Guaranteed Rate Field': 'CWS',
     'Great American Ball Park': 'CIN', 'Progressive Field': 'CLE', 'Coors Field': 'COL',
-    'Comerica Park': 'DET', 'Minute Maid Park': 'HOU', 'Kauffman Stadium': 'KC',
+    'Comerica Park': 'DET', 'Minute Maid Park': 'HOU', 'Daikin Park': 'HOU', 'Kauffman Stadium': 'KC',
     'Angel Stadium': 'LAA', 'Dodger Stadium': 'LAD', 'LoanDepot Park': 'MIA',
     'American Family Field': 'MIL', 'Target Field': 'MIN', 'Citi Field': 'NYM',
     'Yankee Stadium': 'NYY', 'Oakland Coliseum': 'OAK', 'Citizens Bank Park': 'PHI',
@@ -208,9 +232,137 @@ def persist_daily_predictions(predictions_df, date_str=None):
     return filename
 
 
+def print_bet_ready_wagers(date_str=None, top_n=15):
+    """Print only actionable wagers from today's predictions file.
+
+    Safeguards:
+    - Excludes rows with missing odds
+    - Excludes rows outside configured American-odds range
+    - Requires +EV and Kelly > 0
+    """
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    pred_file = Path('data') / f'predictions_{date_str}.csv'
+    if not pred_file.exists():
+        print(f"NO BETS TODAY: missing predictions file ({pred_file}).")
+        return pd.DataFrame()
+
+    try:
+        preds = pd.read_csv(pred_file)
+    except Exception as exc:
+        print(f"NO BETS TODAY: failed to read predictions file ({exc}).")
+        return pd.DataFrame()
+
+    if preds.empty:
+        print("NO BETS TODAY: predictions file is empty.")
+        return pd.DataFrame()
+
+    for num_col in ['kelly_fraction', 'ev_percent', 'pred_hr_prob', 'edge_pct', 'best_market_odds_american']:
+        if num_col in preds.columns:
+            preds[num_col] = pd.to_numeric(preds[num_col], errors='coerce')
+
+    def _env_int(name, default):
+        try:
+            return int(float(os.getenv(name, str(default))))
+        except Exception:
+            return int(default)
+
+    # Conservative default range for HR props; override via env if needed.
+    min_american = _env_int('BET_READY_MIN_AMERICAN_ODDS', -300)
+    max_american = _env_int('BET_READY_MAX_AMERICAN_ODDS', 5000)
+
+    if 'is_positive_ev' in preds.columns:
+        preds['is_positive_ev_bool'] = preds['is_positive_ev'].astype(str).str.lower().eq('true')
+    elif 'ev_percent' in preds.columns:
+        preds['is_positive_ev_bool'] = pd.to_numeric(preds['ev_percent'], errors='coerce').fillna(0) > 0
+    else:
+        preds['is_positive_ev_bool'] = False
+
+    if 'best_market_odds_american' in preds.columns:
+        preds['has_market_odds'] = preds['best_market_odds_american'].astype(str).str.strip().ne('')
+        preds.loc[preds['best_market_odds_american'].isna(), 'has_market_odds'] = False
+    else:
+        preds['has_market_odds'] = False
+
+    preds['odds_in_sanity_range'] = (
+        preds['best_market_odds_american'].notna() &
+        (preds['best_market_odds_american'] >= min_american) &
+        (preds['best_market_odds_american'] <= max_american)
+    ) if 'best_market_odds_american' in preds.columns else False
+
+    actionable = preds[
+        preds['is_positive_ev_bool'] &
+        preds['has_market_odds'] &
+        preds['odds_in_sanity_range'] &
+        (preds['kelly_fraction'].fillna(0) > 0)
+    ].copy()
+
+    if actionable.empty:
+        with_odds_count = int(preds['has_market_odds'].sum())
+        sane_odds_count = int(preds['odds_in_sanity_range'].sum())
+        print(
+            "NO BETS TODAY: no actionable +EV wagers "
+            "(requires market odds, sane odds range, positive EV, and Kelly > 0)."
+        )
+        print(
+            f"Diagnostics: rows={len(preds)}, with_odds={with_odds_count}, "
+            f"sane_odds={sane_odds_count}, positive_ev={int(preds['is_positive_ev_bool'].sum())}, "
+            f"odds_range=[{min_american},{max_american}]"
+        )
+        return actionable
+
+    excluded_outlier_count = int((
+        preds['is_positive_ev_bool'] & preds['has_market_odds'] & ~preds['odds_in_sanity_range']
+    ).sum())
+
+    keep_cols = [
+        'batter_name', 'pitcher_name', 'pred_hr_prob', 'best_book',
+        'best_market_odds_american', 'fair_odds_american',
+        'ev_percent', 'edge_pct', 'kelly_fraction', 'game_time'
+    ]
+    keep_cols = [c for c in keep_cols if c in actionable.columns]
+    report = actionable[keep_cols].sort_values(
+        by=['ev_percent', 'kelly_fraction'],
+        ascending=[False, False]
+    ).head(max(1, int(top_n))).reset_index(drop=True)
+
+    print("\nBET-READY WAGERS (+EV, ODDS-VALIDATED):")
+    if excluded_outlier_count > 0:
+        print(
+            "Filtered out "
+            f"{excluded_outlier_count} +EV rows with outlier market odds outside "
+            f"[{min_american},{max_american}]."
+        )
+    print(report.to_string(index=False))
+    return report
+
+
+def _candidate_discord_webhooks(explicit_webhook=None):
+    """Return normalized webhook candidates in priority order."""
+    candidates = [
+        explicit_webhook,
+        os.getenv("DISCORD_MLB_WEBHOOK"),
+        os.getenv("DISCORD_WEBHOOK_URL"),
+        os.getenv("DISCORD_WEBHOOK"),
+        os.getenv("DISCORD_MLB_WEBHOOK_BACKUP"),
+        os.getenv("DISCORD_WEBHOOK_URL_BACKUP"),
+    ]
+
+    normalized = []
+    for url in candidates:
+        if not url:
+            continue
+        cleaned = str(url).strip().strip('"').strip("'")
+        if not cleaned:
+            continue
+        normalized.append(cleaned)
+
+    # Keep order while removing duplicates.
+    return list(dict.fromkeys(normalized))
+
+
 def send_discord_webhook(content=None, embeds=None, webhook_url=None):
-    webhook_url = webhook_url or os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
+    webhook_candidates = _candidate_discord_webhooks(explicit_webhook=webhook_url)
+    if not webhook_candidates:
         print("Discord webhook not configured; skipping notification.")
         return False
 
@@ -224,16 +376,38 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None):
         print("Nothing to send to Discord; payload is empty.")
         return False
 
-    try:
-        response = requests.post(webhook_url, json=payload, timeout=5)
-        if response.status_code == 204:
-            print("Discord notification sent successfully.")
-            return True
-        print(f"Discord webhook returned status {response.status_code}: {getattr(response, 'text', '')}")
-        return False
-    except Exception as e:
-        print(f"Failed to send Discord notification: {e}")
-        return False
+    for idx, candidate in enumerate(webhook_candidates):
+        try:
+            response = requests.post(candidate, json=payload, timeout=8)
+            if response.status_code == 204:
+                if idx > 0:
+                    print("Discord notification sent successfully using backup webhook.")
+                else:
+                    print("Discord notification sent successfully.")
+                return True
+            if response.status_code == 404:
+                print(
+                    f"Discord webhook returned 404 for candidate #{idx + 1}. "
+                    "This webhook was likely deleted/rotated; trying next candidate if available."
+                )
+                continue
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                print(
+                    "Discord rate-limited webhook call (429). "
+                    f"Retry-After={retry_after}; trying next candidate if available."
+                )
+                continue
+
+            print(
+                f"Discord webhook returned status {response.status_code}: "
+                f"{getattr(response, 'text', '')}"
+            )
+            return False
+        except Exception as e:
+            print(f"Failed to send Discord notification via candidate #{idx + 1}: {e}")
+
+    return False
 
 
 def load_or_fetch_statcast(date_str):
@@ -255,39 +429,525 @@ def load_or_fetch_statcast(date_str):
         return pd.DataFrame()
 
 
+def _load_actual_hr_outcomes(date_str):
+    """Load actual HR outcomes for a date keyed by (game_pk, batter, pitcher)."""
+    actual = load_or_fetch_statcast(date_str)
+    if actual is None or actual.empty:
+        return pd.DataFrame()
+
+    need_cols = {'game_pk', 'batter', 'pitcher', 'events'}
+    if not need_cols.issubset(set(actual.columns)):
+        return pd.DataFrame()
+
+    actual = actual.dropna(subset=['game_pk', 'batter', 'pitcher', 'events']).copy()
+    actual['is_hr'] = (actual['events'] == 'home_run').astype(int)
+    return actual.groupby(['game_pk', 'batter', 'pitcher'], as_index=False).agg(actual_hr=('is_hr', 'max'))
+
+
+def calibrate_physics_blend_weight(days_lookback=30, default_weight=0.45):
+    """Grid-search blend weight over recent predictions with physics diagnostics.
+
+    Returns best physics weight in [0.0, 1.0] that minimizes Brier score.
+    """
+    cutoff = datetime.today() - timedelta(days=days_lookback)
+    candidates = [round(x, 2) for x in np.arange(0.0, 1.01, 0.05)]
+    scores = {w: [] for w in candidates}
+    eligible_days = 0
+
+    for f in sorted(Path('data').glob('predictions_*.csv')):
+        try:
+            date_str = f.stem.replace('predictions_', '')
+            file_date = datetime.strptime(date_str, '%Y-%m-%d')
+            if file_date < cutoff:
+                continue
+
+            preds = pd.read_csv(f)
+            if preds.empty:
+                continue
+            if 'pred_hr_prob' not in preds.columns or 'physics_hr_prob' not in preds.columns:
+                continue
+
+            actual = _load_actual_hr_outcomes(date_str)
+            if actual.empty:
+                continue
+
+            merged = preds.merge(actual, on=['game_pk', 'batter', 'pitcher'], how='inner')
+            if merged.empty:
+                continue
+
+            base_col = 'base_model_prob' if 'base_model_prob' in merged.columns else 'pred_hr_prob'
+            merged['base_prob'] = pd.to_numeric(merged[base_col], errors='coerce').fillna(0.0)
+            merged['physics_prob'] = pd.to_numeric(merged['physics_hr_prob'], errors='coerce').fillna(0.0)
+            merged['actual_hr'] = pd.to_numeric(merged['actual_hr'], errors='coerce').fillna(0.0)
+
+            eligible_days += 1
+            for w in candidates:
+                blended = ((1 - w) * merged['base_prob']) + (w * merged['physics_prob'])
+                brier = ((blended - merged['actual_hr']) ** 2).mean()
+                scores[w].append(float(brier))
+        except Exception:
+            continue
+
+    if eligible_days == 0:
+        print(f"Blend calibration: no eligible historical files in last {days_lookback} days; using default {default_weight:.2f}")
+        return default_weight
+
+    avg_scores = {w: (sum(v) / len(v) if v else 1e9) for w, v in scores.items()}
+    best_weight = min(avg_scores, key=avg_scores.get)
+    print(
+        "Blend calibration: "
+        f"best physics weight={best_weight:.2f} "
+        f"(days={eligible_days}, avg_brier={avg_scores[best_weight]:.5f})"
+    )
+    return float(best_weight)
+
+
+def resolve_probability_mode_and_weight():
+    """Resolve runtime prediction mode and blend weight from env/config.
+
+    HR_PROB_MODE:
+      - base: model-only probabilities
+      - physics: physics-only probabilities
+      - blended: weighted blend (default)
+      - auto: alias of blended
+
+    HR_PHYSICS_BLEND_WEIGHT:
+      - Optional float 0-1 override for blended mode.
+      - If not set, auto-calibrated on recent history.
+    """
+    mode = str(os.getenv('HR_PROB_MODE', 'blended')).strip().lower()
+    if mode == 'auto':
+        mode = 'blended'
+    if mode not in {'base', 'physics', 'blended'}:
+        mode = 'blended'
+
+    raw_weight = os.getenv('HR_PHYSICS_BLEND_WEIGHT')
+    if raw_weight is not None and raw_weight != '':
+        try:
+            weight = max(0.0, min(1.0, float(raw_weight)))
+            print(f"Blend weight override from HR_PHYSICS_BLEND_WEIGHT: {weight:.2f}")
+        except Exception:
+            weight = calibrate_physics_blend_weight(days_lookback=30, default_weight=0.45)
+    else:
+        weight = calibrate_physics_blend_weight(days_lookback=30, default_weight=0.45)
+
+    return mode, weight
+
+
+def run_model_self_check(days_lookback=30):
+    """Print current runtime mode/weight and physics calibration readiness."""
+    print("\n" + "=" * 70)
+    print("MODEL SELF-CHECK")
+    print("=" * 70)
+
+    mode_env = str(os.getenv('HR_PROB_MODE', 'blended')).strip().lower()
+    weight_override = os.getenv('HR_PHYSICS_BLEND_WEIGHT')
+    print(f"Physics module loaded: {apply_physics_pipeline_to_live is not None}")
+    print(f"HR_PROB_MODE env: {mode_env}")
+    print(f"HR_PHYSICS_BLEND_WEIGHT env: {weight_override if weight_override else 'not set'}")
+    print(f"FREE_ODDS_STRICT_SCHEMA: {os.getenv('FREE_ODDS_STRICT_SCHEMA', 'true')}")
+
+    reject_log = os.getenv('FREE_ODDS_REJECT_LOG', '').strip()
+    if reject_log:
+        reject_path = Path(reject_log)
+    else:
+        reject_path = Path('data') / f"free_odds_rejects_{datetime.today().strftime('%Y-%m-%d')}.csv"
+    if reject_path.exists():
+        try:
+            _rej = pd.read_csv(reject_path)
+            print(f"Free-odds reject log: {reject_path} ({len(_rej)} rows)")
+        except Exception:
+            print(f"Free-odds reject log: {reject_path} (unreadable)")
+    else:
+        print(f"Free-odds reject log: {reject_path} (not created yet)")
+
+    cutoff = datetime.today() - timedelta(days=days_lookback)
+    pred_files = []
+    files_with_physics = 0
+    for f in sorted(Path('data').glob('predictions_*.csv')):
+        try:
+            file_date = datetime.strptime(f.stem.replace('predictions_', ''), '%Y-%m-%d')
+            if file_date < cutoff:
+                continue
+            pred_files.append(f)
+            df = pd.read_csv(f, nrows=5)
+            if 'physics_hr_prob' in df.columns:
+                files_with_physics += 1
+        except Exception:
+            continue
+
+    print(f"Prediction files in lookback window: {len(pred_files)}")
+    print(f"Files with physics columns: {files_with_physics}")
+
+    effective_mode, effective_weight = resolve_probability_mode_and_weight()
+    print(f"Effective mode: {effective_mode}")
+    print(f"Effective physics blend weight: {effective_weight:.2f}")
+
+
+def backfill_physics_columns(days_lookback=30):
+    """Backfill physics columns in recent prediction files using context heuristics.
+
+    This enables earlier blend calibration on historical files that predate
+    the physics pipeline persistence columns.
+    """
+    cutoff = datetime.today() - timedelta(days=days_lookback)
+    updated = 0
+    skipped = 0
+
+    print(f"Backfilling physics columns for last {days_lookback} days...")
+    for f in sorted(Path('data').glob('predictions_*.csv')):
+        try:
+            date_str = f.stem.replace('predictions_', '')
+            file_date = datetime.strptime(date_str, '%Y-%m-%d')
+            if file_date < cutoff:
+                continue
+
+            df = pd.read_csv(f)
+            if df.empty or 'pred_hr_prob' not in df.columns:
+                skipped += 1
+                continue
+
+            changed = False
+            base_prob = pd.to_numeric(df.get('base_model_prob', df['pred_hr_prob']), errors='coerce').fillna(0.0)
+
+            if 'physics_hr_prob' not in df.columns:
+                temp = pd.to_numeric(df.get('temp', 71.0), errors='coerce').fillna(71.0)
+                wind = pd.to_numeric(df.get('wind_speed', 5.0), errors='coerce').fillna(5.0)
+                wind_out = pd.to_numeric(df.get('wind_out_component', 0.0), errors='coerce').fillna(0.0)
+                park = pd.to_numeric(df.get('park_factor', 100.0), errors='coerce').fillna(100.0)
+                platoon = pd.to_numeric(df.get('has_platoon_advantage', 0), errors='coerce').fillna(0.0)
+
+                temp_boost = ((temp - 70.0) * 0.0015).clip(-0.03, 0.04)
+                wind_boost = (wind_out * 0.0035 + wind * 0.0008).clip(-0.05, 0.06)
+                park_boost = ((park - 100.0) * 0.0012).clip(-0.08, 0.08)
+                platoon_boost = (platoon * 0.010).clip(0.0, 0.015)
+
+                heur_mult = 1.0 + temp_boost + wind_boost + park_boost + platoon_boost
+                physics_prob = np.clip(base_prob * heur_mult, 0.0, 1.0)
+                df['physics_hr_prob'] = physics_prob
+                changed = True
+
+            defaults = {
+                'base_model_prob': base_prob,
+                'physics_per_pa_hr_prob': pd.to_numeric(df.get('physics_per_pa_hr_prob', 0.0), errors='coerce').fillna(0.0),
+                'density_altitude_ft': pd.to_numeric(df.get('density_altitude_ft', 0.0), errors='coerce').fillna(0.0),
+                'air_density_kg_m3': pd.to_numeric(df.get('air_density_kg_m3', 1.225), errors='coerce').fillna(1.225),
+                'drag_multiplier': pd.to_numeric(df.get('drag_multiplier', 1.0), errors='coerce').fillna(1.0),
+                'pitch_micro_matchup_score': pd.to_numeric(df.get('pitch_micro_matchup_score', 1.0), errors='coerce').fillna(1.0),
+                'vaa_attack_angle_score': pd.to_numeric(df.get('vaa_attack_angle_score', 1.0), errors='coerce').fillna(1.0),
+                'umpire_catcher_cascade': pd.to_numeric(df.get('umpire_catcher_cascade', 1.0), errors='coerce').fillna(1.0),
+                'fatigue_index': pd.to_numeric(df.get('fatigue_index', 0.0), errors='coerce').fillna(0.0),
+                'spin_decay_rpm': pd.to_numeric(df.get('spin_decay_rpm', 0.0), errors='coerce').fillna(0.0),
+                'spin_decay_flag': pd.to_numeric(df.get('spin_decay_flag', 0.0), errors='coerce').fillna(0.0),
+                'lineup_protection_woba_proxy': pd.to_numeric(df.get('lineup_protection_woba_proxy', 0.10), errors='coerce').fillna(0.10),
+                'context_multiplier': pd.to_numeric(df.get('context_multiplier', 1.0), errors='coerce').fillna(1.0),
+                'blend_weight_physics': pd.to_numeric(df.get('blend_weight_physics', 0.45), errors='coerce').fillna(0.45),
+                'line_release_window_flag': pd.to_numeric(df.get('line_release_window_flag', 0), errors='coerce').fillna(0),
+                'nrfi_under_drag_score': pd.to_numeric(df.get('nrfi_under_drag_score', 0.0), errors='coerce').fillna(0.0),
+                'prob_edge_abs': pd.to_numeric(df.get('prob_edge_abs', 0.0), errors='coerce').fillna(0.0),
+            }
+
+            for col, val in defaults.items():
+                if col not in df.columns:
+                    df[col] = val
+                    changed = True
+
+            if 'probability_mode' not in df.columns:
+                df['probability_mode'] = 'backfilled'
+                changed = True
+
+            if 'physics_delta' not in df.columns:
+                df['physics_delta'] = pd.to_numeric(df['physics_hr_prob'], errors='coerce').fillna(base_prob) - base_prob
+                changed = True
+
+            if changed:
+                df.to_csv(f, index=False)
+                updated += 1
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
+
+    print(f"Backfill complete: updated={updated}, skipped={skipped}")
+
+
+def print_weekly_todo(days_lookback=7):
+    """Print a prioritized next-week action list from live system signals."""
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    pred_file = Path('data') / f'predictions_{today_str}.csv'
+
+    print("\n" + "=" * 70)
+    print("NEXT-WEEK TODO (AUTO-GENERATED)")
+    print("=" * 70)
+
+    todos = []
+
+    # 1) Market integration blockers
+    if not os.getenv('ODDS_API_KEY'):
+        todos.append(("HIGH", "Set ODDS_API_KEY in .vscode/.env to unlock live market EV and RLM."))
+        todos.append(("HIGH", "Or configure compliant free-source ingest: FREE_ODDS_JSON_PATH / FREE_ODDS_CSV_PATH / FREE_ODDS_PUBLIC_URLS."))
+    else:
+        try:
+            probe = fetch_hr_prop_odds()
+            if not probe:
+                todos.append(("HIGH", "Odds API responding without usable HR prop data. Verify plan/market access and request parameters."))
+        except Exception:
+            todos.append(("HIGH", "Odds API probe failed. Verify key, plan tier, and API availability."))
+
+    webhook = os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook:
+        todos.append(("HIGH", "Configure DISCORD_MLB_WEBHOOK or DISCORD_WEBHOOK_URL for delivery alerts."))
+
+    # 2) Calibration readiness
+    cutoff = datetime.today() - timedelta(days=days_lookback)
+    pred_files = []
+    eval_files = []
+    for f in Path('data').glob('predictions_*.csv'):
+        try:
+            d = datetime.strptime(f.stem.replace('predictions_', ''), '%Y-%m-%d')
+            if d >= cutoff:
+                pred_files.append(f)
+        except Exception:
+            pass
+    for f in Path('data').glob('evaluation_*.csv'):
+        try:
+            d = datetime.strptime(f.stem.replace('evaluation_', ''), '%Y-%m-%d')
+            if d >= cutoff:
+                eval_files.append(f)
+        except Exception:
+            pass
+
+    if len(pred_files) < 3 or len(eval_files) < 3:
+        todos.append(("HIGH", "Calibration sample too small. Accumulate at least 3-5 days of prediction+evaluation files for stable blend tuning."))
+
+    # 3) Pitcher name coverage quality
+    try:
+        df_live = get_today_matchups()
+        if df_live is not None and not df_live.empty and 'pitcher_name' in df_live.columns:
+            unknown_rate = (df_live['pitcher_name'].fillna('').str.contains('Unknown', case=False)).mean()
+            if unknown_rate > 0.15:
+                todos.append(("MEDIUM", f"Unknown pitcher rate is {unknown_rate:.0%}. Improve probable starter resolution in matchup builder."))
+    except Exception:
+        if pred_file.exists():
+            try:
+                df = pd.read_csv(pred_file)
+                if not df.empty and 'pitcher_name' in df.columns:
+                    unknown_rate = (df['pitcher_name'].fillna('').str.contains('Unknown', case=False)).mean()
+                    if unknown_rate > 0.15:
+                        todos.append(("MEDIUM", f"Unknown pitcher rate is {unknown_rate:.0%}. Improve probable starter resolution in matchup builder."))
+            except Exception:
+                pass
+
+    # 4) Scheduling and monitoring reliability
+    todos.append(("MEDIUM", "Add a weekly cron/task to run --self-check and archive output for drift tracking."))
+    todos.append(("MEDIUM", "Review weekly Brier score trend from data/evaluation_*.csv and adjust Kelly multiplier if drift appears."))
+    todos.append(("LOW", "Expand backfill window monthly (--backfill-physics --backfill-days 120) to keep calibration history rich."))
+
+    priority_rank = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+    todos = sorted(todos, key=lambda t: priority_rank.get(t[0], 9))
+
+    if not todos:
+        print("No immediate next-week actions detected.")
+        return
+
+    for i, (p, text) in enumerate(todos, 1):
+        print(f"{i}. [{p}] {text}")
+
+
+def build_correlated_hr_pairings(live_df):
+    """Build 2-leg same-team HR pairings (leadoff/cleanup) vs vulnerable pitcher."""
+    if live_df is None or live_df.empty:
+        return pd.DataFrame()
+
+    req_cols = {'team_side', 'batting_order_slot', 'batter_name', 'pitcher_name', 'pred_hr_prob'}
+    if not req_cols.issubset(set(live_df.columns)):
+        return pd.DataFrame()
+
+    rows = []
+    for _, team_df in live_df.groupby('team_side'):
+        team_df = team_df.sort_values('batting_order_slot')
+        lead = team_df[team_df['batting_order_slot'].isin([1, 2])]
+        clean = team_df[team_df['batting_order_slot'].isin([4, 5])]
+        if lead.empty or clean.empty:
+            continue
+
+        lead_row = lead.sort_values('pred_hr_prob', ascending=False).iloc[0]
+        clean_row = clean.sort_values('pred_hr_prob', ascending=False).iloc[0]
+
+        p1 = float(lead_row['pred_hr_prob'])
+        p2 = float(clean_row['pred_hr_prob'])
+        vuln = max(
+            float(team_df.get('pitch_hr_per_9', pd.Series([1.0])).iloc[0]),
+            float(team_df.get('pitch_hard_hit_allowed_rate', pd.Series([0.3])).iloc[0] * 3.0)
+        )
+        vuln_uplift = 1.12 if vuln >= 1.2 else 1.05
+        combo_prob = min(0.95, (p1 * p2) * vuln_uplift)
+
+        rows.append({
+            'team_side': lead_row.get('team_side', ''),
+            'pair_leg_1': lead_row['batter_name'],
+            'pair_leg_2': clean_row['batter_name'],
+            'opposing_pitcher': lead_row['pitcher_name'],
+            'leg1_prob': p1,
+            'leg2_prob': p2,
+            'combo_prob': combo_prob,
+            'correlation_uplift': vuln_uplift,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values('combo_prob', ascending=False).reset_index(drop=True)
+
+
+def run_systematic_ev_operation(backfill_days=90):
+    """Run end-to-end +EV workflow for scale and repeatability.
+
+    Steps:
+    1) Backfill historical diagnostics for calibration stability
+    2) Self-check runtime mode/weight and data readiness
+    3) Generate today's predictions with 10k simulation physics engine
+    4) Print next-week operational priorities
+    """
+    print("\n" + "=" * 70)
+    print("SYSTEMATIC +EV OPERATION")
+    print("=" * 70)
+    backfill_physics_columns(days_lookback=max(1, int(backfill_days)))
+    run_model_self_check(days_lookback=max(1, int(min(backfill_days, 30))))
+    generate_daily_predictions()
+    print_weekly_todo(days_lookback=7)
+
+
+HR_PROP_MARKET_KEY_CANDIDATES = [
+    'batter_home_runs',
+    'player_home_runs',
+]
+
+
+def _extract_hr_prop_player_book_odds(games_payload, market_keys=None):
+    """Extract {player_name: {book_key: american_odds}} from The Odds API payload."""
+    market_keys = set(market_keys or HR_PROP_MARKET_KEY_CANDIDATES)
+    player_all_odds = {}
+    for game in games_payload or []:
+        for book in game.get('bookmakers', []):
+            book_key = book.get('key', '')
+            for market in book.get('markets', []):
+                if market.get('key') not in market_keys:
+                    continue
+                for outcome in market.get('outcomes', []):
+                    outcome_name = str(outcome.get('name', '')).strip()
+                    # Event-level player props commonly use outcome.name as Over/Under
+                    # and store the player in outcome.description.
+                    player_name = str(outcome.get('description', '')).strip() or outcome_name
+                    price = outcome.get('price')
+
+                    if not player_name or price is None:
+                        continue
+
+                    # Keep only HR "to hit" side for Over/Under or Yes/No style markets.
+                    side = outcome_name.lower()
+                    if side in {'under', 'no'}:
+                        continue
+
+                    if player_name not in player_all_odds:
+                        player_all_odds[player_name] = {}
+                    player_all_odds[player_name][book_key] = price
+    return player_all_odds
+
+
+def _fetch_hr_props_raw_from_odds_api(api_key):
+    """Fetch HR props from The Odds API with fallback to event-level endpoint."""
+    market_keys = HR_PROP_MARKET_KEY_CANDIDATES
+    for market_key in market_keys:
+        # Try top-level odds endpoint first.
+        top_url = (
+            f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+            f"?apiKey={api_key}&regions=us,us2&markets={market_key}"
+            f"&oddsFormat=american&dateFormat=iso"
+        )
+        try:
+            resp = requests.get(top_url, timeout=10)
+            if resp.status_code == 200:
+                parsed = _extract_hr_prop_player_book_odds(resp.json(), market_keys=[market_key])
+                if parsed:
+                    n_pairs = sum(len(v) for v in parsed.values())
+                    print(f"Odds API ({market_key}): {n_pairs} book-player pairs across {len(parsed)} players")
+                    return parsed
+                print(f"Odds API top-level endpoint returned no {market_key} outcomes; trying event-level endpoint.")
+            else:
+                body = (getattr(resp, 'text', '') or '')[:220]
+                print(f"Odds API returned {resp.status_code} on top-level props endpoint ({market_key}): {body}")
+        except Exception as e:
+            print(f"Odds API top-level fetch failed ({market_key}): {e}")
+
+        # Fallback: event-level props endpoint (works for some plan/market combinations).
+        try:
+            events_url = f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events?apiKey={api_key}&dateFormat=iso"
+            events_resp = requests.get(events_url, timeout=10)
+            if events_resp.status_code != 200:
+                body = (getattr(events_resp, 'text', '') or '')[:220]
+                print(f"Odds API events list returned {events_resp.status_code}: {body}")
+                continue
+
+            events = events_resp.json() or []
+            if not events:
+                print("Odds API event list is empty.")
+                continue
+
+            merged = {}
+            for ev in events:
+                ev_id = ev.get('id')
+                if not ev_id:
+                    continue
+                ev_url = (
+                    f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{ev_id}/odds"
+                    f"?apiKey={api_key}&regions=us,us2&markets={market_key}"
+                    f"&oddsFormat=american&dateFormat=iso"
+                )
+                ev_resp = requests.get(ev_url, timeout=10)
+                if ev_resp.status_code != 200:
+                    continue
+
+                ev_payload = ev_resp.json() or {}
+                chunk = _extract_hr_prop_player_book_odds([ev_payload], market_keys=[market_key])
+                for name, books in chunk.items():
+                    if name not in merged:
+                        merged[name] = {}
+                    merged[name].update(books)
+
+            if merged:
+                n_pairs = sum(len(v) for v in merged.values())
+                print(f"Odds API event-level fallback ({market_key}): {n_pairs} book-player pairs across {len(merged)} players")
+                return merged
+            print(f"Odds API event-level fallback returned no {market_key} outcomes.")
+        except Exception as e:
+            print(f"Odds API event-level fallback failed ({market_key}): {e}")
+
+    return {}
+
+
 def fetch_hr_prop_odds():
     """Fetch live HR prop lines from The Odds API. Returns {player_name: devigged_prob}.
     Set ODDS_API_KEY in .env to enable real market edge calculation."""
     api_key = os.getenv('ODDS_API_KEY')
     if not api_key:
+        if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
+            raw_free = load_free_odds_sources()
+            if raw_free:
+                probs = build_devigged_probs_from_books(raw_free)
+                print(f"Free source odds: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
+                return probs
         return {}
     try:
-        url = (
-            f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-            f"?apiKey={api_key}&regions=us,us2&markets=batter_home_runs"
-            f"&oddsFormat=american&dateFormat=iso"
-        )
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            print(f"Odds API returned {resp.status_code}")
+        player_all_odds = _fetch_hr_props_raw_from_odds_api(api_key)
+        if not player_all_odds:
+            if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
+                raw_free = load_free_odds_sources()
+                if raw_free:
+                    probs = build_devigged_probs_from_books(raw_free)
+                    print(f"Free source odds fallback: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
+                    return probs
             return {}
-
-        # Collect all book lines per player
-        player_all_odds = {}  # name -> {book_key: american_odds}
-        for game in resp.json():
-            for book in game.get('bookmakers', []):
-                book_key = book.get('key', '')
-                for market in book.get('markets', []):
-                    if market.get('key') != 'batter_home_runs':
-                        continue
-                    for outcome in market.get('outcomes', []):
-                        name = outcome.get('name', '').strip()
-                        price = outcome.get('price')
-                        if not name or price is None:
-                            continue
-                        if name not in player_all_odds:
-                            player_all_odds[name] = {}
-                        player_all_odds[name][book_key] = price
 
         # Consensus devigged probability — sharp books weighted 2x
         player_probs = {}
@@ -300,12 +960,15 @@ def fetch_hr_prop_odds():
                 weighted_probs.extend([devigged] * weight)
             if weighted_probs:
                 player_probs[name] = round(sum(weighted_probs) / len(weighted_probs), 4)
-
-        n_pairs = sum(len(v) for v in player_all_odds.values())
-        print(f"Odds API: {n_pairs} book-player pairs across {len(player_probs)} players")
         return player_probs
     except Exception as e:
         print(f"Odds API fetch failed: {e}")
+        if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
+            raw_free = load_free_odds_sources()
+            if raw_free:
+                probs = build_devigged_probs_from_books(raw_free)
+                print(f"Free source odds fallback: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
+                return probs
         return {}
 
 
@@ -314,34 +977,84 @@ def fetch_hr_prop_odds_raw():
     Used for RLM monitoring and per-book line movement tracking."""
     api_key = os.getenv('ODDS_API_KEY')
     if not api_key:
+        if load_free_odds_sources is not None:
+            return load_free_odds_sources()
+        return {}
+    try:
+        raw = _fetch_hr_props_raw_from_odds_api(api_key)
+        if not raw:
+            if load_free_odds_sources is not None:
+                return load_free_odds_sources()
+            return {}
+        return raw
+    except Exception as e:
+        print(f"Odds raw fetch failed: {e}")
+        if load_free_odds_sources is not None:
+            return load_free_odds_sources()
+        return {}
+
+
+def american_to_implied_prob(odds):
+    odds = float(odds)
+    if odds > 0:
+        return 100.0 / (odds + 100.0)
+    return abs(odds) / (abs(odds) + 100.0)
+
+
+def prob_to_fair_american(prob):
+    p = max(1e-6, min(1 - 1e-6, float(prob)))
+    if p >= 0.5:
+        return -round((p / (1 - p)) * 100)
+    return round(((1 - p) / p) * 100)
+
+
+def is_line_release_window_et(now_utc=None):
+    now_utc = now_utc or datetime.utcnow()
+    now_et = now_utc - timedelta(hours=4)
+    return 9 <= now_et.hour < 11
+
+
+def fetch_totals_market_pressure():
+    """Fetch totals market and return under-bias pressure keyed by matchup name.
+
+    Returns dict: "away @ home" -> score in [0, 1], where higher means heavier under bias.
+    """
+    api_key = os.getenv('ODDS_API_KEY')
+    if not api_key:
         return {}
     try:
         url = (
             f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-            f"?apiKey={api_key}&regions=us,us2&markets=batter_home_runs"
+            f"?apiKey={api_key}&regions=us,us2&markets=totals"
             f"&oddsFormat=american&dateFormat=iso"
         )
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
             return {}
-        raw = {}
+
+        pressure = {}
         for game in resp.json():
+            away = str(game.get('away_team', '')).strip()
+            home = str(game.get('home_team', '')).strip()
+            key = f"{away} @ {home}"
+            under_prices = []
+
             for book in game.get('bookmakers', []):
-                book_key = book.get('key', '')
                 for market in book.get('markets', []):
-                    if market.get('key') != 'batter_home_runs':
+                    if market.get('key') != 'totals':
                         continue
                     for outcome in market.get('outcomes', []):
-                        name = outcome.get('name', '').strip()
-                        price = outcome.get('price')
-                        if not name or price is None:
-                            continue
-                        if name not in raw:
-                            raw[name] = {}
-                        raw[name][book_key] = price
-        return raw
-    except Exception as e:
-        print(f"Odds raw fetch failed: {e}")
+                        if str(outcome.get('name', '')).lower() == 'under' and outcome.get('price') is not None:
+                            under_prices.append(float(outcome['price']))
+
+            if under_prices:
+                under_probs = [american_to_implied_prob(p) for p in under_prices]
+                avg_under_prob = float(sum(under_probs) / len(under_probs))
+                # 0.50 is neutral. >0.54 means meaningful under pressure.
+                pressure[key] = max(0.0, min(1.0, (avg_under_prob - 0.50) / 0.12))
+
+        return pressure
+    except Exception:
         return {}
 
 
@@ -581,6 +1294,9 @@ def get_advanced_hr_metrics(days_back=60):
         bat_30pa_fb_rate=('bat_30pa_fb_rate', 'last'),
         bat_total_hr=('is_hr', 'sum'),
         bat_total_fb=('is_fly', 'sum'),
+        bat_avg_exit_velocity=('launch_speed', lambda x: float(x[x > 0].mean()) if (x > 0).sum() > 0 else 88.0),
+        bat_max_exit_velocity=('launch_speed', lambda x: float(x[x > 0].max()) if (x > 0).sum() > 0 else 102.0),
+        bat_avg_launch_angle=('launch_angle', lambda x: float(pd.to_numeric(x, errors='coerce').dropna().mean()) if pd.to_numeric(x, errors='coerce').dropna().shape[0] > 0 else 12.0),
         bat_ev90=('launch_speed', lambda x: float(x[x > 0].quantile(0.90)) if (x > 0).sum() > 5 else 88.0),
         bat_iso_proxy=('is_xbh', 'mean'),
         bat_pulled_fly_count=('is_pulled_fly', 'sum')
@@ -611,6 +1327,9 @@ def get_advanced_hr_metrics(days_back=60):
         pitch_avg_velocity=('release_speed', lambda x: float(x[x > 70].mean()) if (x > 70).sum() > 0 else 92.0)
     ).reset_index()
     pitcher_stats['pitch_hr_fb_allowed_rate'] = pitcher_stats['pitch_total_hr'] / pitcher_stats['pitch_total_fb'].clip(lower=1)
+    pitcher_stats['pitch_fb_allowed_rate'] = pitcher_stats['pitch_total_fb'] / pitcher_stats['pitch_pa_count'].clip(lower=1)
+    pitcher_stats['pitch_est_ip'] = pitcher_stats['pitch_pa_count'] / 4.3
+    pitcher_stats['pitch_hr_per_9'] = (pitcher_stats['pitch_total_hr'] * 9) / pitcher_stats['pitch_est_ip'].clip(lower=1)
     _last_pit = pa_df.groupby('pitcher')['game_date'].max().reset_index()
     _last_pit['pitch_days_since_last_start'] = (today_date - _last_pit['game_date']).dt.days.clip(0, 30)
     pitcher_stats = pitcher_stats.merge(_last_pit[['pitcher', 'pitch_days_since_last_start']], on='pitcher', how='left')
@@ -650,6 +1369,8 @@ def get_today_matchups():
         venue_name = game.get('venue_name', '')
         team_abbrev = VENUE_MAP.get(venue_name, 'Unknown')
         park_factor = PARK_HR_FACTORS.get(team_abbrev, 100)
+        probable_home_pitcher = game.get('home_probable_pitcher', 'Unknown Pitcher')
+        probable_away_pitcher = game.get('away_probable_pitcher', 'Unknown Pitcher')
 
         # Pull geolocation data via venue metadata or fallback to baseline coordinate mappings
         venue_id = game.get('venue_id', 0)
@@ -668,6 +1389,27 @@ def get_today_matchups():
             boxscore = statsapi.boxscore_data(game_id)
             if not boxscore:
                 continue
+
+            home_team_abbr = boxscore.get('home', {}).get('abbreviation', team_abbrev)
+            away_team_abbr = boxscore.get('away', {}).get('abbreviation', '')
+            if not home_team_abbr:
+                try:
+                    home_id = game.get('home_id')
+                    if home_id:
+                        home_team_abbr = statsapi.get('team', {'teamId': home_id}).get('teams', [{}])[0].get('abbreviation', team_abbrev)
+                    else:
+                        home_team_abbr = statsapi.lookup_team(game.get('home_name', ''))[0].get('abbreviation', team_abbrev)
+                except Exception:
+                    home_team_abbr = team_abbrev
+            if not away_team_abbr:
+                try:
+                    away_id = game.get('away_id')
+                    if away_id:
+                        away_team_abbr = statsapi.get('team', {'teamId': away_id}).get('teams', [{}])[0].get('abbreviation', '')
+                    else:
+                        away_team_abbr = statsapi.lookup_team(game.get('away_name', ''))[0].get('abbreviation', '')
+                except Exception:
+                    away_team_abbr = ''
 
             for team_type in ['home', 'away']:
                 opponent_type = 'away' if team_type == 'home' else 'home'
@@ -700,13 +1442,27 @@ def get_today_matchups():
                     pitcher_player = opp_info.get('players', {}).get(f"ID{pitcher_id}", {}).get('person', {}) if pitcher_id else {}
                     pitcher_name = pitcher_player.get('fullName', 'Unknown Pitcher')
 
+                    if not pitcher_name or pitcher_name == 'Unknown Pitcher':
+                        pitcher_name = probable_away_pitcher if team_type == 'home' else probable_home_pitcher
+
                     matchups.append({
                         'game_pk': game_id,
+                        'game_id': game_id,
                         'game_time': game_time_str,
+                        'venue_id': venue_id,
+                        'venue_name': venue_name,
+                        'home_name': game.get('home_name', ''),
+                        'away_name': game.get('away_name', ''),
+                        'home_team': home_team_abbr,
+                        'away_team': away_team_abbr,
+                        'team_side': f"{team_type}_{game_id}",
+                        'is_home_game': team_type == 'home',
                         'batter': batter_id,
                         'batter_name': batter_name,
+                        'batter_hand': b_stands,
                         'pitcher': pitcher_id,
                         'pitcher_name': pitcher_name,
+                        'pitcher_hand': p_throws,
                         'has_platoon_advantage': int(b_stands != p_throws),
                         'batting_order_slot': order_idx + 1,
                         'wind_out_component': wind_out_component,
@@ -979,17 +1735,20 @@ def generate_daily_predictions():
     
     # Feature list for MODEL TRAINING (only features that exist in train_df)
     features_train = [
-        # Batter Features (20 batted ball metrics)
+        # Batter Features (core power + batted ball profile)
         'bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate',
         'bat_hr_fb_rate', 'bat_pull_rate', 'bat_ev90', 'bat_iso_proxy', 'bat_days_since_last_game',
+        'bat_avg_exit_velocity', 'bat_max_exit_velocity', 'bat_avg_launch_angle',
         'bat_15pa_barrel_rate', 'bat_30pa_barrel_rate',
         'bat_15pa_hard_hit_rate', 'bat_30pa_hard_hit_rate',
         'bat_15pa_sweet_spot_rate', 'bat_30pa_sweet_spot_rate',
         'bat_15pa_fb_rate', 'bat_30pa_fb_rate',
+        'has_platoon_advantage',
         
-        # Pitcher Features (20 batted ball allowed metrics)
+        # Pitcher vulnerability features (HR/9, FB%, hard-hit, barrels)
         'pitch_pa_count', 'pitch_hr_allowed_rate', 'pitch_barrel_allowed_rate',
         'pitch_hard_hit_allowed_rate', 'pitch_hr_fb_allowed_rate', 'pitch_days_since_last_start',
+        'pitch_fb_allowed_rate', 'pitch_hr_per_9',
         'pitch_avg_velocity',
         'pitch_15pa_hr_rate', 'pitch_30pa_hr_rate',
         'pitch_15pa_barrel_allowed_rate', 'pitch_30pa_barrel_allowed_rate',
@@ -1095,13 +1854,22 @@ def generate_daily_predictions():
     live['bat_hr_fb_rate'] = live['bat_hr_fb_rate'].fillna(0.12)
     live['pitch_hr_fb_allowed_rate'] = live['pitch_hr_fb_allowed_rate'].fillna(0.12)
     live['bat_ev90'] = live['bat_ev90'].fillna(88.0)
+    live['bat_avg_exit_velocity'] = live['bat_avg_exit_velocity'].fillna(88.0)
+    live['bat_max_exit_velocity'] = live['bat_max_exit_velocity'].fillna(102.0)
+    live['bat_avg_launch_angle'] = live['bat_avg_launch_angle'].fillna(12.0)
     live['bat_iso_proxy'] = live['bat_iso_proxy'].fillna(0.08)
     live['bat_days_since_last_game'] = live['bat_days_since_last_game'].fillna(1)
     live['pitch_days_since_last_start'] = live['pitch_days_since_last_start'].fillna(5)
     live['pitch_avg_velocity'] = live['pitch_avg_velocity'].fillna(92.0)
+    live['pitch_fb_allowed_rate'] = live['pitch_fb_allowed_rate'].fillna(0.35)
+    live['pitch_hr_per_9'] = live['pitch_hr_per_9'].fillna(1.10)
     live['wind_out_component'] = live['wind_out_component'].fillna(0.0)
     live['bat_pull_rate'] = live['bat_pull_rate'].fillna(0.38)
     live['game_time'] = live['game_time'].fillna('') if 'game_time' in live.columns else ''
+    live['home_team'] = live['home_team'].fillna('') if 'home_team' in live.columns else ''
+    live['away_team'] = live['away_team'].fillna('') if 'away_team' in live.columns else ''
+    live['batter_hand'] = live['batter_hand'].fillna('R') if 'batter_hand' in live.columns else 'R'
+    live['pitcher_hand'] = live['pitcher_hand'].fillna('R') if 'pitcher_hand' in live.columns else 'R'
     
     # =====================================================================
     # PROFESSIONAL BETTOR FEATURES CALCULATION
@@ -1206,8 +1974,20 @@ def generate_daily_predictions():
             except Exception:
                 pass
     
-    # 6. Sportsbook Value Score (placeholder - requires odds data)
+    # 6. Market Micro-Structure Features
+    live['line_release_window_flag'] = 1 if is_line_release_window_et() else 0
+    live['nrfi_under_drag_score'] = 0.0
     live['sportsbook_value_score'] = 1.0
+
+    _under_pressure = fetch_totals_market_pressure()
+    if _under_pressure:
+        def _under_drag(row):
+            key = f"{str(row.get('away_name', '')).strip()} @ {str(row.get('home_name', '')).strip()}"
+            return float(_under_pressure.get(key, 0.0))
+
+        live['nrfi_under_drag_score'] = live.apply(_under_drag, axis=1)
+        # Under pressure can create slightly inflated HR prices in props.
+        live['sportsbook_value_score'] = (1.0 + (live['nrfi_under_drag_score'] * 0.10)).clip(1.0, 1.12)
     
     # =====================================================================
     # SECTION: BALLPARK DIMENSIONS FEATURES
@@ -1302,6 +2082,7 @@ def generate_daily_predictions():
     # Project batting order-based PA count for each batter
     order_slots = live.get('batting_order_slot', pd.Series([5] * len(live))).fillna(5).astype(int).clip(1, 9)
     projected_pas = order_slots.apply(project_batting_order_pa)
+    live['projected_pas'] = projected_pas
     
     # Run Monte Carlo: convert single-PA probability to game-level probability
     simulated_probs = pd.Series([
@@ -1311,6 +2092,42 @@ def generate_daily_predictions():
     
     # Use simulated (game-level) probabilities as our model prediction
     probs = simulated_probs.values
+    base_model_probs = probs.copy()
+    live['base_model_prob'] = base_model_probs
+    physics_probs = base_model_probs.copy()
+
+    # =====================================================================
+    # PROFESSIONAL UPGRADE 1.5: FULL PA PHYSICS + CONTEXT PIPELINE
+    # =====================================================================
+    if apply_physics_pipeline_to_live is not None and not statcast_df.empty:
+        try:
+            live = apply_physics_pipeline_to_live(live, statcast_df)
+            if 'physics_hr_prob' in live.columns:
+                _physics_series = pd.to_numeric(live['physics_hr_prob'], errors='coerce')
+                _base_series = pd.Series(base_model_probs, index=_physics_series.index)
+                physics_probs = _physics_series.fillna(_base_series).values
+        except Exception as _physics_err:
+            print(f"Physics pipeline skipped: {_physics_err}")
+
+    # Runtime probability mode selection and blend calibration.
+    prob_mode, physics_weight = resolve_probability_mode_and_weight()
+    if prob_mode == 'base':
+        probs = base_model_probs
+        print("Probability mode: base (ML model only)")
+    elif prob_mode == 'physics':
+        probs = np.clip(physics_probs, 0.0, 1.0)
+        print("Probability mode: physics (PA simulation only)")
+    else:
+        probs = np.clip((base_model_probs * (1 - physics_weight)) + (physics_probs * physics_weight), 0.0, 1.0)
+        print(
+            "Probability mode: blended "
+            f"(physics={physics_weight:.2f}, base={1 - physics_weight:.2f})"
+        )
+
+    live['physics_hr_prob'] = physics_probs
+    live['blend_weight_physics'] = physics_weight if prob_mode == 'blended' else 0.0
+    live['probability_mode'] = prob_mode
+    live['physics_delta'] = probs - base_model_probs
 
     # =====================================================================
     # PROFESSIONAL UPGRADE 2: Kelly Criterion with Simulated Probabilities
@@ -1341,7 +2158,33 @@ def generate_daily_predictions():
 
     # Apply real market odds if ODDS_API_KEY is configured
     market_odds = fetch_hr_prop_odds()
-    if market_odds:
+    market_odds_raw = fetch_hr_prop_odds_raw()
+
+    def _match_raw_best_line(bname):
+        if not market_odds_raw:
+            return None, None
+        bname_lower = str(bname).lower().strip()
+        best_book = None
+        best_odds = None
+        best_decimal = -1.0
+
+        for key, book_map in market_odds_raw.items():
+            key_lower = key.lower().strip()
+            if not (bname_lower in key_lower or key_lower in bname_lower or bname_lower.split()[-1] in key_lower):
+                continue
+            for bk, odds in (book_map or {}).items():
+                try:
+                    o = float(odds)
+                    dec = (1 + (o / 100.0)) if o > 0 else (1 + (100.0 / abs(o)))
+                    if dec > best_decimal:
+                        best_decimal = dec
+                        best_odds = int(round(o))
+                        best_book = bk
+                except Exception:
+                    continue
+        return best_book, best_odds
+
+    if market_odds or market_odds_raw:
         def _match_odds(bname):
             bname_lower = bname.lower()
             for key, prob in market_odds.items():
@@ -1350,9 +2193,21 @@ def generate_daily_predictions():
                 if bname.split()[-1].lower() in key.lower():
                     return prob
             return None
-        live['market_prob'] = live['batter_name'].apply(_match_odds)
+        live['market_prob'] = live['batter_name'].apply(_match_odds) if market_odds else np.nan
+
+        raw_matches = live['batter_name'].apply(_match_raw_best_line)
+        live['best_book'] = raw_matches.apply(lambda x: x[0])
+        live['best_market_odds_american'] = raw_matches.apply(lambda x: x[1])
+        live['best_market_implied_prob'] = live['best_market_odds_american'].apply(
+            lambda x: american_to_implied_prob(x) if pd.notna(x) else np.nan
+        )
+
+        # Prefer devigged market prob where available, else implied from best line.
+        live['market_prob'] = pd.to_numeric(live['market_prob'], errors='coerce')
+        live['market_prob'] = live['market_prob'].fillna(live['best_market_implied_prob'])
+
         matched = live['market_prob'].notna().sum()
-        print(f"Odds matched: {matched}/{len(live)} batters have real market lines")
+        print(f"Odds matched: {matched}/{len(live)} batters have market lines")
         
         # =====================================================================
         # PROFESSIONAL UPGRADE 3: Advanced EV+ Filtering & True Expected Value
@@ -1378,6 +2233,24 @@ def generate_daily_predictions():
         live[['ev_value', 'ev_percent']] = live.apply(
             lambda r: pd.Series(calculate_row_ev(r)), axis=1
         )
+
+        live['fair_odds_american'] = live['pred_hr_prob'].apply(prob_to_fair_american)
+        live['prob_edge_abs'] = (live['pred_hr_prob'] - live['market_prob']).fillna(0.0)
+
+        elite_edge_abs = float(os.getenv('EV_EDGE_TRIGGER_ABS', '0.03'))
+        elite_ev_pct = float(os.getenv('EV_TRIGGER_PCT', '10.0'))
+        live['elite_ev_signal'] = (
+            (live['prob_edge_abs'] >= elite_edge_abs) &
+            (live['ev_percent'] >= elite_ev_pct)
+        )
+        live['release_window_sniper_signal'] = (
+            (live.get('line_release_window_flag', 0) == 1) & live['elite_ev_signal']
+        )
+
+        # Blend sportsbook value score with observed edge and under-drag regime.
+        _sv = 1.0 + live['prob_edge_abs'].clip(lower=0.0, upper=0.12)
+        _nrfi = 1.0 + pd.to_numeric(live.get('nrfi_under_drag_score', 0.0), errors='coerce').fillna(0.0) * 0.08
+        live['sportsbook_value_score'] = (_sv * _nrfi).clip(1.0, 1.25)
         
         # Filter for +EV opportunities (profitable bets only)
         live['is_positive_ev'] = live['ev_percent'] > 0
@@ -1402,10 +2275,47 @@ def generate_daily_predictions():
         live['ev_value'] = 0.0
         live['ev_percent'] = 0.0
         live['is_positive_ev'] = False
+        live['best_book'] = None
+        live['best_market_odds_american'] = np.nan
+        live['best_market_implied_prob'] = np.nan
+        live['fair_odds_american'] = live['pred_hr_prob'].apply(prob_to_fair_american)
+        live['prob_edge_abs'] = 0.0
+        live['elite_ev_signal'] = False
+        live['release_window_sniper_signal'] = False
+
+    physics_output_defaults = {
+        'physics_hr_prob': 0.0,
+        'physics_per_pa_hr_prob': 0.0,
+        'density_altitude_ft': 0.0,
+        'air_density_kg_m3': 1.225,
+        'drag_multiplier': 1.0,
+        'pitch_micro_matchup_score': 1.0,
+        'vaa_attack_angle_score': 1.0,
+        'umpire_catcher_cascade': 1.0,
+        'fatigue_index': 0.0,
+        'spin_decay_rpm': 0.0,
+        'spin_decay_flag': 0.0,
+        'lineup_protection_woba_proxy': 0.10,
+        'context_multiplier': 1.0
+    }
+    for _col, _default in physics_output_defaults.items():
+        if _col not in live.columns:
+            live[_col] = _default
+        else:
+            live[_col] = pd.to_numeric(live[_col], errors='coerce').fillna(_default)
 
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
                                     'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
                                     'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
+                                    'base_model_prob', 'physics_delta', 'blend_weight_physics', 'probability_mode',
+                                    'best_book', 'best_market_odds_american', 'best_market_implied_prob',
+                                    'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
+                                    'release_window_sniper_signal', 'line_release_window_flag', 'nrfi_under_drag_score',
+                                    'physics_hr_prob', 'physics_per_pa_hr_prob', 'density_altitude_ft',
+                                    'air_density_kg_m3', 'drag_multiplier', 'pitch_micro_matchup_score',
+                                    'vaa_attack_angle_score', 'umpire_catcher_cascade', 'fatigue_index',
+                                    'spin_decay_rpm', 'spin_decay_flag',
+                                    'lineup_protection_woba_proxy', 'context_multiplier',
                                     'model_name', 'prediction_timestamp']])
 
     # Sort and present elite values
@@ -1414,6 +2324,37 @@ def generate_daily_predictions():
     
     # Get top 5 by HR probability
     top_5 = rankings.sort_values(by='hr_probability', ascending=False).head(5).reset_index(drop=True)
+
+    # Show largest movers caused by physics/context simulation.
+    if 'physics_delta' in live.columns:
+        movers = live[['batter_name', 'pitcher_name', 'physics_delta', 'base_model_prob', 'pred_hr_prob']].copy()
+        movers = movers.sort_values(by='physics_delta', key=lambda s: s.abs(), ascending=False).head(5)
+        print("\nTop 5 Physics-Driven Movers (absolute delta vs base model):")
+        for _, mr in movers.iterrows():
+            print(
+                f"  {mr['batter_name']} vs {mr['pitcher_name']} | "
+                f"delta={mr['physics_delta']:+.3f} | "
+                f"base={mr['base_model_prob']:.3f} -> final={mr['pred_hr_prob']:.3f}"
+            )
+
+    if 'elite_ev_signal' in live.columns:
+        elite = live[live['elite_ev_signal'] == True].copy()
+        if not elite.empty:
+            elite_view = elite[['batter_name', 'pitcher_name', 'pred_hr_prob', 'best_market_odds_american', 'fair_odds_american', 'ev_percent', 'best_book']]
+            elite_view = elite_view.sort_values('ev_percent', ascending=False).head(10)
+            print("\nElite +EV Discrepancy Signals:")
+            print(elite_view.to_string(index=False))
+
+    pair_df = build_correlated_hr_pairings(live)
+    if not pair_df.empty:
+        print("\nTop Correlated 2-Leg HR Pairings:")
+        print(pair_df.head(5).to_string(index=False))
+        try:
+            pair_path = Path('data') / f"parlay_candidates_{datetime.today().strftime('%Y-%m-%d')}.csv"
+            pair_df.to_csv(pair_path, index=False)
+            print(f"Saved correlated pairing candidates: {pair_path}")
+        except Exception:
+            pass
     
     # Also identify +EV only picks (if odds available)
     if 'is_positive_ev' in live.columns:
@@ -1432,8 +2373,7 @@ def generate_daily_predictions():
     # DISCORD WEBHOOK INTEGRATION
     # =====================================================================
     target_date = datetime.today().strftime('%Y-%m-%d')
-    WEBHOOK_URL = os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
-    if not WEBHOOK_URL:
+    if not _candidate_discord_webhooks():
         print("Discord webhook not configured — skipping notification. Set DISCORD_MLB_WEBHOOK to enable.")
         return top_5 if 'top_5' in locals() else pd.DataFrame()
 
@@ -1457,14 +2397,9 @@ def generate_daily_predictions():
             "```"
         )
 
-        try:
-            response = requests.post(WEBHOOK_URL, json={"content": message_content}, timeout=5)
-            if response.status_code == 204:
-                print("Successfully sent predictions to Discord.")
-            else:
-                print(f"Discord returned unexpected status: {response.status_code}")
-        except Exception as e:
-            print(f"Failed to transmit data to Discord webhook: {e}")
+        sent = send_discord_webhook(content=message_content)
+        if not sent:
+            print("Failed to transmit data to Discord webhook after trying configured candidates.")
     else:
         print("No predictions available to send to Discord.")
 
@@ -1671,20 +2606,74 @@ def monitor_live_home_runs():
 
                     payload = {"content": "\n".join(message_lines)}
 
-                    try:
-                        response = requests.post(WEBHOOK_URL, json=payload, timeout=5)
-                        if response.status_code == 204:
-                            print(f"Live HR alert sent for play {event_id} in {game_display}.")
-                        else:
-                            print(f"Live HR webhook returned status {response.status_code}: {response.text if hasattr(response, 'text') else ''}")
-                    except Exception as e:
-                        print("Webhook post failed:", e)
-                    finally:
-                        processed_home_runs.add(event_id)
+                    sent = send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL)
+                    if sent:
+                        print(f"Live HR alert sent for play {event_id} in {game_display}.")
+                    else:
+                        print("Live HR webhook post failed after trying configured candidates.")
+                    processed_home_runs.add(event_id)
             time.sleep(30)
         except Exception as e:
             print("Error checking live feeds:", e)
             time.sleep(10)
+
+
+def _is_pid_running(pid):
+    """Best-effort PID liveness check, with Windows tasklist fallback."""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            out = (proc.stdout or "")
+            # When not running, tasklist prints: "No tasks are running..."
+            return str(pid) in out and "No tasks are running" not in out
+        except Exception:
+            return False
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def launch_live_monitor_background():
+    """Launch one background live monitor process unless already running."""
+    pid_file = Path('data') / 'live_monitor.pid'
+    Path('data').mkdir(parents=True, exist_ok=True)
+
+    if pid_file.exists():
+        try:
+            existing_pid = int(pid_file.read_text().strip())
+            if _is_pid_running(existing_pid):
+                print(f"Live monitor already running (PID {existing_pid}).")
+                return
+        except Exception:
+            pass
+
+    try:
+        child = subprocess.Popen(
+            [sys.executable, __file__, "--live"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        )
+        pid_file.write_text(str(child.pid), encoding='utf-8')
+        print(f"✅ Live monitor launched in background (PID {child.pid}).")
+    except Exception as e:
+        print(f"⚠️ Could not start live monitor: {e}")
 
 
 def pull_games(date_str):
@@ -1707,11 +2696,37 @@ def main():
     parser.add_argument("--evaluate", action="store_true", help="Evaluate saved predictions against actual results")
     parser.add_argument("--eval-date", type=str, help="Date to evaluate predictions for, format YYYY-MM-DD")
     parser.add_argument("--notify-eval", action="store_true", help="Send evaluation summary to Discord if webhook is configured")
+    parser.add_argument("--self-check", action="store_true", help="Print active mode/weight and physics calibration readiness")
+    parser.add_argument("--backfill-physics", action="store_true", help="Backfill physics columns in recent predictions files")
+    parser.add_argument("--weekly-todo", action="store_true", help="Print prioritized next-week action list from current system status")
+    parser.add_argument("--systematic-ev", action="store_true", help="Run full +EV operation (backfill, self-check, predict, weekly todo)")
+    parser.add_argument("--bet-ready", action="store_true", help="Print only actionable wagers (+EV with odds and Kelly > 0)")
+    parser.add_argument("--backfill-days", type=int, default=30, help="Lookback window for self-check/backfill commands")
 
     args = parser.parse_args()
 
     if args.live:
         monitor_live_home_runs()
+        return
+
+    if args.self_check:
+        run_model_self_check(days_lookback=max(1, int(args.backfill_days)))
+        return
+
+    if args.backfill_physics:
+        backfill_physics_columns(days_lookback=max(1, int(args.backfill_days)))
+        run_model_self_check(days_lookback=max(1, int(args.backfill_days)))
+        return
+
+    if args.systematic_ev:
+        run_systematic_ev_operation(backfill_days=max(1, int(args.backfill_days)))
+        if args.bet_ready:
+            print_bet_ready_wagers()
+        launch_live_monitor_background()
+        return
+
+    if args.weekly_todo:
+        print_weekly_todo(days_lookback=max(1, int(args.backfill_days)))
         return
 
     if args.rlm:
@@ -1733,6 +2748,12 @@ def main():
         evaluate_saved_predictions(args.eval_date or args.date)
         return
 
+    if args.bet_ready:
+        generate_daily_predictions()
+        print_bet_ready_wagers()
+        launch_live_monitor_background()
+        return
+
     generate_daily_predictions()
     
     # Pre-game lineup check (2-3 hours before first pitch)
@@ -1752,18 +2773,9 @@ def main():
     except Exception as e:
         print(f"⚠️  Pre-game lineup check failed: {e}")
     
-    # Spawn background live monitor process to catch home runs throughout the day
-    try:
-        print("\n📡 Starting live home run monitor in background...")
-        subprocess.Popen(
-            [sys.executable, __file__, "--live"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-        )
-        print("✅ Live monitor launched. Alerts will post to Discord throughout the day.")
-    except Exception as e:
-        print(f"⚠️ Could not start live monitor: {e}")
+    # Spawn (or reuse) background live monitor process to catch home runs throughout the day.
+    print("\n📡 Ensuring live home run monitor is running in background...")
+    launch_live_monitor_background()
 
 
 if __name__ == "__main__":

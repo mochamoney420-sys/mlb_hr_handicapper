@@ -4,5 +4,7 @@
         "./src/src",
         "./src"
     ],
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python.envFile": "${workspaceFolder}/.vscode/.env",
+    "python.terminal.useEnvFile": true
 }

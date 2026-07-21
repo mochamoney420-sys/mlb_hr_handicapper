@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-21T10:01:10.081483",
+  "timestamp": "2026-07-21T11:35:34.093611",
   "games": {
     "824409": {
       "away_team": "Minnesota Twins",
@@ -858,7 +858,7 @@
           "id": "ID695257",
           "name": "Billy Cook",
           "number": "25",
-          "position": "RF",
+          "position": "CF",
           "is_batter": true
         },
         {
@@ -2627,7 +2627,7 @@
           "id": "ID666182",
           "name": "Bo Bichette",
           "number": "19",
-          "position": "SS",
+          "position": "3B",
           "is_batter": true
         },
         {

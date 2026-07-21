@@ -317,6 +317,9 @@ def calculate_bullpen_fatigue_score(team, game_date, statcast_data):
     - Opener/exhausted bullpen detection
     """
     try:
+        if not hasattr(statsapi, 'team_stat'):
+            return 50
+
         # Get team stats from StatsAPI
         team_id = statsapi.lookup_team(team)[0]['id']
         team_stats = statsapi.team_stat(team_id, 'pitching', group='bullpen')
@@ -450,8 +453,9 @@ def get_todays_umpires():
         for game in games:
             game_id = game['game_id']
             game_data = statsapi.get('game', {'gamePk': game_id})
-            
-            hp_umpire = game_data.get('liveData', {}).get('boxscore', {}).get('officials', [{}])[0].get('person', {}).get('fullName', 'Unknown')
+
+            officials = game_data.get('liveData', {}).get('boxscore', {}).get('officials', [])
+            hp_umpire = officials[0].get('person', {}).get('fullName', 'Unknown') if officials else 'Unknown'
             
             umpires_dict[game_id] = {
                 'home_plate': hp_umpire,
