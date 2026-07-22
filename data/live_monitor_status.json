@@ -3,6 +3,10 @@
   "in_progress_games": 0,
   "detected_events_this_loop": 0,
   "sent_events_this_loop": 0,
+  "micro_signals_this_loop": 0,
   "processed_event_count": 0,
-  "updated_at": "2026-07-22T11:45:45.312624"
+  "odds_players_tracked": 289,
+  "live_monitor_poll_seconds": 5,
+  "live_odds_poll_seconds": 5,
+  "updated_at": "2026-07-22T12:47:03.663815"
 }

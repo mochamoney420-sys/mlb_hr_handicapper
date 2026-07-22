@@ -970,6 +970,65 @@ HR_PROP_MARKET_KEY_CANDIDATES = [
 ]
 
 
+def _parse_odds_event_commence_time(event_obj):
+    """Parse Odds API commence_time into a datetime, or None if unavailable."""
+    try:
+        ts = str((event_obj or {}).get('commence_time', '')).strip()
+        if not ts:
+            return None
+        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def _filter_current_slate_odds_events(events_payload, source_label='odds'):
+    """Keep only current-slate odds events and reject stale historical events.
+
+    Uses local "today" plus +1 UTC date allowance so late-night U.S. games
+    (which can be next-day in UTC) are still accepted.
+    """
+    events_payload = list(events_payload or [])
+    if not events_payload:
+        return []
+
+    strict = str(os.getenv('ODDS_ENFORCE_CURRENT_SLATE', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    today_local = datetime.today().date()
+    allowed_dates = {today_local, (today_local + timedelta(days=1))}
+
+    kept = []
+    stale_count = 0
+    unknown_count = 0
+    future_outside_count = 0
+
+    for ev in events_payload:
+        dt = _parse_odds_event_commence_time(ev)
+        if dt is None:
+            unknown_count += 1
+            continue
+
+        ev_date = dt.date()
+        if ev_date < today_local:
+            stale_count += 1
+            continue
+        if ev_date not in allowed_dates:
+            future_outside_count += 1
+            continue
+        kept.append(ev)
+
+    print(
+        f"Odds event filter ({source_label}): kept={len(kept)}/{len(events_payload)} "
+        f"(stale={stale_count}, unknown_time={unknown_count}, outside_window={future_outside_count}, strict={strict})"
+    )
+
+    if strict and stale_count > 0:
+        raise RuntimeError(
+            f"Stale odds events detected ({stale_count}) in {source_label}; "
+            f"aborting odds ingest because ODDS_ENFORCE_CURRENT_SLATE=true"
+        )
+
+    return kept
+
+
 def _extract_hr_prop_player_book_odds(games_payload, market_keys=None):
     """Extract {player_name: {book_key: american_odds}} from The Odds API payload."""
     market_keys = set(market_keys or HR_PROP_MARKET_KEY_CANDIDATES)
@@ -1014,7 +1073,8 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
         try:
             resp = requests.get(top_url, timeout=10)
             if resp.status_code == 200:
-                parsed = _extract_hr_prop_player_book_odds(resp.json(), market_keys=[market_key])
+                top_payload = _filter_current_slate_odds_events(resp.json(), source_label='top-level')
+                parsed = _extract_hr_prop_player_book_odds(top_payload, market_keys=[market_key])
                 if parsed:
                     n_pairs = sum(len(v) for v in parsed.values())
                     print(f"Odds API ({market_key}): {n_pairs} book-player pairs across {len(parsed)} players")
@@ -1035,7 +1095,7 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
                 print(f"Odds API events list returned {events_resp.status_code}: {body}")
                 continue
 
-            events = events_resp.json() or []
+            events = _filter_current_slate_odds_events(events_resp.json() or [], source_label='events-list')
             if not events:
                 print("Odds API event list is empty.")
                 continue
@@ -1072,6 +1132,25 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
     return {}
 
 
+def _build_devigged_probs_from_raw_books(player_all_odds):
+    """Build consensus devigged probabilities from per-book American odds."""
+    player_probs = {}
+    for name, book_odds in (player_all_odds or {}).items():
+        weighted_probs = []
+        for bk, odds in (book_odds or {}).items():
+            try:
+                odds = float(odds)
+                raw_implied = abs(odds) / (abs(odds) + 100) if odds < 0 else 100 / (odds + 100)
+                devigged = raw_implied * 0.952
+                weight = 2 if bk in SHARP_BOOKS else 1
+                weighted_probs.extend([devigged] * weight)
+            except Exception:
+                continue
+        if weighted_probs:
+            player_probs[name] = round(sum(weighted_probs) / len(weighted_probs), 4)
+    return player_probs
+
+
 def fetch_hr_prop_odds():
     """Fetch live HR prop lines from The Odds API. Returns {player_name: devigged_prob}.
     Set ODDS_API_KEY in .env to enable real market edge calculation."""
@@ -1095,18 +1174,7 @@ def fetch_hr_prop_odds():
                     return probs
             return {}
 
-        # Consensus devigged probability — sharp books weighted 2x
-        player_probs = {}
-        for name, book_odds in player_all_odds.items():
-            weighted_probs = []
-            for bk, odds in book_odds.items():
-                raw_implied = abs(odds) / (abs(odds) + 100) if odds < 0 else 100 / (odds + 100)
-                devigged = raw_implied * 0.952
-                weight = 2 if bk in SHARP_BOOKS else 1
-                weighted_probs.extend([devigged] * weight)
-            if weighted_probs:
-                player_probs[name] = round(sum(weighted_probs) / len(weighted_probs), 4)
-        return player_probs
+        return _build_devigged_probs_from_raw_books(player_all_odds)
     except Exception as e:
         print(f"Odds API fetch failed: {e}")
         if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
@@ -2368,8 +2436,8 @@ def generate_daily_predictions():
         live['is_positive_ev'] = False
 
     # Apply real market odds if ODDS_API_KEY is configured
-    market_odds = fetch_hr_prop_odds()
     market_odds_raw = fetch_hr_prop_odds_raw()
+    market_odds = _build_devigged_probs_from_raw_books(market_odds_raw)
 
     def _match_raw_best_line(bname):
         if not market_odds_raw:
@@ -2817,6 +2885,522 @@ def write_live_monitor_status(status):
         pass
 
 
+def _safe_float(value, default=None):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value, default=None):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _normalize_player_name(name):
+    return str(name or '').strip().lower()
+
+
+def _best_line_from_book_map(book_map):
+    """Return (best_book, best_american) using max decimal payout logic."""
+    best_book = None
+    best_american = None
+    best_decimal = -1.0
+    for bk, odds in (book_map or {}).items():
+        o = _safe_float(odds)
+        if o is None:
+            continue
+        dec = (1 + (o / 100.0)) if o > 0 else (1 + (100.0 / abs(o)))
+        if dec > best_decimal:
+            best_decimal = dec
+            best_american = int(round(o))
+            best_book = str(bk)
+    return best_book, best_american
+
+
+def load_live_power_profile(date_str=None):
+    """Load today's predictions into a power profile index keyed by batter id and name."""
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    pred_file = Path('data') / f'predictions_{date_str}.csv'
+    if not pred_file.exists():
+        return {'by_id': {}, 'by_name': {}}
+
+    try:
+        preds = pd.read_csv(pred_file)
+    except Exception:
+        return {'by_id': {}, 'by_name': {}}
+
+    by_id = {}
+    by_name = {}
+    for _, row in preds.iterrows():
+        batter_id = _safe_int(row.get('batter'))
+        batter_name = str(row.get('batter_name', '')).strip()
+        profile = {
+            'batter_id': batter_id,
+            'batter_name': batter_name,
+            'pred_hr_prob': _safe_float(row.get('pred_hr_prob'), 0.0) or 0.0,
+            'hard_hit_rate': _safe_float(row.get('bat_15pa_hard_hit_rate'), 0.0) or 0.0,
+            'avg_ev': _safe_float(row.get('bat_avg_exit_velocity'), 0.0) or 0.0,
+        }
+        if batter_id is not None:
+            by_id[batter_id] = profile
+        if batter_name:
+            by_name[_normalize_player_name(batter_name)] = profile
+
+    return {'by_id': by_id, 'by_name': by_name}
+
+
+def build_pitch_count_fastball_tendency_lookup(days_back=45, min_sample=25):
+    """Build pitcher count-specific four-seam tendency lookup from cached Statcast files."""
+    cache_dir = Path('cache')
+    if not cache_dir.exists():
+        return {}
+
+    file_paths = []
+    today = datetime.today().date()
+    for i in range(1, max(2, int(days_back)) + 1):
+        ds = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+        fp = cache_dir / f'statcast_{ds}.csv'
+        if fp.exists():
+            file_paths.append(fp)
+
+    if not file_paths:
+        return {}
+
+    parts = []
+    for fp in file_paths:
+        try:
+            df = pd.read_csv(fp, usecols=['pitcher', 'balls', 'strikes', 'pitch_type'])
+            parts.append(df)
+        except Exception:
+            continue
+
+    if not parts:
+        return {}
+
+    pitches = pd.concat(parts, ignore_index=True)
+    pitches['pitcher'] = pd.to_numeric(pitches.get('pitcher'), errors='coerce')
+    pitches['balls'] = pd.to_numeric(pitches.get('balls'), errors='coerce')
+    pitches['strikes'] = pd.to_numeric(pitches.get('strikes'), errors='coerce')
+    pitches = pitches.dropna(subset=['pitcher', 'balls', 'strikes', 'pitch_type']).copy()
+    if pitches.empty:
+        return {}
+
+    pitches['pitcher'] = pitches['pitcher'].astype(int)
+    pitches['count_key'] = pitches['balls'].astype(int).astype(str) + '-' + pitches['strikes'].astype(int).astype(str)
+    pitches = pitches[pitches['count_key'].isin({'2-0', '3-1'})].copy()
+    if pitches.empty:
+        return {}
+
+    pitches['is_four_seam'] = pitches['pitch_type'].astype(str).isin({'FF', 'FA'}).astype(int)
+    agg = pitches.groupby(['pitcher', 'count_key'], as_index=False).agg(
+        four_seam_rate=('is_four_seam', 'mean'),
+        sample_size=('is_four_seam', 'count'),
+    )
+    agg = agg[agg['sample_size'] >= max(1, int(min_sample))]
+
+    lookup = {}
+    for _, row in agg.iterrows():
+        lookup[(int(row['pitcher']), str(row['count_key']))] = {
+            'four_seam_rate': float(row['four_seam_rate']),
+            'sample_size': int(row['sample_size'])
+        }
+    return lookup
+
+
+def _get_next_hitters_live(play_by_play, half_inning, current_batter_id, lookahead_slots=5):
+    """Return upcoming batter candidates from live boxscore batting order."""
+    live_data = (play_by_play or {}).get('liveData', {})
+    boxscore = live_data.get('boxscore', {})
+    teams = boxscore.get('teams', {})
+    offense_key = 'away' if str(half_inning).lower() == 'top' else 'home'
+    team_box = teams.get(offense_key, {})
+    batting_order = team_box.get('battingOrder', []) or []
+    players = team_box.get('players', {}) or {}
+
+    ids = [_safe_int(x) for x in batting_order if _safe_int(x) is not None]
+    if not ids:
+        return []
+
+    current_batter_id = _safe_int(current_batter_id)
+    if current_batter_id is None or current_batter_id not in ids:
+        start_idx = 0
+    else:
+        start_idx = ids.index(current_batter_id) + 1
+
+    out = []
+    for step in range(max(1, int(lookahead_slots))):
+        bid = ids[(start_idx + step) % len(ids)]
+        p = players.get(f'ID{bid}', {})
+        full_name = str((p.get('person') or {}).get('fullName', '')).strip()
+        if full_name:
+            out.append({'batter_id': bid, 'batter_name': full_name})
+    return out
+
+
+def _rank_next_power_hitters(candidates, power_profile, top_n=3):
+    """Rank upcoming hitters by today's HR model probability."""
+    scored = []
+    by_id = power_profile.get('by_id', {})
+    by_name = power_profile.get('by_name', {})
+
+    for c in candidates or []:
+        bid = _safe_int(c.get('batter_id'))
+        bname = str(c.get('batter_name', '')).strip()
+        prof = by_id.get(bid) or by_name.get(_normalize_player_name(bname)) or {}
+        scored.append({
+            'batter_id': bid,
+            'batter_name': bname,
+            'pred_hr_prob': float(prof.get('pred_hr_prob', 0.0)),
+            'hard_hit_rate': float(prof.get('hard_hit_rate', 0.0)),
+            'avg_ev': float(prof.get('avg_ev', 0.0)),
+        })
+
+    scored.sort(key=lambda x: x.get('pred_hr_prob', 0.0), reverse=True)
+    return scored[:max(1, int(top_n))]
+
+
+def _pitcher_recent_release_series(all_plays, pitcher_id):
+    """Extract chronological releasePosZ values for one pitcher from live game plays."""
+    pitcher_id = _safe_int(pitcher_id)
+    if pitcher_id is None:
+        return []
+
+    series = []
+    for play in all_plays or []:
+        pid = _safe_int(((play.get('matchup') or {}).get('pitcher') or {}).get('id'))
+        if pid != pitcher_id:
+            continue
+        for pe in play.get('playEvents', []) or []:
+            if not pe.get('isPitch', False):
+                continue
+            release_z = _safe_float((((pe.get('pitchData') or {}).get('coordinates') or {}).get('releasePosZ')))
+            if release_z is not None:
+                series.append(release_z)
+    return series
+
+
+def _recent_hard_hit_lineout_streak(all_plays, pitcher_id):
+    """Count consecutive hard-hit lineouts allowed by pitcher (most recent backward)."""
+    pitcher_id = _safe_int(pitcher_id)
+    if pitcher_id is None:
+        return 0
+
+    streak = 0
+    for play in reversed(all_plays or []):
+        pid = _safe_int(((play.get('matchup') or {}).get('pitcher') or {}).get('id'))
+        if pid != pitcher_id:
+            continue
+
+        result = play.get('result', {}) or {}
+        event = str(result.get('event', '')).lower()
+        event_type = str(result.get('eventType', '')).lower()
+        is_lineout = ('lineout' in event) or ('lineout' in event_type)
+        if not is_lineout:
+            break
+
+        launch_speed = None
+        for pe in reversed(play.get('playEvents', []) or []):
+            ls = _safe_float(((pe.get('hitData') or {}).get('launchSpeed')))
+            if ls is not None:
+                launch_speed = ls
+                break
+
+        if launch_speed is not None and launch_speed >= 95.0:
+            streak += 1
+            continue
+        break
+
+    return streak
+
+
+def _extract_best_live_odds(current_odds_raw):
+    """Convert raw odds map to normalized best-line map keyed by normalized player name."""
+    out = {}
+    for player_name, book_map in (current_odds_raw or {}).items():
+        best_book, best_american = _best_line_from_book_map(book_map)
+        if best_american is None:
+            continue
+        out[_normalize_player_name(player_name)] = {
+            'player_name': str(player_name),
+            'best_book': best_book,
+            'best_american': int(best_american)
+        }
+    return out
+
+
+def _is_risp_no_outs(play):
+    matchup = (play or {}).get('matchup', {}) or {}
+    count = (play or {}).get('count', {}) or {}
+    outs = _safe_int(count.get('outs'), 0) or 0
+    has_risp = bool(matchup.get('postOnSecond') or matchup.get('postOnThird'))
+    return has_risp and outs == 0
+
+
+def _detect_release_axis_tilt_signal(game, play_by_play, power_profile, seen_keys):
+    """Detect release height drop over recent pitch window and emit one alert per pitcher-game."""
+    alerts = []
+    threshold_inches = _safe_float(os.getenv('LIVE_RELEASE_DROP_INCHES', '2.5'), 2.5) or 2.5
+    threshold_ft = threshold_inches / 12.0
+    window = max(6, _safe_int(os.getenv('LIVE_RELEASE_WINDOW_PITCHES', '10'), 10) or 10)
+    next_hitters_n = max(1, _safe_int(os.getenv('LIVE_RELEASE_NEXT_HITTERS', '3'), 3) or 3)
+    lookahead_slots = max(next_hitters_n, _safe_int(os.getenv('LIVE_RELEASE_LOOKAHEAD_SLOTS', '5'), 5) or 5)
+
+    all_plays = ((play_by_play or {}).get('liveData', {}).get('plays', {}).get('allPlays', []) or [])
+    if not all_plays:
+        return alerts
+
+    last_play = all_plays[-1]
+    matchup = last_play.get('matchup', {}) or {}
+    pitcher = matchup.get('pitcher', {}) or {}
+    pitcher_id = _safe_int(pitcher.get('id'))
+    pitcher_name = str(pitcher.get('fullName', 'Unknown Pitcher'))
+    if pitcher_id is None:
+        return alerts
+
+    rz = _pitcher_recent_release_series(all_plays, pitcher_id)
+    if len(rz) < window:
+        return alerts
+
+    tail = rz[-window:]
+    first_half = tail[:window // 2]
+    second_half = tail[window // 2:]
+    if not first_half or not second_half:
+        return alerts
+
+    drop_ft = (sum(first_half) / len(first_half)) - (sum(second_half) / len(second_half))
+    if drop_ft <= threshold_ft:
+        return alerts
+
+    game_id = game.get('game_pk') or game.get('game_id')
+    key = f"release:{game_id}:{pitcher_id}"
+    if key in seen_keys:
+        return alerts
+    seen_keys.add(key)
+
+    half_inning = (last_play.get('about', {}) or {}).get('halfInning', '')
+    current_batter_id = ((matchup.get('batter') or {}).get('id'))
+    candidates = _get_next_hitters_live(play_by_play, half_inning, current_batter_id, lookahead_slots=lookahead_slots)
+    ranked = _rank_next_power_hitters(candidates, power_profile, top_n=next_hitters_n)
+
+    alerts.append({
+        'type': 'release_axis_tilt',
+        'game_id': game_id,
+        'pitcher_id': pitcher_id,
+        'pitcher_name': pitcher_name,
+        'drop_inches': drop_ft * 12.0,
+        'window': window,
+        'targets': ranked,
+        'game_display': f"{game.get('away_name','Away')} @ {game.get('home_name','Home')}",
+    })
+    return alerts
+
+
+def _detect_predictable_count_signal(game, play_by_play, power_profile, tendency_lookup, seen_keys):
+    """Detect 2-0 / 3-1 predictable count four-seam tendency windows."""
+    alerts = []
+    rate_threshold = _safe_float(os.getenv('LIVE_COUNT_FASTBALL_RATE', '0.82'), 0.82) or 0.82
+    lookahead_slots = max(3, _safe_int(os.getenv('LIVE_COUNT_LOOKAHEAD_SLOTS', '5'), 5) or 5)
+    next_hitters_n = max(1, _safe_int(os.getenv('LIVE_COUNT_NEXT_HITTERS', '2'), 2) or 2)
+
+    all_plays = ((play_by_play or {}).get('liveData', {}).get('plays', {}).get('allPlays', []) or [])
+    if not all_plays:
+        return alerts
+
+    # Evaluate only recent plays to keep loop lightweight.
+    for play in all_plays[-4:]:
+        matchup = play.get('matchup', {}) or {}
+        pitcher = matchup.get('pitcher', {}) or {}
+        batter = matchup.get('batter', {}) or {}
+        pitcher_id = _safe_int(pitcher.get('id'))
+        batter_id = _safe_int(batter.get('id'))
+        pitcher_name = str(pitcher.get('fullName', 'Unknown Pitcher'))
+        batter_name = str(batter.get('fullName', 'Unknown Batter'))
+        if pitcher_id is None:
+            continue
+
+        for pe in play.get('playEvents', []) or []:
+            if not pe.get('isPitch', False):
+                continue
+            count = pe.get('count', {}) or {}
+            balls = _safe_int(count.get('balls'))
+            strikes = _safe_int(count.get('strikes'))
+            if balls is None or strikes is None:
+                continue
+            count_key = f"{balls}-{strikes}"
+            if count_key not in {'2-0', '3-1'}:
+                continue
+
+            tendency = tendency_lookup.get((pitcher_id, count_key))
+            if not tendency:
+                continue
+            fs_rate = float(tendency.get('four_seam_rate', 0.0))
+            if fs_rate < rate_threshold:
+                continue
+            if not _is_risp_no_outs(play):
+                continue
+
+            game_id = game.get('game_pk') or game.get('game_id')
+            about = play.get('about', {}) or {}
+            at_bat_idx = about.get('atBatIndex', '')
+            key = f"count:{game_id}:{pitcher_id}:{batter_id}:{count_key}:{at_bat_idx}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            half_inning = about.get('halfInning', '')
+            candidates = _get_next_hitters_live(play_by_play, half_inning, batter_id, lookahead_slots=lookahead_slots)
+            ranked = _rank_next_power_hitters(candidates, power_profile, top_n=next_hitters_n)
+
+            alerts.append({
+                'type': 'predictable_count',
+                'game_id': game_id,
+                'pitcher_id': pitcher_id,
+                'pitcher_name': pitcher_name,
+                'batter_name': batter_name,
+                'count_key': count_key,
+                'four_seam_rate': fs_rate,
+                'sample_size': int(tendency.get('sample_size', 0)),
+                'targets': ranked,
+                'game_display': f"{game.get('away_name','Away')} @ {game.get('home_name','Home')}",
+            })
+
+    return alerts
+
+
+def _detect_live_odds_inversion_signal(game, play_by_play, power_profile, best_odds_now, best_odds_prev, seen_keys):
+    """Detect rapid in-play odds spikes after hard-hit lineout clusters."""
+    alerts = []
+    if not best_odds_now or not best_odds_prev:
+        return alerts
+
+    min_jump = _safe_int(os.getenv('LIVE_ODDS_SPIKE_MIN_JUMP', '200'), 200) or 200
+    from_max = _safe_int(os.getenv('LIVE_ODDS_SPIKE_FROM_MAX', '500'), 500) or 500
+    to_min = _safe_int(os.getenv('LIVE_ODDS_SPIKE_TO_MIN', '650'), 650) or 650
+    next_hitters_n = max(1, _safe_int(os.getenv('LIVE_ODDS_NEXT_HITTERS', '3'), 3) or 3)
+    lookahead_slots = max(next_hitters_n, _safe_int(os.getenv('LIVE_ODDS_LOOKAHEAD_SLOTS', '5'), 5) or 5)
+
+    all_plays = ((play_by_play or {}).get('liveData', {}).get('plays', {}).get('allPlays', []) or [])
+    if not all_plays:
+        return alerts
+
+    last_play = all_plays[-1]
+    matchup = last_play.get('matchup', {}) or {}
+    pitcher = matchup.get('pitcher', {}) or {}
+    pitcher_id = _safe_int(pitcher.get('id'))
+    pitcher_name = str(pitcher.get('fullName', 'Unknown Pitcher'))
+    if pitcher_id is None:
+        return alerts
+
+    streak = _recent_hard_hit_lineout_streak(all_plays, pitcher_id)
+    if streak < 2:
+        return alerts
+
+    half_inning = (last_play.get('about', {}) or {}).get('halfInning', '')
+    current_batter_id = ((matchup.get('batter') or {}).get('id'))
+    candidates = _get_next_hitters_live(play_by_play, half_inning, current_batter_id, lookahead_slots=lookahead_slots)
+    ranked = _rank_next_power_hitters(candidates, power_profile, top_n=next_hitters_n)
+
+    game_id = game.get('game_pk') or game.get('game_id')
+    by_name = power_profile.get('by_name', {})
+    for hitter in ranked:
+        hname = str(hitter.get('batter_name', ''))
+        norm = _normalize_player_name(hname)
+        now_obj = best_odds_now.get(norm)
+        prev_obj = best_odds_prev.get(norm)
+        if not now_obj or not prev_obj:
+            continue
+
+        now_odds = _safe_int(now_obj.get('best_american'))
+        prev_odds = _safe_int(prev_obj.get('best_american'))
+        if now_odds is None or prev_odds is None:
+            continue
+        if prev_odds <= 0 or now_odds <= 0:
+            continue
+        if not (prev_odds <= from_max and now_odds >= to_min and (now_odds - prev_odds) >= min_jump):
+            continue
+
+        prof = by_name.get(norm, {})
+        hh_rate = float(prof.get('hard_hit_rate', hitter.get('hard_hit_rate', 0.0)) or 0.0)
+        avg_ev = float(prof.get('avg_ev', hitter.get('avg_ev', 0.0)) or 0.0)
+        if hh_rate < 0.35 and avg_ev < 92.0:
+            continue
+
+        key = f"odds:{game_id}:{pitcher_id}:{norm}:{prev_odds}:{now_odds}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        alerts.append({
+            'type': 'odds_inversion',
+            'game_id': game_id,
+            'pitcher_id': pitcher_id,
+            'pitcher_name': pitcher_name,
+            'batter_name': hname,
+            'prev_odds': prev_odds,
+            'now_odds': now_odds,
+            'jump': now_odds - prev_odds,
+            'hard_hit_lineout_streak': streak,
+            'best_book': str(now_obj.get('best_book') or ''),
+            'game_display': f"{game.get('away_name','Away')} @ {game.get('home_name','Home')}",
+        })
+
+    return alerts
+
+
+def _format_micro_signal_message(alert):
+    ts = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')
+    atype = alert.get('type')
+    game_display = alert.get('game_display', 'Game in progress')
+
+    if atype == 'release_axis_tilt':
+        lines = [
+            "⚡ **MICRO-SIGNAL: RELEASE AXIS TILT**",
+            f"⏰ Time: {ts}",
+            f"🏟️ {game_display}",
+            f"🎯 Pitcher: {alert.get('pitcher_name', 'Unknown')}",
+            f"📉 Release drop: {float(alert.get('drop_inches', 0.0)):.2f} in over last {int(alert.get('window', 10))} pitches",
+        ]
+        targets = alert.get('targets') or []
+        if targets:
+            lines.append("🔥 Next power hitters:")
+            for t in targets:
+                lines.append(f"• {t.get('batter_name','Unknown')} ({float(t.get('pred_hr_prob', 0.0))*100:.1f}% HR)")
+        return "\n".join(lines)
+
+    if atype == 'odds_inversion':
+        return "\n".join([
+            "⚡ **MICRO-SIGNAL: LIVE ODDS INVERSION**",
+            f"⏰ Time: {ts}",
+            f"🏟️ {game_display}",
+            f"🎯 Pitcher stress: {alert.get('pitcher_name', 'Unknown')} ({int(alert.get('hard_hit_lineout_streak', 0))} hard-hit lineouts)",
+            f"👤 Batter: {alert.get('batter_name', 'Unknown')}",
+            f"📈 Odds spike: {int(alert.get('prev_odds', 0)):+d} → {int(alert.get('now_odds', 0)):+d} (Δ {int(alert.get('jump', 0)):+d})",
+            f"🏦 Book: {alert.get('best_book', 'N/A')}",
+        ])
+
+    if atype == 'predictable_count':
+        lines = [
+            "⚡ **MICRO-SIGNAL: PREDICTABLE COUNT WINDOW**",
+            f"⏰ Time: {ts}",
+            f"🏟️ {game_display}",
+            f"🎯 Pitcher: {alert.get('pitcher_name', 'Unknown')}",
+            f"🧮 Count: {alert.get('count_key', 'N/A')} (RISP, 0 outs)",
+            f"📌 Four-seam tendency: {float(alert.get('four_seam_rate', 0.0))*100:.1f}% (n={int(alert.get('sample_size', 0))})",
+            f"👤 Current batter: {alert.get('batter_name', 'Unknown')}",
+        ]
+        targets = alert.get('targets') or []
+        if targets:
+            lines.append("🔥 Next power hitters:")
+            for t in targets:
+                lines.append(f"• {t.get('batter_name','Unknown')} ({float(t.get('pred_hr_prob', 0.0))*100:.1f}% HR)")
+        return "\n".join(lines)
+
+    return ""
+
+
 def monitor_live_home_runs():
     """Loop indefinitely, checking live game data for home runs and alerting Discord."""
     WEBHOOK_URL = os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
@@ -2824,7 +3408,25 @@ def monitor_live_home_runs():
         raise RuntimeError("DISCORD_MLB_WEBHOOK or DISCORD_WEBHOOK_URL not set; configure env var or GitHub secret")
 
     print("🚀 Monitoring started: Waiting for live MLB home run events...")
+    print("⚡ Micro-signal engine enabled: release-axis tilt, odds inversion, predictable count windows")
     processed_home_runs = load_processed_home_run_events()
+    micro_alert_keys = set()
+
+    power_profile = load_live_power_profile()
+    tendency_lookup = build_pitch_count_fastball_tendency_lookup(
+        days_back=max(14, _safe_int(os.getenv('LIVE_COUNT_LOOKBACK_DAYS', '45'), 45) or 45),
+        min_sample=max(10, _safe_int(os.getenv('LIVE_COUNT_MIN_SAMPLE', '25'), 25) or 25),
+    )
+    if tendency_lookup:
+        print(f"Loaded count tendency lookup: {len(tendency_lookup)} pitcher-count patterns")
+    else:
+        print("Count tendency lookup unavailable (insufficient cached pitch data).")
+
+    odds_poll_seconds = max(5, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '5'), 5) or 5)
+    monitor_sleep_seconds = max(5, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '5'), 5) or 5)
+    last_odds_poll_ts = 0.0
+    best_odds_prev = {}
+    best_odds_now = {}
 
     while True:
         try:
@@ -2833,6 +3435,19 @@ def monitor_live_home_runs():
             in_progress_games = 0
             detected_this_loop = 0
             sent_this_loop = 0
+            micro_signals_this_loop = 0
+
+            now_ts = time.time()
+            if (now_ts - last_odds_poll_ts) >= odds_poll_seconds:
+                try:
+                    odds_raw = fetch_hr_prop_odds_raw()
+                    if odds_raw:
+                        best_odds_prev = best_odds_now
+                        best_odds_now = _extract_best_live_odds(odds_raw)
+                    last_odds_poll_ts = now_ts
+                except Exception as odds_err:
+                    print(f"Live odds poll failed: {odds_err}")
+
             for game in games:
                 if game.get('status') != 'In Progress':
                     continue
@@ -2842,6 +3457,38 @@ def monitor_live_home_runs():
                     continue
                 play_by_play = statsapi.get('game', {'gamePk': game_id}) or {}
                 all_plays = play_by_play.get('liveData', {}).get('plays', {}).get('allPlays', [])
+
+                # Micro-signal: release-axis tilt
+                for alert in _detect_release_axis_tilt_signal(game, play_by_play, power_profile, micro_alert_keys):
+                    msg = _format_micro_signal_message(alert)
+                    if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
+                        micro_signals_this_loop += 1
+                        sent_this_loop += 1
+                        print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
+
+                # Micro-signal: predictable pitch sequence in hitter's counts
+                for alert in _detect_predictable_count_signal(game, play_by_play, power_profile, tendency_lookup, micro_alert_keys):
+                    msg = _format_micro_signal_message(alert)
+                    if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
+                        micro_signals_this_loop += 1
+                        sent_this_loop += 1
+                        print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
+
+                # Micro-signal: odds inversion after hard-hit lineout clusters
+                for alert in _detect_live_odds_inversion_signal(
+                    game,
+                    play_by_play,
+                    power_profile,
+                    best_odds_now,
+                    best_odds_prev,
+                    micro_alert_keys,
+                ):
+                    msg = _format_micro_signal_message(alert)
+                    if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
+                        micro_signals_this_loop += 1
+                        sent_this_loop += 1
+                        print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
+
                 for play in all_plays:
                     result = play.get('result', {})
                     about = play.get('about', {})
@@ -2919,9 +3566,13 @@ def monitor_live_home_runs():
                 'in_progress_games': in_progress_games,
                 'detected_events_this_loop': detected_this_loop,
                 'sent_events_this_loop': sent_this_loop,
+                'micro_signals_this_loop': micro_signals_this_loop,
                 'processed_event_count': len(processed_home_runs),
+                'odds_players_tracked': len(best_odds_now),
+                'live_monitor_poll_seconds': monitor_sleep_seconds,
+                'live_odds_poll_seconds': odds_poll_seconds,
             })
-            time.sleep(30)
+            time.sleep(monitor_sleep_seconds)
         except Exception as e:
             print("Error checking live feeds:", e)
             write_live_monitor_status({

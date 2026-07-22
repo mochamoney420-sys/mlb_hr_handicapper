@@ -1,15 +1,15 @@
 {
-  "timestamp": "2026-07-22T10:15:48.791649",
+  "timestamp": "2026-07-22T12:32:23.114545",
   "games": {
     "823518": {
       "away_team": "Pittsburgh Pirates",
       "home_team": "New York Yankees",
       "away_players": [
         {
-          "id": "ID694378",
-          "name": "Jacob Gonzalez",
-          "number": "26",
-          "position": "1B",
+          "id": "ID663968",
+          "name": "Jake Mangum",
+          "number": "28",
+          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 1
         },
@@ -30,34 +30,34 @@
           "batting_order_slot": 3
         },
         {
-          "id": "ID669707",
-          "name": "Jared Triolo",
-          "number": "19",
-          "position": "SS",
-          "is_batter": true,
-          "batting_order_slot": 4
-        },
-        {
           "id": "ID699013",
           "name": "Esmerlyn Valdez",
           "number": "55",
           "position": "RF",
           "is_batter": true,
+          "batting_order_slot": 4
+        },
+        {
+          "id": "ID656811",
+          "name": "Ryan O'Hearn",
+          "number": "29",
+          "position": "DH",
+          "is_batter": true,
           "batting_order_slot": 5
         },
         {
-          "id": "ID663968",
-          "name": "Jake Mangum",
-          "number": "28",
-          "position": "CF",
+          "id": "ID693304",
+          "name": "Nick Gonzales",
+          "number": "3",
+          "position": "3B",
           "is_batter": true,
           "batting_order_slot": 6
         },
         {
-          "id": "ID695257",
-          "name": "Billy Cook",
-          "number": "25",
-          "position": "CF",
+          "id": "ID694378",
+          "name": "Jacob Gonzalez",
+          "number": "26",
+          "position": "SS",
           "is_batter": true,
           "batting_order_slot": 7
         },
@@ -73,25 +73,25 @@
           "id": "ID682997",
           "name": "Tyler Callihan",
           "number": "37",
-          "position": "LF",
+          "position": "1B",
           "is_batter": true,
           "batting_order_slot": 9
         }
       ],
       "home_players": [
         {
-          "id": "ID645305",
-          "name": "Ali S\u00e1nchez",
-          "number": "39",
-          "position": "C",
+          "id": "ID663757",
+          "name": "Trent Grisham",
+          "number": "12",
+          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 1
         },
         {
-          "id": "ID676609",
-          "name": "Jos\u00e9 Caballero",
-          "number": "72",
-          "position": "SS",
+          "id": "ID700250",
+          "name": "Ben Rice",
+          "number": "22",
+          "position": "1B",
           "is_batter": true,
           "batting_order_slot": 2
         },
@@ -99,47 +99,47 @@
           "id": "ID682987",
           "name": "Spencer Jones",
           "number": "78",
-          "position": "CF",
+          "position": "DH",
           "is_batter": true,
           "batting_order_slot": 3
         },
         {
-          "id": "ID680474",
-          "name": "Max Schuemann",
-          "number": "30",
-          "position": "SS",
+          "id": "ID641355",
+          "name": "Cody Bellinger",
+          "number": "35",
+          "position": "LF",
           "is_batter": true,
           "batting_order_slot": 4
-        },
-        {
-          "id": "ID642708",
-          "name": "Amed Rosario",
-          "number": "14",
-          "position": "3B",
-          "is_batter": true,
-          "batting_order_slot": 5
-        },
-        {
-          "id": "ID641857",
-          "name": "Ryan McMahon",
-          "number": "19",
-          "position": "3B",
-          "is_batter": true,
-          "batting_order_slot": 6
-        },
-        {
-          "id": "ID502671",
-          "name": "Paul Goldschmidt",
-          "number": "48",
-          "position": "1B",
-          "is_batter": true,
-          "batting_order_slot": 7
         },
         {
           "id": "ID691176",
           "name": "Jasson Dom\u00ednguez",
           "number": "24",
           "position": "RF",
+          "is_batter": true,
+          "batting_order_slot": 5
+        },
+        {
+          "id": "ID665862",
+          "name": "Jazz Chisholm Jr.",
+          "number": "13",
+          "position": "2B",
+          "is_batter": true,
+          "batting_order_slot": 6
+        },
+        {
+          "id": "ID676609",
+          "name": "Jos\u00e9 Caballero",
+          "number": "72",
+          "position": "SS",
+          "is_batter": true,
+          "batting_order_slot": 7
+        },
+        {
+          "id": "ID641857",
+          "name": "Ryan McMahon",
+          "number": "19",
+          "position": "3B",
           "is_batter": true,
           "batting_order_slot": 8
         },
@@ -310,28 +310,20 @@
       "home_team": "Boston Red Sox",
       "away_players": [
         {
-          "id": "ID669236",
-          "name": "Jeremiah Jackson",
-          "number": "82",
-          "position": "2B",
+          "id": "ID621493",
+          "name": "Taylor Ward",
+          "number": "3",
+          "position": "LF",
           "is_batter": true,
           "batting_order_slot": 1
         },
         {
-          "id": "ID644433",
-          "name": "Chadwick Tromp",
-          "number": "41",
-          "position": "C",
+          "id": "ID624413",
+          "name": "Pete Alonso",
+          "number": "25",
+          "position": "1B",
           "is_batter": true,
           "batting_order_slot": 2
-        },
-        {
-          "id": "ID694212",
-          "name": "Samuel Basallo",
-          "number": "29",
-          "position": "C",
-          "is_batter": true,
-          "batting_order_slot": 3
         },
         {
           "id": "ID683002",
@@ -339,31 +331,7 @@
           "number": "2",
           "position": "SS",
           "is_batter": true,
-          "batting_order_slot": 4
-        },
-        {
-          "id": "ID665750",
-          "name": "Leody Taveras",
-          "number": "30",
-          "position": "CF",
-          "is_batter": true,
-          "batting_order_slot": 5
-        },
-        {
-          "id": "ID621493",
-          "name": "Taylor Ward",
-          "number": "3",
-          "position": "LF",
-          "is_batter": true,
-          "batting_order_slot": 6
-        },
-        {
-          "id": "ID687637",
-          "name": "Dylan Beavers",
-          "number": "12",
-          "position": "RF",
-          "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 3
         },
         {
           "id": "ID641933",
@@ -371,13 +339,45 @@
           "number": "9",
           "position": "RF",
           "is_batter": true,
+          "batting_order_slot": 4
+        },
+        {
+          "id": "ID691723",
+          "name": "Coby Mayo",
+          "number": "16",
+          "position": "DH",
+          "is_batter": true,
+          "batting_order_slot": 5
+        },
+        {
+          "id": "ID665750",
+          "name": "Leody Taveras",
+          "number": "30",
+          "position": "CF",
+          "is_batter": true,
+          "batting_order_slot": 6
+        },
+        {
+          "id": "ID687952",
+          "name": "Christian Encarnacion-Strand",
+          "number": "32",
+          "position": "3B",
+          "is_batter": true,
+          "batting_order_slot": 7
+        },
+        {
+          "id": "ID702616",
+          "name": "Jackson Holliday",
+          "number": "7",
+          "position": "2B",
+          "is_batter": true,
           "batting_order_slot": 8
         },
         {
-          "id": "ID624413",
-          "name": "Pete Alonso",
-          "number": "25",
-          "position": "1B",
+          "id": "ID669087",
+          "name": "Sam Huff",
+          "number": "31",
+          "position": "C",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -614,12 +614,20 @@
       "home_team": "Kansas City Royals",
       "away_players": [
         {
-          "id": "ID669477",
-          "name": "Casey Schmitt",
-          "number": "10",
-          "position": "LF",
+          "id": "ID650333",
+          "name": "Luis Arraez",
+          "number": "1",
+          "position": "2B",
           "is_batter": true,
           "batting_order_slot": 1
+        },
+        {
+          "id": "ID805811",
+          "name": "Bryce Eldridge",
+          "number": "8",
+          "position": "DH",
+          "is_batter": true,
+          "batting_order_slot": 2
         },
         {
           "id": "ID671218",
@@ -627,29 +635,21 @@
           "number": "17",
           "position": "LF",
           "is_batter": true,
-          "batting_order_slot": 2
-        },
-        {
-          "id": "ID701852",
-          "name": "Drew Cavanaugh",
-          "number": "61",
-          "position": "C",
-          "is_batter": true,
           "batting_order_slot": 3
         },
         {
-          "id": "ID683679",
-          "name": "Jesus Rodriguez",
-          "number": "79",
-          "position": "C",
+          "id": "ID646240",
+          "name": "Rafael Devers",
+          "number": "16",
+          "position": "1B",
           "is_batter": true,
           "batting_order_slot": 4
         },
         {
-          "id": "ID687551",
-          "name": "Drew Gilbert",
-          "number": "0",
-          "position": "CF",
+          "id": "ID669477",
+          "name": "Casey Schmitt",
+          "number": "10",
+          "position": "3B",
           "is_batter": true,
           "batting_order_slot": 5
         },
@@ -662,26 +662,26 @@
           "batting_order_slot": 6
         },
         {
-          "id": "ID646240",
-          "name": "Rafael Devers",
-          "number": "16",
-          "position": "1B",
+          "id": "ID642715",
+          "name": "Willy Adames",
+          "number": "2",
+          "position": "SS",
           "is_batter": true,
           "batting_order_slot": 7
         },
         {
-          "id": "ID687529",
-          "name": "Grant McCray",
-          "number": "58",
+          "id": "ID687551",
+          "name": "Drew Gilbert",
+          "number": "0",
           "position": "CF",
           "is_batter": true,
           "batting_order_slot": 8
         },
         {
-          "id": "ID683766",
-          "name": "Christian Koss",
-          "number": "50",
-          "position": "2B",
+          "id": "ID701852",
+          "name": "Drew Cavanaugh",
+          "number": "61",
+          "position": "C",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -696,44 +696,28 @@
           "batting_order_slot": 1
         },
         {
-          "id": "ID686475",
-          "name": "Tyler Tolbert",
-          "number": "2",
-          "position": "2B",
+          "id": "ID657041",
+          "name": "Lane Thomas",
+          "number": "15",
+          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 2
         },
         {
-          "id": "ID668942",
-          "name": "Josh Rojas",
-          "number": "40",
-          "position": "3B",
+          "id": "ID686469",
+          "name": "Vinnie Pasquantino",
+          "number": "9",
+          "position": "1B",
           "is_batter": true,
           "batting_order_slot": 3
-        },
-        {
-          "id": "ID686555",
-          "name": "Isaac Collins",
-          "number": "1",
-          "position": "LF",
-          "is_batter": true,
-          "batting_order_slot": 4
         },
         {
           "id": "ID521692",
           "name": "Salvador Perez",
           "number": "13",
-          "position": "C",
+          "position": "DH",
           "is_batter": true,
-          "batting_order_slot": 5
-        },
-        {
-          "id": "ID679845",
-          "name": "Nick Loftin",
-          "number": "12",
-          "position": "3B",
-          "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 4
         },
         {
           "id": "ID686681",
@@ -741,7 +725,15 @@
           "number": "19",
           "position": "2B",
           "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 5
+        },
+        {
+          "id": "ID686555",
+          "name": "Isaac Collins",
+          "number": "1",
+          "position": "LF",
+          "is_batter": true,
+          "batting_order_slot": 6
         },
         {
           "id": "ID516782",
@@ -749,13 +741,21 @@
           "number": "0",
           "position": "RF",
           "is_batter": true,
+          "batting_order_slot": 7
+        },
+        {
+          "id": "ID668942",
+          "name": "Josh Rojas",
+          "number": "40",
+          "position": "3B",
+          "is_batter": true,
           "batting_order_slot": 8
         },
         {
-          "id": "ID571912",
-          "name": "Luke Maile",
-          "number": "18",
-          "position": "C",
+          "id": "ID623205",
+          "name": "Andrew Velazquez",
+          "number": "45",
+          "position": "SS",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -766,12 +766,20 @@
       "home_team": "Milwaukee Brewers",
       "away_players": [
         {
-          "id": "ID620443",
-          "name": "Luis Torrens",
-          "number": "13",
-          "position": "C",
+          "id": "ID805999",
+          "name": "A.J. Ewing",
+          "number": "9",
+          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 1
+        },
+        {
+          "id": "ID596019",
+          "name": "Francisco Lindor",
+          "number": "12",
+          "position": "SS",
+          "is_batter": true,
+          "batting_order_slot": 2
         },
         {
           "id": "ID666182",
@@ -779,37 +787,29 @@
           "number": "19",
           "position": "3B",
           "is_batter": true,
-          "batting_order_slot": 2
-        },
-        {
-          "id": "ID621438",
-          "name": "Tyrone Taylor",
-          "number": "28",
-          "position": "CF",
-          "is_batter": true,
           "batting_order_slot": 3
-        },
-        {
-          "id": "ID682626",
-          "name": "Francisco Alvarez",
-          "number": "4",
-          "position": "C",
-          "is_batter": true,
-          "batting_order_slot": 4
-        },
-        {
-          "id": "ID683146",
-          "name": "Brett Baty",
-          "number": "7",
-          "position": "3B",
-          "is_batter": true,
-          "batting_order_slot": 5
         },
         {
           "id": "ID701807",
           "name": "Carson Benge",
           "number": "3",
-          "position": "RF",
+          "position": "LF",
+          "is_batter": true,
+          "batting_order_slot": 4
+        },
+        {
+          "id": "ID593871",
+          "name": "Jorge Polanco",
+          "number": "11",
+          "position": "DH",
+          "is_batter": true,
+          "batting_order_slot": 5
+        },
+        {
+          "id": "ID676724",
+          "name": "Jared Young",
+          "number": "29",
+          "position": "1B",
           "is_batter": true,
           "batting_order_slot": 6
         },
@@ -822,38 +822,30 @@
           "batting_order_slot": 7
         },
         {
-          "id": "ID596019",
-          "name": "Francisco Lindor",
-          "number": "12",
-          "position": "SS",
+          "id": "ID683146",
+          "name": "Brett Baty",
+          "number": "7",
+          "position": "RF",
           "is_batter": true,
           "batting_order_slot": 8
         },
         {
-          "id": "ID665742",
-          "name": "Juan Soto",
-          "number": "22",
-          "position": "LF",
+          "id": "ID682626",
+          "name": "Francisco Alvarez",
+          "number": "4",
+          "position": "C",
           "is_batter": true,
           "batting_order_slot": 9
         }
       ],
       "home_players": [
         {
-          "id": "ID806198",
-          "name": "Cooper Pratt",
-          "number": "12",
-          "position": "SS",
+          "id": "ID592885",
+          "name": "Christian Yelich",
+          "number": "22",
+          "position": "DH",
           "is_batter": true,
           "batting_order_slot": 1
-        },
-        {
-          "id": "ID687401",
-          "name": "Joey Ortiz",
-          "number": "3",
-          "position": "SS",
-          "is_batter": true,
-          "batting_order_slot": 2
         },
         {
           "id": "ID694192",
@@ -861,39 +853,23 @@
           "number": "11",
           "position": "LF",
           "is_batter": true,
+          "batting_order_slot": 2
+        },
+        {
+          "id": "ID668930",
+          "name": "Brice Turang",
+          "number": "2",
+          "position": "2B",
+          "is_batter": true,
           "batting_order_slot": 3
         },
         {
-          "id": "ID592885",
-          "name": "Christian Yelich",
-          "number": "22",
-          "position": "DH",
+          "id": "ID661388",
+          "name": "William Contreras",
+          "number": "24",
+          "position": "C",
           "is_batter": true,
           "batting_order_slot": 4
-        },
-        {
-          "id": "ID641343",
-          "name": "Jake Bauers",
-          "number": "9",
-          "position": "1B",
-          "is_batter": true,
-          "batting_order_slot": 5
-        },
-        {
-          "id": "ID669699",
-          "name": "Braden Shewmake",
-          "number": "13",
-          "position": "SS",
-          "is_batter": true,
-          "batting_order_slot": 6
-        },
-        {
-          "id": "ID683734",
-          "name": "Andrew Vaughn",
-          "number": "28",
-          "position": "1B",
-          "is_batter": true,
-          "batting_order_slot": 7
         },
         {
           "id": "ID669003",
@@ -901,13 +877,37 @@
           "number": "5",
           "position": "CF",
           "is_batter": true,
+          "batting_order_slot": 5
+        },
+        {
+          "id": "ID683734",
+          "name": "Andrew Vaughn",
+          "number": "28",
+          "position": "1B",
+          "is_batter": true,
+          "batting_order_slot": 6
+        },
+        {
+          "id": "ID641343",
+          "name": "Jake Bauers",
+          "number": "9",
+          "position": "RF",
+          "is_batter": true,
+          "batting_order_slot": 7
+        },
+        {
+          "id": "ID806198",
+          "name": "Cooper Pratt",
+          "number": "12",
+          "position": "SS",
+          "is_batter": true,
           "batting_order_slot": 8
         },
         {
-          "id": "ID663368",
-          "name": "Blake Perkins",
-          "number": "16",
-          "position": "CF",
+          "id": "ID687401",
+          "name": "Joey Ortiz",
+          "number": "3",
+          "position": "3B",
           "is_batter": true,
           "batting_order_slot": 9
         }
