@@ -4,9 +4,9 @@
 # =====================================================================
 import io
 import sys
+import os
 if sys.platform == 'win32':
     # Enable UTF-8 output on Windows
-    import os
     os.environ['PYTHONIOENCODING'] = 'utf-8'
     # Reconfigure stdout for UTF-8
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -534,6 +534,68 @@ def resolve_probability_mode_and_weight():
     return mode, weight
 
 
+def resolve_kelly_multiplier(days_lookback=14, default_multiplier=0.50):
+    """Resolve Kelly multiplier from env override or recent evaluation drift.
+
+    If KELLY_MULTIPLIER is set, use it (clipped to [0.10, 1.00]).
+    Otherwise derive a conservative multiplier from recent Brier score quality.
+    """
+    raw = os.getenv('KELLY_MULTIPLIER')
+    if raw is not None and str(raw).strip() != '':
+        try:
+            val = max(0.10, min(1.00, float(raw)))
+            print(f"Kelly multiplier override from KELLY_MULTIPLIER: {val:.2f}")
+            return float(val)
+        except Exception:
+            pass
+
+    cutoff = datetime.today() - timedelta(days=days_lookback)
+    briers = []
+    for f in sorted(Path('data').glob('evaluation_*.csv')):
+        try:
+            d = datetime.strptime(f.stem.replace('evaluation_', ''), '%Y-%m-%d')
+            if d < cutoff:
+                continue
+            df = pd.read_csv(f, usecols=['pred_hr_prob', 'actual_hr'])
+            if df.empty:
+                continue
+            pred = pd.to_numeric(df['pred_hr_prob'], errors='coerce').fillna(0.0)
+            actual = pd.to_numeric(df['actual_hr'], errors='coerce').fillna(0.0)
+            brier = float(((pred - actual) ** 2).mean())
+            if np.isfinite(brier):
+                briers.append(brier)
+        except Exception:
+            continue
+
+    if not briers:
+        print(f"Kelly multiplier: no recent evaluations in last {days_lookback} days; using default {default_multiplier:.2f}")
+        return float(default_multiplier)
+
+    avg_brier = float(sum(briers) / len(briers))
+    # Lower Brier = better calibration = can risk slightly more.
+    if avg_brier <= 0.08:
+        mult = 0.60
+    elif avg_brier <= 0.12:
+        mult = 0.50
+    elif avg_brier <= 0.16:
+        mult = 0.40
+    else:
+        mult = 0.30
+
+    print(f"Kelly multiplier auto-adjusted from Brier trend: {mult:.2f} (days={len(briers)}, avg_brier={avg_brier:.4f})")
+    return float(mult)
+
+
+def _file_contains_text(path, needle):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return False
+        return needle in p.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return False
+
+
 def run_model_self_check(days_lookback=30):
     """Print current runtime mode/weight and physics calibration readiness."""
     print("\n" + "=" * 70)
@@ -739,9 +801,23 @@ def print_weekly_todo(days_lookback=7):
                 pass
 
     # 4) Scheduling and monitoring reliability
-    todos.append(("MEDIUM", "Add a weekly cron/task to run --self-check and archive output for drift tracking."))
-    todos.append(("MEDIUM", "Review weekly Brier score trend from data/evaluation_*.csv and adjust Kelly multiplier if drift appears."))
-    todos.append(("LOW", "Expand backfill window monthly (--backfill-physics --backfill-days 120) to keep calibration history rich."))
+    weekly_maint = Path('.github') / 'workflows' / 'weekly_maintenance.yml'
+    monthly_maint = Path('.github') / 'workflows' / 'monthly_backfill.yml'
+
+    has_weekly_self_check = (
+        _file_contains_text(weekly_maint, '--self-check') and
+        _file_contains_text(weekly_maint, 'Upload self-check artifacts')
+    )
+    if not has_weekly_self_check:
+        todos.append(("MEDIUM", "Add a weekly cron/task to run --self-check and archive output for drift tracking."))
+
+    # Kelly drift review can be automated once enough evaluation files exist.
+    if len(eval_files) < 3:
+        todos.append(("MEDIUM", "Build 3-5 recent evaluation files so auto Kelly/Brier drift controls can engage."))
+
+    has_monthly_backfill = _file_contains_text(monthly_maint, '--backfill-physics --backfill-days 120')
+    if not has_monthly_backfill:
+        todos.append(("LOW", "Expand backfill window monthly (--backfill-physics --backfill-days 120) to keep calibration history rich."))
 
     priority_rank = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
     todos = sorted(todos, key=lambda t: priority_rank.get(t[0], 9))
@@ -2138,13 +2214,16 @@ def generate_daily_predictions():
     _b = _dec_odds - 1
     _market_prob = float(os.getenv('MARKET_HR_BASELINE', '0.09'))
 
+    kelly_multiplier = resolve_kelly_multiplier(days_lookback=14, default_multiplier=0.50)
+
     def _kelly(p):
         edge = p * _b - (1 - p)
-        return max(round(edge / _b * 0.5, 4), 0.0) if edge > 0 else 0.0
+        return max(round(edge / _b * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
 
     live['pred_hr_prob'] = probs
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     live['kelly_fraction'] = live['pred_hr_prob'].apply(_kelly)
+    live['kelly_multiplier'] = kelly_multiplier
     live['model_name'] = '+'.join(model_names)
     live['prediction_timestamp'] = datetime.now().isoformat()
 
@@ -2268,7 +2347,7 @@ def generate_daily_predictions():
                 return row['kelly_fraction']
             b = (1 - mp) / mp
             edge = row['pred_hr_prob'] * b - (1 - row['pred_hr_prob'])
-            return max(round(edge / b * 0.5, 4), 0.0) if edge > 0 else 0.0
+            return max(round(edge / b * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
         live['kelly_fraction'] = live.apply(_kelly_real, axis=1)
     else:
         # No real odds: mark EV as zero
@@ -2307,6 +2386,7 @@ def generate_daily_predictions():
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
                                     'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
                                     'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
+                                    'kelly_multiplier',
                                     'base_model_prob', 'physics_delta', 'blend_weight_physics', 'probability_mode',
                                     'best_book', 'best_market_odds_american', 'best_market_implied_prob',
                                     'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
