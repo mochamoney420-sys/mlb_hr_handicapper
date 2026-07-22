@@ -2557,21 +2557,31 @@ def monitor_live_home_runs():
                 all_plays = play_by_play.get('liveData', {}).get('plays', {}).get('allPlays', [])
                 for play in all_plays:
                     result = play.get('result', {})
-                    event_id = play.get('about', {}).get('playId')
-                    if not event_id:
+                    about = play.get('about', {})
+                    matchup = play.get('matchup', {})
+                    event_name = str(result.get('event', '')).lower()
+                    event_type = str(result.get('eventType', '')).lower()
+                    if event_name not in ('home run', 'home_run', 'homerun', 'hr') and event_type not in ('home_run', 'home run', 'homerun', 'hr'):
                         continue
 
-                    event_name = str(result.get('event', '')).lower()
-                    if event_name not in ('home run', 'home_run', 'homerun', 'hr'):
-                        continue
+                    event_id = about.get('playId')
+                    if not event_id:
+                        # Some StatsAPI payloads omit playId for completed events.
+                        # Build a deterministic fallback key for dedupe.
+                        batter_id = matchup.get('batter', {}).get('id') or ''
+                        at_bat_idx = about.get('atBatIndex', '')
+                        inning = about.get('inning', '')
+                        half = about.get('halfInning', '')
+                        event_id = f"{game_id}:{inning}:{half}:{at_bat_idx}:{batter_id}:{event_type or event_name}"
+
                     if event_id in processed_home_runs:
                         continue
 
                     description = result.get('description', 'A home run was hit!')
-                    inning_half = play.get('about', {}).get('halfInning', '')
-                    num_inning = play.get('about', {}).get('inning', '')
-                    batter_name = play.get('matchup', {}).get('batter', {}).get('fullName') or ''
-                    pitcher_name = play.get('matchup', {}).get('pitcher', {}).get('fullName') or ''
+                    inning_half = about.get('halfInning', '')
+                    num_inning = about.get('inning', '')
+                    batter_name = matchup.get('batter', {}).get('fullName') or ''
+                    pitcher_name = matchup.get('pitcher', {}).get('fullName') or ''
                     game_display = f"{game.get('away_name','Away')} @ {game.get('home_name','Home')}"
 
                     # Log live outcome against today's predictions for learning feedback

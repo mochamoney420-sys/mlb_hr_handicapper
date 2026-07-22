@@ -384,5 +384,14 @@ if __name__ == '__main__':
         print("Setting up continuous prediction updates...")
         schedule_prediction_updates()
     else:
-        success = check_and_update_predictions()
-        sys.exit(0 if success else 1)
+        try:
+            updated = check_and_update_predictions()
+            if updated:
+                print("✓ Update cycle completed with changes applied.")
+            else:
+                print("✓ Update cycle completed with no changes required.")
+            # No-op cycles are expected and should not fail CI.
+            sys.exit(0)
+        except Exception as e:
+            print(f"✗ Unhandled updater error: {e}")
+            sys.exit(1)
