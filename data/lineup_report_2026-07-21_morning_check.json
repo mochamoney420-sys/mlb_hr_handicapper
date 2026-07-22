@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-21T20:56:42.782676",
+  "timestamp": "2026-07-21T21:17:14.166882",
   "games": {
     "824409": {
       "away_team": "Minnesota Twins",
@@ -120,7 +120,7 @@
         {
           "id": "ID681252",
           "name": "Jack Anderson",
-          "number": "",
+          "number": "30",
           "position": "P",
           "is_batter": false
         },
@@ -1272,7 +1272,7 @@
           "id": "ID687749",
           "name": "Jase Bowen",
           "number": "4",
-          "position": "RF",
+          "position": "LF",
           "is_batter": true
         },
         {
@@ -1323,7 +1323,7 @@
           "id": "ID663698",
           "name": "Joey Bart",
           "number": "16",
-          "position": "C",
+          "position": "DH",
           "is_batter": true
         },
         {
@@ -1751,7 +1751,7 @@
           "id": "ID516782",
           "name": "Starling Marte",
           "number": "0",
-          "position": "LF",
+          "position": "RF",
           "is_batter": true
         },
         {
@@ -2874,7 +2874,7 @@
           "id": "ID670032",
           "name": "Nicky Lopez",
           "number": "33",
-          "position": "2B",
+          "position": "SS",
           "is_batter": true
         },
         {
@@ -2902,7 +2902,7 @@
           "id": "ID677649",
           "name": "Ezequiel Duran",
           "number": "20",
-          "position": "SS",
+          "position": "3B",
           "is_batter": true
         },
         {
@@ -4317,6 +4317,13 @@
           "is_batter": true
         },
         {
+          "id": "ID672629",
+          "name": "Gerardo Carrillo",
+          "number": "68",
+          "position": "P",
+          "is_batter": false
+        },
+        {
           "id": "ID571448",
           "name": "Nolan Arenado",
           "number": "28",
@@ -4329,13 +4336,6 @@
           "number": "31",
           "position": "1B",
           "is_batter": true
-        },
-        {
-          "id": "ID686753",
-          "name": "Drey Jameson",
-          "number": "99",
-          "position": "P",
-          "is_batter": false
         },
         {
           "id": "ID518876",

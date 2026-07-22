@@ -42,35 +42,40 @@ def get_game_lineups(game_id):
         away_batting_order = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('batters', [])
         home_batting_order = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('batters', [])
         
-        # Parse away team lineup - include all players, not just confirmed batters
-        away_lineup = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('away', {}).get('players', {})
-        for player_id, player_data in away_lineup.items():
-            player_info = player_data.get('person', {})
-            position = player_data.get('position', {}).get('abbreviation', 'UNK')
-            # Include if in batting order OR if position suggests batter (not pitcher)
-            is_batter = player_id.replace('ID', '') in away_batting_order or position not in ['P', 'UNK']
-            lineups['away_players'].append({
-                'id': player_id,
-                'name': player_info.get('fullName', 'Unknown'),
-                'number': player_data.get('jerseyNumber', 0),
-                'position': position,
-                'is_batter': is_batter
-            })
-        
-        # Parse home team lineup - include all players, not just confirmed batters
-        home_lineup = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get('home', {}).get('players', {})
-        for player_id, player_data in home_lineup.items():
-            player_info = player_data.get('person', {})
-            position = player_data.get('position', {}).get('abbreviation', 'UNK')
-            # Include if in batting order OR if position suggests batter (not pitcher)
-            is_batter = player_id.replace('ID', '') in home_batting_order or position not in ['P', 'UNK']
-            lineups['home_players'].append({
-                'id': player_id,
-                'name': player_info.get('fullName', 'Unknown'),
-                'number': player_data.get('jerseyNumber', 0),
-                'position': position,
-                'is_batter': is_batter
-            })
+        def _build_ordered_lineup(team_key, batting_order_ids):
+            players = game_data.get('liveData', {}).get('boxscore', {}).get('teams', {}).get(team_key, {}).get('players', {})
+            ordered = []
+
+            ordered_ids = [str(pid).replace('ID', '') for pid in (batting_order_ids or [])]
+            if not ordered_ids:
+                # Conservative fallback: use only non-pitchers from current boxscore roster, capped to 9.
+                ordered_ids = [
+                    str(pid).replace('ID', '') for pid, pdata in players.items()
+                    if pdata.get('position', {}).get('abbreviation') not in ['P', 'UNK']
+                ][:9]
+
+            seen = set()
+            for slot, batter_id in enumerate(ordered_ids, 1):
+                batter_id = str(batter_id).replace('ID', '')
+                if not batter_id or batter_id in seen:
+                    continue
+                seen.add(batter_id)
+                player_data = players.get(f'ID{batter_id}', {})
+                player_info = player_data.get('person', {})
+                ordered.append({
+                    'id': f'ID{batter_id}',
+                    'name': player_info.get('fullName', f'Unknown (#{batter_id})'),
+                    'number': player_data.get('jerseyNumber', 0),
+                    'position': player_data.get('position', {}).get('abbreviation', 'UNK'),
+                    'is_batter': True,
+                    'batting_order_slot': slot,
+                })
+                if len(ordered) >= 9:
+                    break
+            return ordered
+
+        lineups['away_players'] = _build_ordered_lineup('away', away_batting_order)
+        lineups['home_players'] = _build_ordered_lineup('home', home_batting_order)
         
         return lineups
     except Exception as e:

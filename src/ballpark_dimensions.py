@@ -542,6 +542,33 @@ BALLPARK_DATA = {
     },
 }
 
+TEAM_TO_BALLPARK_KEY = {
+    str(v.get('team', '')).upper(): k for k, v in BALLPARK_DATA.items() if v.get('team')
+}
+STADIUM_NAME_TO_BALLPARK_KEY = {
+    str(v.get('name', '')).lower(): k for k, v in BALLPARK_DATA.items() if v.get('name')
+}
+
+
+def _resolve_ballpark_key(team):
+    """Resolve BALLPARK_DATA key from canonical key, team abbrev, or stadium name."""
+    if team in BALLPARK_DATA:
+        return team
+
+    team_str = str(team or '').strip()
+    if not team_str:
+        return None
+
+    upper = team_str.upper()
+    if upper in TEAM_TO_BALLPARK_KEY:
+        return TEAM_TO_BALLPARK_KEY[upper]
+
+    lower = team_str.lower()
+    if lower in STADIUM_NAME_TO_BALLPARK_KEY:
+        return STADIUM_NAME_TO_BALLPARK_KEY[lower]
+
+    return None
+
 
 def get_ballpark_factor(team, batter_hand='R', batter_id=None):
     """
@@ -555,10 +582,11 @@ def get_ballpark_factor(team, batter_hand='R', batter_id=None):
     Returns:
         dict with park factor and characteristics
     """
-    if team not in BALLPARK_DATA:
+    park_key = _resolve_ballpark_key(team)
+    if park_key is None:
         return {'park_factor': 1.0, 'characteristics': []}
-    
-    park = BALLPARK_DATA[team]
+
+    park = BALLPARK_DATA[park_key]
     
     if batter_hand.upper() == 'L':
         park_factor = park['park_factor_lh']
@@ -642,7 +670,8 @@ def get_porch_advantage_bonus(team, batter_hand, recent_fly_ball_distance=None):
     
     Returns multiplier 1.0-1.35x based on mismatch detection.
     """
-    park = BALLPARK_DATA.get(team)
+    park_key = _resolve_ballpark_key(team)
+    park = BALLPARK_DATA.get(park_key)
     if not park:
         return 1.0
     
@@ -671,7 +700,8 @@ def get_death_valley_penalty(team, batter_exit_velo_avg=None):
     
     Returns multiplier 0.92-1.0 based on severity.
     """
-    park = BALLPARK_DATA.get(team)
+    park_key = _resolve_ballpark_key(team)
+    park = BALLPARK_DATA.get(park_key)
     if not park:
         return 1.0
     

@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-21T18:11:55.389654",
+  "timestamp": "2026-07-21T21:19:54.753368",
   "games": {
     "824409": {
       "away_team": "Minnesota Twins",
@@ -120,7 +120,7 @@
         {
           "id": "ID681252",
           "name": "Jack Anderson",
-          "number": "",
+          "number": "30",
           "position": "P",
           "is_batter": false
         },
@@ -1098,7 +1098,7 @@
           "id": "ID664702",
           "name": "Myles Straw",
           "number": "3",
-          "position": "RF",
+          "position": "LF",
           "is_batter": true
         },
         {
@@ -1272,7 +1272,7 @@
           "id": "ID687749",
           "name": "Jase Bowen",
           "number": "4",
-          "position": "RF",
+          "position": "LF",
           "is_batter": true
         },
         {
@@ -1323,7 +1323,7 @@
           "id": "ID663698",
           "name": "Joey Bart",
           "number": "16",
-          "position": "C",
+          "position": "DH",
           "is_batter": true
         },
         {
@@ -1751,7 +1751,7 @@
           "id": "ID516782",
           "name": "Starling Marte",
           "number": "0",
-          "position": "LF",
+          "position": "RF",
           "is_batter": true
         },
         {
@@ -2273,6 +2273,13 @@
           "is_batter": true
         },
         {
+          "id": "ID680744",
+          "name": "Ty Madden",
+          "number": "36",
+          "position": "P",
+          "is_batter": false
+        },
+        {
           "id": "ID623454",
           "name": "Drew Anderson",
           "number": "38",
@@ -2325,13 +2332,6 @@
           "id": "ID445276",
           "name": "Kenley Jansen",
           "number": "74",
-          "position": "P",
-          "is_batter": false
-        },
-        {
-          "id": "ID656427",
-          "name": "Jack Flaherty",
-          "number": "9",
           "position": "P",
           "is_batter": false
         },
@@ -2801,13 +2801,6 @@
           "is_batter": true
         },
         {
-          "id": "ID692030",
-          "name": "Jose Corniell",
-          "number": "59",
-          "position": "P",
-          "is_batter": false
-        },
-        {
           "id": "ID694671",
           "name": "Wyatt Langford",
           "number": "36",
@@ -2850,6 +2843,13 @@
           "is_batter": true
         },
         {
+          "id": "ID642851",
+          "name": "Austin Wynns",
+          "number": "38",
+          "position": "C",
+          "is_batter": true
+        },
+        {
           "id": "ID592626",
           "name": "Joc Pederson",
           "number": "3",
@@ -2874,7 +2874,7 @@
           "id": "ID670032",
           "name": "Nicky Lopez",
           "number": "33",
-          "position": "2B",
+          "position": "SS",
           "is_batter": true
         },
         {
@@ -2899,17 +2899,10 @@
           "is_batter": true
         },
         {
-          "id": "ID543309",
-          "name": "Kyle Higashioka",
-          "number": "11",
-          "position": "C",
-          "is_batter": true
-        },
-        {
           "id": "ID677649",
           "name": "Ezequiel Duran",
           "number": "20",
-          "position": "SS",
+          "position": "3B",
           "is_batter": true
         },
         {
@@ -2937,6 +2930,13 @@
           "id": "ID687239",
           "name": "Ben Peoples",
           "number": "70",
+          "position": "P",
+          "is_batter": false
+        },
+        {
+          "id": "ID594835",
+          "name": "Marco Gonzales",
+          "number": "50",
           "position": "P",
           "is_batter": false
         },
@@ -4108,7 +4108,7 @@
           "id": "ID641680",
           "name": "Jonah Heim",
           "number": "15",
-          "position": "C",
+          "position": "1B",
           "is_batter": true
         },
         {
@@ -4171,14 +4171,14 @@
           "id": "ID675961",
           "name": "Alika Williams",
           "number": "12",
-          "position": "SS",
+          "position": "2B",
           "is_batter": true
         },
         {
           "id": "ID691777",
           "name": "Max Muncy",
           "number": "3",
-          "position": "3B",
+          "position": "DH",
           "is_batter": true
         },
         {
@@ -4205,7 +4205,7 @@
         {
           "id": "ID696522",
           "name": "Hayden Juenger",
-          "number": "",
+          "number": "58",
           "position": "P",
           "is_batter": false
         },
@@ -4317,6 +4317,13 @@
           "is_batter": true
         },
         {
+          "id": "ID672629",
+          "name": "Gerardo Carrillo",
+          "number": "68",
+          "position": "P",
+          "is_batter": false
+        },
+        {
           "id": "ID571448",
           "name": "Nolan Arenado",
           "number": "28",
@@ -4329,13 +4336,6 @@
           "number": "31",
           "position": "1B",
           "is_batter": true
-        },
-        {
-          "id": "ID686753",
-          "name": "Drey Jameson",
-          "number": "99",
-          "position": "P",
-          "is_batter": false
         },
         {
           "id": "ID518876",
@@ -4664,7 +4664,7 @@
           "id": "ID645302",
           "name": "Victor Robles",
           "number": "10",
-          "position": "RF",
+          "position": "CF",
           "is_batter": true
         },
         {
@@ -5164,6 +5164,13 @@
           "number": "13",
           "position": "2B",
           "is_batter": true
+        },
+        {
+          "id": "ID608331",
+          "name": "Max Fried",
+          "number": "54",
+          "position": "P",
+          "is_batter": false
         },
         {
           "id": "ID666808",
