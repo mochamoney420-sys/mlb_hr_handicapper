@@ -18,6 +18,7 @@ import argparse
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from itertools import combinations
 
 # Load environment variables from .vscode/.env
 env_file = Path(__file__).parent / '.vscode' / '.env'
@@ -900,50 +901,205 @@ def print_weekly_todo(days_lookback=7):
         print(f"{i}. [{p}] {text}")
 
 
-def build_correlated_hr_pairings(live_df):
-    """Build 2-leg same-team HR pairings (leadoff/cleanup) vs vulnerable pitcher."""
+def _normalize_player_key(name):
+    return str(name or '').strip().lower()
+
+
+def _american_to_decimal_safe(odds):
+    try:
+        o = float(odds)
+    except Exception:
+        return np.nan
+    if o > 0:
+        return 1.0 + (o / 100.0)
+    if o < 0:
+        return 1.0 + (100.0 / abs(o))
+    return np.nan
+
+
+def _load_hr_hitter_name_set(date_str):
+    """Load actual HR hitters for one date from Statcast cache/feed."""
+    try:
+        sc = load_or_fetch_statcast(date_str)
+    except Exception:
+        return set()
+    if sc is None or sc.empty or 'events' not in sc.columns:
+        return set()
+
+    hr = sc[sc['events'] == 'home_run'].copy()
+    if hr.empty:
+        return set()
+
+    names = set()
+    if 'player_name' in hr.columns:
+        names |= {_normalize_player_key(x) for x in hr['player_name'].dropna().tolist() if str(x).strip()}
+    if 'batter_name' in hr.columns:
+        names |= {_normalize_player_key(x) for x in hr['batter_name'].dropna().tolist() if str(x).strip()}
+    return names
+
+
+def learn_parlay_pair_multipliers(days_back=60, top_n_per_day=20):
+    """Learn global pairing multipliers from historical prediction files and actual HR outcomes."""
+    data_dir = Path('data')
+    pred_files = sorted(data_dir.glob('predictions_*.csv'))
+    if not pred_files:
+        return {
+            'global_mult': 1.0,
+            'cross_game_mult': 1.0,
+            'same_game_mult': 1.0,
+            'dual_ev_mult': 1.0,
+            'training_days_used': 0,
+        }
+
+    today = datetime.today().date()
+    cutoff = today - timedelta(days=max(1, int(days_back)))
+
+    g_obs = g_exp = 0.0
+    x_obs = x_exp = 0.0
+    s_obs = s_exp = 0.0
+    ev_obs = ev_exp = 0.0
+    days_used = 0
+
+    for fp in pred_files:
+        stem = fp.stem
+        if not stem.startswith('predictions_'):
+            continue
+        ds = stem.replace('predictions_', '').strip()
+        try:
+            d = datetime.strptime(ds, '%Y-%m-%d').date()
+        except Exception:
+            continue
+        if d >= today or d < cutoff:
+            continue
+
+        try:
+            preds = pd.read_csv(fp)
+        except Exception:
+            continue
+        if preds.empty or 'batter_name' not in preds.columns or 'pred_hr_prob' not in preds.columns:
+            continue
+
+        hr_names = _load_hr_hitter_name_set(ds)
+        if not hr_names:
+            continue
+
+        cols = ['batter_name', 'pred_hr_prob', 'game_pk']
+        if 'ev_percent' in preds.columns:
+            cols.append('ev_percent')
+        sub = preds[cols].copy()
+        sub['pred_hr_prob'] = pd.to_numeric(sub['pred_hr_prob'], errors='coerce').fillna(0.0)
+        if 'ev_percent' not in sub.columns:
+            sub['ev_percent'] = 0.0
+        sub['ev_percent'] = pd.to_numeric(sub['ev_percent'], errors='coerce').fillna(0.0)
+        sub = sub.sort_values('pred_hr_prob', ascending=False).head(max(8, int(top_n_per_day)))
+        sub = sub[sub['pred_hr_prob'] > 0].copy()
+        if len(sub) < 2:
+            continue
+
+        days_used += 1
+        rows = sub.to_dict('records')
+        for a, b in combinations(rows, 2):
+            p1 = float(a.get('pred_hr_prob', 0.0))
+            p2 = float(b.get('pred_hr_prob', 0.0))
+            base = p1 * p2
+            if base <= 0:
+                continue
+            n1 = _normalize_player_key(a.get('batter_name', ''))
+            n2 = _normalize_player_key(b.get('batter_name', ''))
+            hit = 1.0 if (n1 in hr_names and n2 in hr_names) else 0.0
+
+            g_obs += hit
+            g_exp += base
+
+            same_game = str(a.get('game_pk', '')) == str(b.get('game_pk', ''))
+            if same_game:
+                s_obs += hit
+                s_exp += base
+            else:
+                x_obs += hit
+                x_exp += base
+
+            if float(a.get('ev_percent', 0.0)) > 0 and float(b.get('ev_percent', 0.0)) > 0:
+                ev_obs += hit
+                ev_exp += base
+
+    def _ratio(obs, exp, default=1.0, lo=0.7, hi=1.5):
+        if exp <= 0:
+            return default
+        return float(np.clip(obs / exp, lo, hi))
+
+    return {
+        'global_mult': _ratio(g_obs, g_exp, default=1.0),
+        'cross_game_mult': _ratio(x_obs, x_exp, default=1.0),
+        'same_game_mult': _ratio(s_obs, s_exp, default=1.0),
+        'dual_ev_mult': _ratio(ev_obs, ev_exp, default=1.0),
+        'training_days_used': int(days_used),
+    }
+
+
+def build_learned_hr_pairings(live_df, days_back=60, candidate_n=36):
+    """Build learned 2-leg HR parlay pairings (any game) from historical co-hit behavior."""
     if live_df is None or live_df.empty:
         return pd.DataFrame()
 
-    req_cols = {'team_side', 'batting_order_slot', 'batter_name', 'pitcher_name', 'pred_hr_prob'}
+    req_cols = {'batter_name', 'pitcher_name', 'pred_hr_prob', 'game_pk'}
     if not req_cols.issubset(set(live_df.columns)):
         return pd.DataFrame()
 
+    work = live_df.copy()
+    work['pred_hr_prob'] = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+    work['ev_percent'] = pd.to_numeric(work.get('ev_percent', 0.0), errors='coerce').fillna(0.0)
+    work['signal_score'] = work['pred_hr_prob'] + np.maximum(work['ev_percent'], 0) / 250.0
+    work = work.sort_values(['signal_score', 'pred_hr_prob'], ascending=False).head(max(12, int(candidate_n)))
+    if len(work) < 2:
+        return pd.DataFrame()
+
+    multipliers = learn_parlay_pair_multipliers(days_back=max(14, int(days_back)), top_n_per_day=20)
     rows = []
-    for _, team_df in live_df.groupby('team_side'):
-        team_df = team_df.sort_values('batting_order_slot')
-        lead = team_df[team_df['batting_order_slot'].isin([1, 2])]
-        clean = team_df[team_df['batting_order_slot'].isin([4, 5])]
-        if lead.empty or clean.empty:
+    for a, b in combinations(work.to_dict('records'), 2):
+        p1 = float(a.get('pred_hr_prob', 0.0))
+        p2 = float(b.get('pred_hr_prob', 0.0))
+        if p1 <= 0 or p2 <= 0:
             continue
 
-        lead_row = lead.sort_values('pred_hr_prob', ascending=False).iloc[0]
-        clean_row = clean.sort_values('pred_hr_prob', ascending=False).iloc[0]
+        same_game = str(a.get('game_pk', '')) == str(b.get('game_pk', ''))
+        base_combo = p1 * p2
+        multi = float(multipliers.get('global_mult', 1.0))
+        multi *= float(multipliers.get('same_game_mult', 1.0) if same_game else multipliers.get('cross_game_mult', 1.0))
+        if float(a.get('ev_percent', 0.0)) > 0 and float(b.get('ev_percent', 0.0)) > 0:
+            multi *= float(multipliers.get('dual_ev_mult', 1.0))
 
-        p1 = float(lead_row['pred_hr_prob'])
-        p2 = float(clean_row['pred_hr_prob'])
-        vuln = max(
-            float(team_df.get('pitch_hr_per_9', pd.Series([1.0])).iloc[0]),
-            float(team_df.get('pitch_hard_hit_allowed_rate', pd.Series([0.3])).iloc[0] * 3.0)
-        )
-        vuln_uplift = 1.12 if vuln >= 1.2 else 1.05
-        combo_prob = min(0.95, (p1 * p2) * vuln_uplift)
+        learned_combo = min(0.95, max(0.0, base_combo * multi))
+
+        o1 = _american_to_decimal_safe(a.get('best_market_odds_american', np.nan))
+        o2 = _american_to_decimal_safe(b.get('best_market_odds_american', np.nan))
+        parlay_decimal = (o1 * o2) if (pd.notna(o1) and pd.notna(o2)) else np.nan
+        parlay_ev = (learned_combo * parlay_decimal - 1.0) if pd.notna(parlay_decimal) else np.nan
 
         rows.append({
-            'team_side': lead_row.get('team_side', ''),
-            'pair_leg_1': lead_row['batter_name'],
-            'pair_leg_2': clean_row['batter_name'],
-            'opposing_pitcher': lead_row['pitcher_name'],
+            'pair_leg_1': a.get('batter_name', ''),
+            'pair_leg_2': b.get('batter_name', ''),
+            'leg1_game_pk': a.get('game_pk', ''),
+            'leg2_game_pk': b.get('game_pk', ''),
+            'pair_type': 'same_game' if same_game else 'cross_game',
             'leg1_prob': p1,
             'leg2_prob': p2,
-            'combo_prob': combo_prob,
-            'correlation_uplift': vuln_uplift,
+            'base_combo_prob': base_combo,
+            'learned_multiplier': multi,
+            'combo_prob': learned_combo,
+            'leg1_odds_american': a.get('best_market_odds_american', np.nan),
+            'leg2_odds_american': b.get('best_market_odds_american', np.nan),
+            'parlay_decimal': parlay_decimal,
+            'parlay_ev': parlay_ev,
+            'training_days_used': int(multipliers.get('training_days_used', 0)),
         })
 
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values('combo_prob', ascending=False).reset_index(drop=True)
+
+    out = out.sort_values(['parlay_ev', 'combo_prob'], ascending=[False, False], na_position='last').reset_index(drop=True)
+    return out
 
 
 def run_systematic_ev_operation(backfill_days=90):
@@ -2656,14 +2812,22 @@ def generate_daily_predictions():
             print("\nTop 5 Umpire Zone Drift Boosts:")
             print(umpire_view.to_string(index=False))
 
-    pair_df = build_correlated_hr_pairings(live)
+    pair_df = build_learned_hr_pairings(
+        live,
+        days_back=max(14, int(os.getenv('PARLAY_LEARN_DAYS', '60'))),
+        candidate_n=max(12, int(os.getenv('PARLAY_CANDIDATE_BATTERS', '36'))),
+    )
     if not pair_df.empty:
-        print("\nTop Correlated 2-Leg HR Pairings:")
-        print(pair_df.head(5).to_string(index=False))
+        print("\nTop Learned 2-Leg HR Pairings (Any Game):")
+        pair_view = pair_df[[
+            'pair_leg_1', 'pair_leg_2', 'pair_type',
+            'combo_prob', 'parlay_ev', 'learned_multiplier', 'training_days_used'
+        ]].head(10)
+        print(pair_view.to_string(index=False))
         try:
             pair_path = Path('data') / f"parlay_candidates_{datetime.today().strftime('%Y-%m-%d')}.csv"
             pair_df.to_csv(pair_path, index=False)
-            print(f"Saved correlated pairing candidates: {pair_path}")
+            print(f"Saved learned pairing candidates: {pair_path}")
         except Exception:
             pass
     
@@ -2796,7 +2960,7 @@ def monitor_odds_rlm():
 # ==========================================
 def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_inning):
     """Check today's predictions for the HR batter, log outcome to live_feedback CSV,
-    and return (model_prob, was_predicted, was_top5) for Discord annotation."""
+    and return (model_prob, was_predicted, was_top5, model_rank) for Discord annotation."""
     today_str = datetime.today().strftime('%Y-%m-%d')
     pred_file = Path('data') / f'predictions_{today_str}.csv'
 
@@ -2805,6 +2969,7 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
     pitcher_id = None
     was_predicted = False
     was_top5 = False
+    model_rank = None
 
     if pred_file.exists():
         try:
@@ -2818,6 +2983,7 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
                 was_predicted = model_prob >= 0.15
                 top5_names = preds.nlargest(5, 'pred_hr_prob')['batter_name'].str.lower().str.strip().tolist()
                 was_top5 = batter_name.lower().strip() in top5_names
+                model_rank = int((preds['pred_hr_prob'] > model_prob).sum() + 1)
         except Exception:
             pass
 
@@ -2844,7 +3010,7 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
     else:
         fb_df.to_csv(feedback_file, index=False)
 
-    return model_prob, was_predicted, was_top5
+    return model_prob, was_predicted, was_top5, model_rank
 
 
 def _live_hr_processed_path(date_str=None):
@@ -3350,6 +3516,149 @@ def _detect_live_odds_inversion_signal(game, play_by_play, power_profile, best_o
     return alerts
 
 
+def _build_live_reprice_predictions(game, play_by_play, power_profile, best_odds_now=None, best_odds_prev=None):
+    """Build fresh live HR predictions when pitcher quality appears to be declining.
+
+    This is a re-pricing layer, not a new training run: it adjusts today's baseline
+    batter probabilities using live pitcher degradation signals and returns the next
+    hitters most likely to benefit.
+    """
+    all_plays = ((play_by_play or {}).get('liveData', {}).get('plays', {}).get('allPlays', []) or [])
+    if not all_plays:
+        return None
+
+    last_play = all_plays[-1]
+    matchup = last_play.get('matchup', {}) or {}
+    pitcher = matchup.get('pitcher', {}) or {}
+    pitcher_id = _safe_int(pitcher.get('id'))
+    pitcher_name = str(pitcher.get('fullName', 'Unknown Pitcher'))
+    if pitcher_id is None:
+        return None
+
+    release_series = _pitcher_recent_release_series(all_plays, pitcher_id)
+    if len(release_series) < 8:
+        return None
+
+    window = min(len(release_series), max(8, _safe_int(os.getenv('LIVE_REPRICE_WINDOW_PITCHES', '10'), 10) or 10))
+    tail = release_series[-window:]
+    half = max(1, window // 2)
+    first_avg = sum(tail[:half]) / len(tail[:half])
+    second_avg = sum(tail[half:]) / len(tail[half:]) if tail[half:] else first_avg
+    drop_inches = max(0.0, (first_avg - second_avg) * 12.0)
+    hard_hit_streak = _recent_hard_hit_lineout_streak(all_plays, pitcher_id)
+
+    # Only reprice when we have a tangible live deterioration signal.
+    if drop_inches < _safe_float(os.getenv('LIVE_REPRICE_MIN_DROP_INCHES', '1.5'), 1.5):
+        return None
+
+    half_inning = (last_play.get('about', {}) or {}).get('halfInning', '')
+    current_batter_id = ((matchup.get('batter') or {}).get('id'))
+    lookahead_slots = max(4, _safe_int(os.getenv('LIVE_REPRICE_LOOKAHEAD_SLOTS', '6'), 6) or 6)
+    target_n = max(3, _safe_int(os.getenv('LIVE_REPRICE_TARGETS', '4'), 4) or 4)
+    candidates = _get_next_hitters_live(play_by_play, half_inning, current_batter_id, lookahead_slots=lookahead_slots)
+    ranked = _rank_next_power_hitters(candidates, power_profile, top_n=target_n)
+    if not ranked:
+        return None
+
+    # Convert decline into a conservative uplift factor for live probabilities.
+    decline_factor = 1.0
+    decline_factor += min(0.18, drop_inches / 20.0)
+    decline_factor += min(0.10, hard_hit_streak * 0.03)
+    decline_factor = min(1.30, max(1.0, decline_factor))
+
+    game_id = game.get('game_pk') or game.get('game_id')
+    game_display = f"{game.get('away_name','Away')} @ {game.get('home_name','Home')}"
+    reprice_rows = []
+    for row in ranked:
+        base_prob = float(row.get('pred_hr_prob', 0.0))
+        live_prob = min(0.95, base_prob * decline_factor)
+        best_odds = None
+        best_book = None
+        odds_momentum = 0.0
+        if best_odds_now:
+            norm = _normalize_player_name(row.get('batter_name', ''))
+            odds_obj = best_odds_now.get(norm)
+            if odds_obj:
+                best_odds = odds_obj.get('best_american')
+                best_book = odds_obj.get('best_book')
+            if best_odds_prev:
+                prev_obj = best_odds_prev.get(norm)
+                if prev_obj and prev_obj.get('best_american') is not None and best_odds is not None:
+                    prev_odds = _safe_float(prev_obj.get('best_american'))
+                    now_odds = _safe_float(best_odds)
+                    if prev_odds is not None and now_odds is not None:
+                        odds_momentum = max(0.0, (now_odds - prev_odds) / 1000.0)
+
+        live_prob = min(0.97, live_prob + min(0.08, odds_momentum))
+
+        reprice_rows.append({
+            'batter_name': row.get('batter_name', ''),
+            'base_prob': base_prob,
+            'live_prob': live_prob,
+            'delta_prob': live_prob - base_prob,
+            'odds_momentum': odds_momentum,
+            'best_book': best_book or '',
+            'best_market_odds_american': best_odds,
+            'hard_hit_rate': row.get('hard_hit_rate', 0.0),
+            'avg_ev': row.get('avg_ev', 0.0),
+        })
+
+    reprice_rows.sort(key=lambda x: (x['live_prob'], x['odds_momentum'], x['delta_prob']), reverse=True)
+    return {
+        'type': 'live_reprice',
+        'game_id': game_id,
+        'game_display': game_display,
+        'pitcher_id': pitcher_id,
+        'pitcher_name': pitcher_name,
+        'drop_inches': drop_inches,
+        'hard_hit_streak': hard_hit_streak,
+        'decline_factor': decline_factor,
+        'targets': reprice_rows[:target_n],
+    }
+
+
+def save_live_reprice_snapshot(reprice_alert, date_str=None):
+    """Persist live repriced HR candidates for later review."""
+    if not reprice_alert:
+        return None
+
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    out_path = Path('data') / f'live_reprice_predictions_{date_str}.csv'
+    Path('data').mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for target in reprice_alert.get('targets') or []:
+        rows.append({
+            'timestamp': datetime.now().isoformat(),
+            'game_id': reprice_alert.get('game_id', ''),
+            'game_display': reprice_alert.get('game_display', ''),
+            'pitcher_name': reprice_alert.get('pitcher_name', ''),
+            'pitcher_id': reprice_alert.get('pitcher_id', ''),
+            'drop_inches': reprice_alert.get('drop_inches', ''),
+            'hard_hit_streak': reprice_alert.get('hard_hit_streak', 0),
+            'decline_factor': reprice_alert.get('decline_factor', 1.0),
+            'batter_name': target.get('batter_name', ''),
+            'base_prob': target.get('base_prob', 0.0),
+            'live_prob': target.get('live_prob', 0.0),
+            'delta_prob': target.get('delta_prob', 0.0),
+            'odds_momentum': target.get('odds_momentum', 0.0),
+            'best_book': target.get('best_book', ''),
+            'best_market_odds_american': target.get('best_market_odds_american', ''),
+            'hard_hit_rate': target.get('hard_hit_rate', 0.0),
+            'avg_ev': target.get('avg_ev', 0.0),
+        })
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    if out_path.exists():
+        df.to_csv(out_path, mode='a', header=False, index=False)
+    else:
+        df.to_csv(out_path, index=False)
+    return out_path
+
+
 def _format_micro_signal_message(alert):
     ts = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')
     atype = alert.get('type')
@@ -3396,6 +3705,29 @@ def _format_micro_signal_message(alert):
             lines.append("🔥 Next power hitters:")
             for t in targets:
                 lines.append(f"• {t.get('batter_name','Unknown')} ({float(t.get('pred_hr_prob', 0.0))*100:.1f}% HR)")
+        return "\n".join(lines)
+
+    if atype == 'live_reprice':
+        lines = [
+            "⚡ **LIVE HR REPRICE**",
+            f"⏰ Time: {ts}",
+            f"🏟️ {game_display}",
+            f"🎯 Pitcher: {alert.get('pitcher_name', 'Unknown')}",
+            f"📉 Release drop: {float(alert.get('drop_inches', 0.0)):.2f} in",
+            f"🧪 Decline factor: x{float(alert.get('decline_factor', 1.0)):.2f}",
+        ]
+        targets = alert.get('targets') or []
+        if targets:
+            lines.append("🔥 Repriced HR candidates:")
+            for t in targets:
+                live_prob = float(t.get('live_prob', 0.0)) * 100
+                delta = float(t.get('delta_prob', 0.0)) * 100
+                odds_text = ''
+                if pd.notna(t.get('best_market_odds_american')) and t.get('best_market_odds_american') is not None:
+                    odds_text = f" | {int(t.get('best_market_odds_american')):+d}"
+                lines.append(
+                    f"• {t.get('batter_name','Unknown')} -> {live_prob:.1f}% ({delta:+.1f} pts){odds_text}"
+                )
         return "\n".join(lines)
 
     return ""
@@ -3489,6 +3821,19 @@ def monitor_live_home_runs():
                         sent_this_loop += 1
                         print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
 
+                # Live reprice: send refreshed HR predictions when pitcher quality deteriorates.
+                reprice_alert = _build_live_reprice_predictions(game, play_by_play, power_profile, best_odds_now, best_odds_prev)
+                if reprice_alert:
+                    reprice_key = f"reprice:{reprice_alert.get('game_id')}:{reprice_alert.get('pitcher_id')}"
+                    if reprice_key not in micro_alert_keys:
+                        micro_alert_keys.add(reprice_key)
+                        save_live_reprice_snapshot(reprice_alert)
+                        msg = _format_micro_signal_message(reprice_alert)
+                        if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
+                            micro_signals_this_loop += 1
+                            sent_this_loop += 1
+                            print(f"Live reprice sent: {reprice_alert.get('pitcher_name')} ({reprice_alert.get('game_display','')})")
+
                 for play in all_plays:
                     result = play.get('result', {})
                     about = play.get('about', {})
@@ -3521,10 +3866,10 @@ def monitor_live_home_runs():
                     alert_ts = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')
 
                     # Log live outcome against today's predictions for learning feedback
-                    _model_prob, _was_predicted, _was_top5 = None, False, False
+                    _model_prob, _was_predicted, _was_top5, _model_rank = None, False, False, None
                     if batter_name:
                         try:
-                            _model_prob, _was_predicted, _was_top5 = log_live_hr_feedback(
+                            _model_prob, _was_predicted, _was_top5, _model_rank = log_live_hr_feedback(
                                 batter_name, pitcher_name, game_id, inning_half, num_inning
                             )
                         except Exception:
@@ -3544,8 +3889,12 @@ def monitor_live_home_runs():
                         prob_str = f"{_model_prob * 100:.1f}%"
                         if _was_top5:
                             message_lines.append(f"\u2705 **Model called it!** (Prob: {prob_str}) — Top 5 pick")
+                        elif _model_rank is not None:
+                            message_lines.append(
+                                f"\U0001f4ca Model rank: #{_model_rank} (Prob: {prob_str}) — not a Top 5 list pick"
+                            )
                         elif _was_predicted:
-                            message_lines.append(f"\u2705 Model predicted this (Prob: {prob_str})")
+                            message_lines.append(f"\u2705 Model signaled HR risk (Prob: {prob_str})")
                         else:
                             message_lines.append(f"\u26a0\ufe0f Model missed (had: {prob_str}) — logged for retraining")
                     else:
