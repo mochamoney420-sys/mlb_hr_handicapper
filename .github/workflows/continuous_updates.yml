@@ -13,9 +13,14 @@ on:
     - cron: '0 14,16,18,20,22,0,2 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   update-predictions:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v5
@@ -41,6 +46,7 @@ jobs:
         with:
           name: updated-predictions-${{ github.run_number }}
           path: data/predictions_*.csv
+          if-no-files-found: error
           retention-days: 7
       
       - name: Upload update logs
@@ -49,4 +55,5 @@ jobs:
         with:
           name: update-logs-${{ github.run_number }}
           path: data/prediction_updates_*.json
+          if-no-files-found: error
           retention-days: 7

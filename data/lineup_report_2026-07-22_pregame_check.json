@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-22T18:37:10.422947",
+  "timestamp": "2026-07-22T18:45:28.376819",
   "games": {
     "823518": {
       "away_team": "Pittsburgh Pirates",
@@ -1187,7 +1187,7 @@
           "id": "ID672515",
           "name": "Gabriel Moreno",
           "number": "14",
-          "position": "DH",
+          "position": "3B",
           "is_batter": true,
           "batting_order_slot": 6
         },
@@ -1211,7 +1211,7 @@
           "id": "ID545121",
           "name": "Ildemaro Vargas",
           "number": "6",
-          "position": "2B",
+          "position": "P",
           "is_batter": true,
           "batting_order_slot": 9
         }

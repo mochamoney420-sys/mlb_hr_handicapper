@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-22T18:32:54.162030",
+  "timestamp": "2026-07-22T18:41:39.990583",
   "games": {
     "823518": {
       "away_team": "Pittsburgh Pirates",
@@ -1113,7 +1113,7 @@
           "id": "ID691777",
           "name": "Max Muncy",
           "number": "3",
-          "position": "DH",
+          "position": "LF",
           "is_batter": true,
           "batting_order_slot": 6
         },
@@ -1121,7 +1121,7 @@
           "id": "ID666126",
           "name": "Carlos Cortes",
           "number": "26",
-          "position": "LF",
+          "position": "P",
           "is_batter": true,
           "batting_order_slot": 7
         },
@@ -1187,7 +1187,7 @@
           "id": "ID672515",
           "name": "Gabriel Moreno",
           "number": "14",
-          "position": "DH",
+          "position": "3B",
           "is_batter": true,
           "batting_order_slot": 6
         },
@@ -1211,7 +1211,7 @@
           "id": "ID545121",
           "name": "Ildemaro Vargas",
           "number": "6",
-          "position": "2B",
+          "position": "P",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -1488,12 +1488,20 @@
           "batting_order_slot": 5
         },
         {
+          "id": "ID642350",
+          "name": "Jose Siri",
+          "number": "28",
+          "position": "PR",
+          "is_batter": true,
+          "batting_order_slot": 6
+        },
+        {
           "id": "ID685133",
           "name": "Wade Meckler",
           "number": "53",
           "position": "LF",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 7
         },
         {
           "id": "ID672724",
@@ -1501,21 +1509,13 @@
           "number": "2",
           "position": "2B",
           "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 8
         },
         {
           "id": "ID666139",
           "name": "Josh Lowe",
           "number": "3",
           "position": "RF",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID623168",
-          "name": "Tyler Heineman",
-          "number": "31",
-          "position": "C",
           "is_batter": true,
           "batting_order_slot": 9
         }
