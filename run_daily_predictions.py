@@ -669,6 +669,19 @@ def send_morning_learning_summary(
         return False
 
     insights = (learning_result or {}).get('insights', {}) if isinstance(learning_result, dict) else {}
+    if not isinstance(insights, dict):
+        insights = {}
+
+    # Fallback: if in-memory insights are missing, try today's saved learning report.
+    if not insights:
+        report_path = Path('data') / f"hr_learning_report_{today_str}.json"
+        if report_path.exists():
+            try:
+                loaded = _json.loads(report_path.read_text(encoding='utf-8'))
+                if isinstance(loaded, dict):
+                    insights = loaded
+            except Exception:
+                pass
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
     eval_file = Path('data') / f'evaluation_{yesterday_str}.csv'
     eval_brier = None
@@ -686,14 +699,33 @@ def send_morning_learning_summary(
     if insights:
         findings = [str(x) for x in insights.get('key_findings', [])[:3]]
 
-    total_hrs = int(insights.get('total_hrs_analyzed', 0)) if insights else 0
-    accurate = int(insights.get('accurate_predictions', 0)) if insights else 0
-    missed = int(insights.get('missed_predictions', 0)) if insights else 0
+    total_hrs = insights.get('total_hrs_analyzed') if insights else None
+    accurate = insights.get('accurate_predictions') if insights else None
+    missed = insights.get('missed_predictions') if insights else None
 
-    lines = [
-        f"**🧠 Morning Learning Summary — {today_str}**",
-        f"Yesterday reviewed: {total_hrs} HRs | Predicted: {accurate} | Missed: {missed}",
-    ]
+    try:
+        total_hrs = int(total_hrs) if total_hrs is not None else None
+    except Exception:
+        total_hrs = None
+    try:
+        accurate = int(accurate) if accurate is not None else None
+    except Exception:
+        accurate = None
+    try:
+        missed = int(missed) if missed is not None else None
+    except Exception:
+        missed = None
+
+    has_hr_summary = (
+        total_hrs is not None and total_hrs > 0 and
+        accurate is not None and missed is not None
+    )
+
+    lines = [f"**🧠 Morning Learning Summary — {today_str}**"]
+    if has_hr_summary:
+        lines.append(f"Yesterday reviewed: {total_hrs} HRs | Predicted: {accurate} | Missed: {missed}")
+    else:
+        lines.append("Yesterday reviewed: unavailable (no verified HR feedback loaded)")
     if eval_rows:
         brier_str = f"{eval_brier:.4f}" if eval_brier is not None else 'n/a'
         lines.append(f"Evaluation: {eval_rows} predictions scored | Brier: {brier_str}")
@@ -705,7 +737,7 @@ def send_morning_learning_summary(
         for item in findings:
             lines.append(f"- {item}")
     else:
-        lines.append("Learned: no HR feedback file was available for yesterday")
+        lines.append("Learned: no verified HR feedback insights were available")
 
     lines.append("Model changes applied today:")
     lines.append(f"- Upweighted training rows from missed HR feedback: {int(missed_count)}")

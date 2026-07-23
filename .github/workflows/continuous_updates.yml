@@ -1,16 +1,13 @@
-name: Continuous Prediction Updates (Every 2 Hours)
+name: Continuous Prediction Updates (Every 4 Hours)
 
 on:
   schedule:
-    # Run every 2 hours during game day (10 AM - 10 PM ET)
+    # Run every 4 hours during game day (10 AM - 10 PM ET)
     # 10 AM ET = 2 PM UTC = cron '0 14'
-    # 12 PM ET = 4 PM UTC = cron '0 16'
     # 2 PM ET = 6 PM UTC = cron '0 18'
-    # 4 PM ET = 8 PM UTC = cron '0 20'
     # 6 PM ET = 10 PM UTC = cron '0 22'
-    # 8 PM ET = 12 AM UTC = cron '0 0'
     # 10 PM ET = 2 AM UTC = cron '0 2'
-    - cron: '0 14,16,18,20,22,0,2 * * *'
+    - cron: '0 14,18,22,2 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -46,7 +43,7 @@ jobs:
         with:
           name: updated-predictions-${{ github.run_number }}
           path: data/predictions_*.csv
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
       
       - name: Upload update logs
@@ -55,5 +52,5 @@ jobs:
         with:
           name: update-logs-${{ github.run_number }}
           path: data/prediction_updates_*.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
