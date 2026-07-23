@@ -268,6 +268,12 @@ def print_bet_ready_wagers(date_str=None, top_n=15):
         except Exception:
             return int(default)
 
+    def _env_float(name, default):
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return float(default)
+
     # Conservative default range for HR props; override via env if needed.
     min_american = _env_int('BET_READY_MIN_AMERICAN_ODDS', -300)
     max_american = _env_int('BET_READY_MAX_AMERICAN_ODDS', 5000)
@@ -1126,6 +1132,31 @@ HR_PROP_MARKET_KEY_CANDIDATES = [
 ]
 
 
+def _get_hr_prop_market_key_candidates():
+    """Return market key candidates, allowing env override for fast recovery.
+
+    Use ODDS_API_HR_MARKETS="k1,k2,..." to override defaults without code edits.
+    """
+    raw = str(os.getenv('ODDS_API_HR_MARKETS', '') or '').strip()
+    if not raw:
+        return list(HR_PROP_MARKET_KEY_CANDIDATES)
+
+    out = []
+    for tok in raw.split(','):
+        key = tok.strip()
+        if key and key not in out:
+            out.append(key)
+    return out or list(HR_PROP_MARKET_KEY_CANDIDATES)
+
+
+def _odds_api_invalid_market(status_code, body_text):
+    """Return True when Odds API indicates an unsupported market key."""
+    if int(status_code) != 422:
+        return False
+    body = str(body_text or '').lower()
+    return ('invalid_market' in body) or ('invalid markets' in body) or ('markets not supported' in body)
+
+
 def _parse_odds_event_commence_time(event_obj):
     """Parse Odds API commence_time into a datetime, or None if unavailable."""
     try:
@@ -1218,7 +1249,8 @@ def _extract_hr_prop_player_book_odds(games_payload, market_keys=None):
 
 def _fetch_hr_props_raw_from_odds_api(api_key):
     """Fetch HR props from The Odds API with fallback to event-level endpoint."""
-    market_keys = HR_PROP_MARKET_KEY_CANDIDATES
+    market_keys = _get_hr_prop_market_key_candidates()
+    unsupported_markets = []
     for market_key in market_keys:
         # Try top-level odds endpoint first.
         top_url = (
@@ -1238,6 +1270,10 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
                 print(f"Odds API top-level endpoint returned no {market_key} outcomes; trying event-level endpoint.")
             else:
                 body = (getattr(resp, 'text', '') or '')[:220]
+                if _odds_api_invalid_market(resp.status_code, body):
+                    unsupported_markets.append(market_key)
+                    print(f"Odds API market unsupported for this key/plan ({market_key}); trying next candidate.")
+                    continue
                 print(f"Odds API returned {resp.status_code} on top-level props endpoint ({market_key}): {body}")
         except Exception as e:
             print(f"Odds API top-level fetch failed ({market_key}): {e}")
@@ -1257,10 +1293,13 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
                 continue
 
             merged = {}
+            event_422_count = 0
+            event_req_count = 0
             for ev in events:
                 ev_id = ev.get('id')
                 if not ev_id:
                     continue
+                event_req_count += 1
                 ev_url = (
                     f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{ev_id}/odds"
                     f"?apiKey={api_key}&regions=us,us2&markets={market_key}"
@@ -1268,6 +1307,9 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
                 )
                 ev_resp = requests.get(ev_url, timeout=10)
                 if ev_resp.status_code != 200:
+                    body = (getattr(ev_resp, 'text', '') or '')[:220]
+                    if _odds_api_invalid_market(ev_resp.status_code, body):
+                        event_422_count += 1
                     continue
 
                 ev_payload = ev_resp.json() or {}
@@ -1281,9 +1323,23 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
                 n_pairs = sum(len(v) for v in merged.values())
                 print(f"Odds API event-level fallback ({market_key}): {n_pairs} book-player pairs across {len(merged)} players")
                 return merged
+
+            if event_req_count > 0 and event_422_count == event_req_count:
+                if market_key not in unsupported_markets:
+                    unsupported_markets.append(market_key)
+                print(f"Odds API market unsupported at event-level ({market_key}); trying next candidate.")
+                continue
+
             print(f"Odds API event-level fallback returned no {market_key} outcomes.")
         except Exception as e:
             print(f"Odds API event-level fallback failed ({market_key}): {e}")
+
+    if unsupported_markets:
+        print(
+            "Odds API HR markets unsupported for current account/settings: "
+            f"{', '.join(unsupported_markets)}. "
+            "Set ODDS_API_HR_MARKETS to valid keys if your plan uses different names."
+        )
 
     return {}
 
@@ -2771,12 +2827,97 @@ def generate_daily_predictions():
                                     'lineup_protection_woba_proxy', 'context_multiplier',
                                     'model_name', 'prediction_timestamp']])
 
+    def _env_int(name, default):
+        try:
+            return int(float(os.getenv(name, str(default))))
+        except Exception:
+            return int(default)
+
+    def _env_float(name, default):
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return float(default)
+
     # Sort and present elite values
     rankings = live[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time']].rename(
         columns={'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'})
-    
-    # Get top 5 by HR probability
-    top_5 = rankings.sort_values(by='hr_probability', ascending=False).head(5).reset_index(drop=True)
+
+    discord_top_prob_n = max(10, _env_int('DISCORD_TOP_PROB_COUNT', 30))
+    discord_top_ev_n = max(3, _env_int('DISCORD_TOP_EV_COUNT', 12))
+    discord_rows_per_message = max(5, _env_int('DISCORD_ROWS_PER_MESSAGE', 10))
+    discord_min_prob = _env_float('DISCORD_MIN_PROB', 0.06)
+    discord_radar_n = max(8, _env_int('DISCORD_RADAR_COUNT', 20))
+    discord_window_1_hours = max(1, _env_int('DISCORD_WINDOW_1_HOURS', 2))
+    discord_window_2_hours = max(discord_window_1_hours + 1, _env_int('DISCORD_WINDOW_2_HOURS', 6))
+
+    # Top probabilities for reporting/Discord delivery.
+    prob_pool = rankings.sort_values(by='hr_probability', ascending=False).reset_index(drop=True)
+    top_prob = prob_pool[prob_pool['hr_probability'] >= discord_min_prob].head(discord_top_prob_n).copy()
+    if top_prob.empty:
+        top_prob = prob_pool.head(discord_top_prob_n).copy()
+
+    radar = pd.DataFrame()
+    if 'physics_delta' in live.columns:
+        radar = live[[
+            'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
+            'kelly_fraction', 'ev_percent', 'game_time', 'physics_delta'
+        ]].rename(columns={'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'}).copy()
+        radar['hr_probability'] = pd.to_numeric(radar['hr_probability'], errors='coerce').fillna(0.0)
+        radar['physics_delta'] = pd.to_numeric(radar['physics_delta'], errors='coerce').fillna(0.0)
+        radar = radar[radar['hr_probability'] >= max(0.03, discord_min_prob * 0.7)]
+
+        top_keys = set(zip(top_prob['batter_name'].astype(str), top_prob['pitcher_name'].astype(str)))
+        radar = radar[
+            ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
+        ]
+        radar = radar.sort_values(
+            by=['physics_delta', 'hr_probability'],
+            key=lambda s: s.abs() if s.name == 'physics_delta' else s,
+            ascending=[False, False]
+        ).head(discord_radar_n).reset_index(drop=True)
+
+    def _annotate_time_windows(df):
+        if df is None or df.empty:
+            return df
+
+        now = datetime.now()
+        out = df.copy()
+
+        def _minutes_until(value):
+            try:
+                raw = str(value or '').strip()
+                if not raw:
+                    return 99999
+                t = datetime.strptime(raw, '%I:%M %p').time()
+                target = datetime.combine(now.date(), t)
+                mins = int((target - now).total_seconds() // 60)
+                # Treat times that already passed as next-day starts if far enough behind.
+                if mins < -90:
+                    mins += 24 * 60
+                return mins
+            except Exception:
+                return 99999
+
+        def _window_label(mins):
+            if mins == 99999:
+                return 'Unknown'
+            if mins <= (discord_window_1_hours * 60):
+                return f'<= {discord_window_1_hours}h'
+            if mins <= (discord_window_2_hours * 60):
+                return f'<= {discord_window_2_hours}h'
+            return 'Later'
+
+        out['__minutes_until_start'] = out['game_time'].apply(_minutes_until)
+        out['start_window'] = out['__minutes_until_start'].apply(_window_label)
+        out = out.sort_values(
+            by=['__minutes_until_start', 'hr_probability', 'ev_pct', 'kelly_fraction'],
+            ascending=[True, False, False, False]
+        ).reset_index(drop=True)
+        return out
+
+    top_prob = _annotate_time_windows(top_prob)
+    radar = _annotate_time_windows(radar)
 
     # Show largest movers caused by physics/context simulation.
     if 'physics_delta' in live.columns:
@@ -2832,17 +2973,20 @@ def generate_daily_predictions():
             pass
     
     # Also identify +EV only picks (if odds available)
+    top_ev = pd.DataFrame()
     if 'is_positive_ev' in live.columns:
         positive_ev = live[live['is_positive_ev'] == True].copy()
         if not positive_ev.empty:
             top_ev = positive_ev[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time']].rename(
                 columns={'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'})
-            top_ev = top_ev.sort_values(by='ev_pct', ascending=False).head(5).reset_index(drop=True)
+            top_ev = top_ev.sort_values(by='ev_pct', ascending=False).head(discord_top_ev_n).reset_index(drop=True)
             print(f"\n✅ +EV PREMIUM PICKS (Expected Value > 0%):")
             print(top_ev.to_string(index=False))
+    top_ev = _annotate_time_windows(top_ev)
 
-    print("\nTop 5 Daily Projected HR Probabilities:")
-    print(top_5.to_string(index=False))
+    print(f"\nTop {min(5, len(top_prob))} Daily Projected HR Probabilities:")
+    print(top_prob.head(5).to_string(index=False))
+    print(f"\nRadar Coverage: {len(radar)} additional candidates")
 
     # =====================================================================
     # DISCORD WEBHOOK INTEGRATION
@@ -2852,31 +2996,66 @@ def generate_daily_predictions():
         print("Discord webhook not configured — skipping notification. Set DISCORD_MLB_WEBHOOK to enable.")
         return live
 
-    if 'top_5' in locals() or 'top_5' in globals():
+    def _post_pick_table_batches(df, title):
+        if df is None or df.empty:
+            return True
+
         table_rows = []
-        for _, row in top_5.iterrows():
+        for _, row in df.iterrows():
             pct = f"{row['hr_probability'] * 100:.1f}%"
-            edge = f"{row['edge_pct']:+.0f}%" if pd.notna(row.get('edge_pct')) else 'N/A'
+            edge = f"{row.get('edge_pct', 0):+.0f}%" if pd.notna(row.get('edge_pct')) else 'N/A'
             ev_str = f"{row.get('ev_pct', 0):+.1f}%" if pd.notna(row.get('ev_pct', None)) else 'N/A'
+            kelly = f"{float(row.get('kelly_fraction', 0) or 0):.3f}" if pd.notna(row.get('kelly_fraction')) else 'N/A'
             gtime = str(row.get('game_time', '')).strip()[:8]
-            table_rows.append(f"| {row['batter_name'][:12]:<12} | {row['pitcher_name'][:12]:<12} | {gtime:<8} | {pct:<6} | {edge:<7} | {ev_str:<7} |")
+            win = str(row.get('start_window', 'Later'))[:10]
+            table_rows.append(
+                f"| {str(row['batter_name'])[:14]:<14} | {str(row['pitcher_name'])[:14]:<14} | {gtime:<8} | {win:<10} | {pct:<6} | {edge:<7} | {ev_str:<7} | {kelly:<6} |"
+            )
 
-        table_str = "\n".join(table_rows)
+        chunks = [
+            table_rows[i:i + discord_rows_per_message]
+            for i in range(0, len(table_rows), discord_rows_per_message)
+        ]
 
-        message_content = (
-            f"**\u26be Today's Top 5 MLB HR Predictions ({target_date})**\n"
-            "```\n"
-            f"| {'Batter':<12} | {'Pitcher':<12} | {'Time ET':<8} | {'Prob':<6} | {'Edge':<7} | {'EV%':<7} |\n"
-            f"|{'-'*14}|{'-'*14}|{'-'*10}|{'-'*8}|{'-'*9}|{'-'*9}|\n"
-            f"{table_str}\n"
-            "```"
-        )
+        for idx, chunk_rows in enumerate(chunks, start=1):
+            part_suffix = f" (Part {idx}/{len(chunks)})" if len(chunks) > 1 else ""
+            table_str = "\n".join(chunk_rows)
+            message_content = (
+                f"**{title} ({target_date}){part_suffix}**\n"
+                "```\n"
+                f"| {'Batter':<14} | {'Pitcher':<14} | {'Time ET':<8} | {'Window':<10} | {'Prob':<6} | {'Edge':<7} | {'EV%':<7} | {'Kelly':<6} |\n"
+                f"|{'-'*16}|{'-'*16}|{'-'*10}|{'-'*12}|{'-'*8}|{'-'*9}|{'-'*9}|{'-'*8}|\n"
+                f"{table_str}\n"
+                "```"
+            )
+            if not send_discord_webhook(content=message_content):
+                return False
 
-        sent = send_discord_webhook(content=message_content)
-        if not sent:
-            print("Failed to transmit data to Discord webhook after trying configured candidates.")
-    else:
+        return True
+
+    summary_lines = [
+        f"\u26be MLB HR MODEL SNAPSHOT ({target_date})",
+        f"Candidates ranked: {len(rankings)}",
+        f"Delivered top probability picks: {len(top_prob)}",
+        f"Delivered radar picks: {len(radar)}",
+        f"Delivered +EV picks: {len(top_ev)}",
+        f"Time windows: <= {discord_window_1_hours}h, <= {discord_window_2_hours}h, later",
+    ]
+    if not send_discord_webhook(content="\n".join(summary_lines)):
+        print("Failed to transmit Discord summary after trying configured candidates.")
+
+    if top_prob.empty:
         print("No predictions available to send to Discord.")
+        return live
+
+    sent_prob = _post_pick_table_batches(top_prob, f"\u26be Top Probability HR Picks (Top {len(top_prob)})")
+    sent_ev = True
+    sent_radar = _post_pick_table_batches(radar, f"\U0001f535 HR Radar Picks (Physics Movers & Sleepers) ({len(radar)})")
+    if not top_ev.empty:
+        sent_ev = _post_pick_table_batches(top_ev, f"\u2705 +EV HR Picks (Top {len(top_ev)})")
+
+    if not sent_prob or not sent_ev or not sent_radar:
+        print("Failed to transmit one or more Discord pick tables after trying configured candidates.")
 
     return live
 
