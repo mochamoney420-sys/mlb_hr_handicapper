@@ -1,12 +1,12 @@
 {
   "mode": "live_hr_monitor",
-  "in_progress_games": 3,
+  "in_progress_games": 1,
   "detected_events_this_loop": 0,
   "sent_events_this_loop": 0,
   "micro_signals_this_loop": 0,
-  "processed_event_count": 32,
+  "processed_event_count": 33,
   "odds_players_tracked": 0,
   "live_monitor_poll_seconds": 5,
   "live_odds_poll_seconds": 5,
-  "updated_at": "2026-07-22T22:34:54.656822"
+  "updated_at": "2026-07-23T12:58:14.064714"
 }

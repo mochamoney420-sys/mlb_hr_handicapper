@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-22T18:45:28.376819",
+  "timestamp": "2026-07-22T22:42:01.249777",
   "games": {
     "823518": {
       "away_team": "Pittsburgh Pirates",
@@ -169,9 +169,17 @@
           "id": "ID669707",
           "name": "Jared Triolo",
           "number": "19",
-          "position": "SS",
+          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 2
+        },
+        {
+          "id": "ID682997",
+          "name": "Tyler Callihan",
+          "number": "37",
+          "position": "PH",
+          "is_batter": true,
+          "batting_order_slot": 3
         },
         {
           "id": "ID668804",
@@ -179,7 +187,7 @@
           "number": "10",
           "position": "LF",
           "is_batter": true,
-          "batting_order_slot": 3
+          "batting_order_slot": 4
         },
         {
           "id": "ID699013",
@@ -187,7 +195,7 @@
           "number": "55",
           "position": "RF",
           "is_batter": true,
-          "batting_order_slot": 4
+          "batting_order_slot": 5
         },
         {
           "id": "ID656811",
@@ -195,7 +203,7 @@
           "number": "29",
           "position": "1B",
           "is_batter": true,
-          "batting_order_slot": 5
+          "batting_order_slot": 6
         },
         {
           "id": "ID542303",
@@ -203,7 +211,7 @@
           "number": "24",
           "position": "DH",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 7
         },
         {
           "id": "ID664040",
@@ -211,21 +219,13 @@
           "number": "5",
           "position": "2B",
           "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 8
         },
         {
           "id": "ID804668",
           "name": "Rafael Flores Jr.",
           "number": "43",
           "position": "C",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID695257",
-          "name": "Billy Cook",
-          "number": "25",
-          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -494,20 +494,28 @@
           "batting_order_slot": 4
         },
         {
+          "id": "ID681297",
+          "name": "Colton Cowser",
+          "number": "17",
+          "position": "CF",
+          "is_batter": true,
+          "batting_order_slot": 5
+        },
+        {
           "id": "ID687952",
           "name": "Christian Encarnacion-Strand",
           "number": "32",
           "position": "3B",
           "is_batter": true,
-          "batting_order_slot": 5
+          "batting_order_slot": 6
         },
         {
           "id": "ID687637",
           "name": "Dylan Beavers",
           "number": "12",
-          "position": "CF",
+          "position": "RF",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 7
         },
         {
           "id": "ID671286",
@@ -515,21 +523,13 @@
           "number": "62",
           "position": "DH",
           "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 8
         },
         {
           "id": "ID702616",
           "name": "Jackson Holliday",
           "number": "7",
           "position": "2B",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID644433",
-          "name": "Chadwick Tromp",
-          "number": "41",
-          "position": "C",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -1534,12 +1534,20 @@
           "batting_order_slot": 1
         },
         {
+          "id": "ID668885",
+          "name": "Austin Martin",
+          "number": "16",
+          "position": "LF",
+          "is_batter": true,
+          "batting_order_slot": 2
+        },
+        {
           "id": "ID686797",
           "name": "Brooks Lee",
           "number": "22",
-          "position": "SS",
+          "position": "3B",
           "is_batter": true,
-          "batting_order_slot": 2
+          "batting_order_slot": 3
         },
         {
           "id": "ID665019",
@@ -1547,7 +1555,7 @@
           "number": "2",
           "position": "2B",
           "is_batter": true,
-          "batting_order_slot": 3
+          "batting_order_slot": 4
         },
         {
           "id": "ID605137",
@@ -1555,15 +1563,15 @@
           "number": "56",
           "position": "DH",
           "is_batter": true,
-          "batting_order_slot": 4
+          "batting_order_slot": 5
         },
         {
           "id": "ID668904",
           "name": "Royce Lewis",
           "number": "23",
-          "position": "3B",
+          "position": "1B",
           "is_batter": true,
-          "batting_order_slot": 5
+          "batting_order_slot": 6
         },
         {
           "id": "ID605170",
@@ -1571,29 +1579,21 @@
           "number": "37",
           "position": "1B",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 7
+        },
+        {
+          "id": "ID668952",
+          "name": "Ryan Kreidler",
+          "number": "5",
+          "position": "SS",
+          "is_batter": true,
+          "batting_order_slot": 8
         },
         {
           "id": "ID702176",
           "name": "Alan Roden",
           "number": "18",
           "position": "RF",
-          "is_batter": true,
-          "batting_order_slot": 7
-        },
-        {
-          "id": "ID807712",
-          "name": "Luke Keaschall",
-          "number": "15",
-          "position": "CF",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID656577",
-          "name": "Alex Jackson",
-          "number": "70",
-          "position": "C",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -1800,26 +1800,26 @@
           "batting_order_slot": 6
         },
         {
+          "id": "ID687282",
+          "name": "Gabriel Rincones Jr.",
+          "number": "17",
+          "position": "PH",
+          "is_batter": true,
+          "batting_order_slot": 7
+        },
+        {
           "id": "ID650559",
           "name": "Bryan De La Cruz",
           "number": "41",
           "position": "RF",
           "is_batter": true,
-          "batting_order_slot": 7
-        },
-        {
-          "id": "ID681082",
-          "name": "Bryson Stott",
-          "number": "5",
-          "position": "2B",
-          "is_batter": true,
           "batting_order_slot": 8
         },
         {
-          "id": "ID665561",
-          "name": "Rafael March\u00e1n",
-          "number": "13",
-          "position": "C",
+          "id": "ID669016",
+          "name": "Brandon Marsh",
+          "number": "16",
+          "position": "PH",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -1894,10 +1894,10 @@
           "batting_order_slot": 8
         },
         {
-          "id": "ID676439",
-          "name": "Hunter Feduccia",
-          "number": "9",
-          "position": "C",
+          "id": "ID810938",
+          "name": "Ben Williamson",
+          "number": "15",
+          "position": "2B",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -1944,34 +1944,34 @@
           "batting_order_slot": 5
         },
         {
+          "id": "ID664702",
+          "name": "Myles Straw",
+          "number": "3",
+          "position": "LF",
+          "is_batter": true,
+          "batting_order_slot": 6
+        },
+        {
+          "id": "ID649966",
+          "name": "Luis Ur\u00edas",
+          "number": "48",
+          "position": "PH",
+          "is_batter": true,
+          "batting_order_slot": 7
+        },
+        {
           "id": "ID672386",
           "name": "Alejandro Kirk",
           "number": "30",
           "position": "C",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 8
         },
         {
           "id": "ID662139",
           "name": "Daulton Varsho",
           "number": "5",
           "position": "CF",
-          "is_batter": true,
-          "batting_order_slot": 7
-        },
-        {
-          "id": "ID815873",
-          "name": "Sean Keys",
-          "number": "20",
-          "position": "3B",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID665926",
-          "name": "Andr\u00e9s Gim\u00e9nez",
-          "number": "0",
-          "position": "SS",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -2030,26 +2030,26 @@
           "batting_order_slot": 6
         },
         {
+          "id": "ID823550",
+          "name": "Sung-Mun Song",
+          "number": "24",
+          "position": "PH",
+          "is_batter": true,
+          "batting_order_slot": 7
+        },
+        {
           "id": "ID593428",
           "name": "Xander Bogaerts",
           "number": "2",
           "position": "SS",
           "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 8
         },
         {
           "id": "ID630105",
           "name": "Jake Cronenworth",
           "number": "9",
           "position": "2B",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID687749",
-          "name": "Jase Bowen",
-          "number": "4",
-          "position": "LF",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -2104,26 +2104,26 @@
           "batting_order_slot": 6
         },
         {
-          "id": "ID643289",
-          "name": "Mauricio Dub\u00f3n",
-          "number": "14",
-          "position": "LF",
+          "id": "ID642201",
+          "name": "Eli White",
+          "number": "36",
+          "position": "PH",
           "is_batter": true,
           "batting_order_slot": 7
         },
         {
-          "id": "ID805347",
-          "name": "Jim Jarvis",
-          "number": "74",
-          "position": "SS",
+          "id": "ID642086",
+          "name": "Dominic Smith",
+          "number": "8",
+          "position": "DH",
           "is_batter": true,
           "batting_order_slot": 8
         },
         {
-          "id": "ID676551",
-          "name": "Brewer Hicklen",
-          "number": "53",
-          "position": "RF",
+          "id": "ID643289",
+          "name": "Mauricio Dub\u00f3n",
+          "number": "14",
+          "position": "LF",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -2142,12 +2142,20 @@
           "batting_order_slot": 1
         },
         {
+          "id": "ID545341",
+          "name": "Randal Grichuk",
+          "number": "34",
+          "position": "PH",
+          "is_batter": true,
+          "batting_order_slot": 2
+        },
+        {
           "id": "ID808959",
           "name": "Munetaka Murakami",
           "number": "5",
           "position": "1B",
           "is_batter": true,
-          "batting_order_slot": 2
+          "batting_order_slot": 3
         },
         {
           "id": "ID678246",
@@ -2155,7 +2163,7 @@
           "number": "20",
           "position": "3B",
           "is_batter": true,
-          "batting_order_slot": 3
+          "batting_order_slot": 4
         },
         {
           "id": "ID695657",
@@ -2163,7 +2171,7 @@
           "number": "12",
           "position": "SS",
           "is_batter": true,
-          "batting_order_slot": 4
+          "batting_order_slot": 5
         },
         {
           "id": "ID695731",
@@ -2171,7 +2179,7 @@
           "number": "24",
           "position": "RF",
           "is_batter": true,
-          "batting_order_slot": 5
+          "batting_order_slot": 6
         },
         {
           "id": "ID805367",
@@ -2179,7 +2187,7 @@
           "number": "10",
           "position": "2B",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 7
         },
         {
           "id": "ID643217",
@@ -2187,21 +2195,13 @@
           "number": "23",
           "position": "DH",
           "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 8
         },
         {
           "id": "ID700337",
           "name": "Edgar Quero",
           "number": "26",
           "position": "C",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID671976",
-          "name": "Tristan Peters",
-          "number": "29",
-          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -2289,7 +2289,7 @@
           "id": "ID805808",
           "name": "Kevin McGonigle",
           "number": "7",
-          "position": "SS",
+          "position": "3B",
           "is_batter": true,
           "batting_order_slot": 1
         },
@@ -2310,12 +2310,20 @@
           "batting_order_slot": 3
         },
         {
+          "id": "ID663837",
+          "name": "Matt Vierling",
+          "number": "8",
+          "position": "RF",
+          "is_batter": true,
+          "batting_order_slot": 4
+        },
+        {
           "id": "ID682985",
           "name": "Riley Greene",
           "number": "31",
           "position": "LF",
           "is_batter": true,
-          "batting_order_slot": 4
+          "batting_order_slot": 5
         },
         {
           "id": "ID679529",
@@ -2323,7 +2331,7 @@
           "number": "20",
           "position": "1B",
           "is_batter": true,
-          "batting_order_slot": 5
+          "batting_order_slot": 6
         },
         {
           "id": "ID681481",
@@ -2331,29 +2339,21 @@
           "number": "30",
           "position": "DH",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 7
         },
         {
           "id": "ID656716",
           "name": "Zach McKinstry",
           "number": "39",
-          "position": "RF",
+          "position": "SS",
           "is_batter": true,
-          "batting_order_slot": 7
+          "batting_order_slot": 8
         },
         {
           "id": "ID701678",
           "name": "Hao-Yu Lee",
           "number": "50",
           "position": "2B",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID681546",
-          "name": "James Outman",
-          "number": "43",
-          "position": "CF",
           "is_batter": true,
           "batting_order_slot": 9
         }
@@ -2528,12 +2528,20 @@
           "batting_order_slot": 2
         },
         {
+          "id": "ID666211",
+          "name": "Taylor Trammell",
+          "number": "26",
+          "position": "LF",
+          "is_batter": true,
+          "batting_order_slot": 3
+        },
+        {
           "id": "ID670623",
           "name": "Isaac Paredes",
           "number": "15",
           "position": "3B",
           "is_batter": true,
-          "batting_order_slot": 3
+          "batting_order_slot": 4
         },
         {
           "id": "ID664774",
@@ -2541,7 +2549,15 @@
           "number": "31",
           "position": "RF",
           "is_batter": true,
-          "batting_order_slot": 4
+          "batting_order_slot": 5
+        },
+        {
+          "id": "ID701358",
+          "name": "Cam Smith",
+          "number": "11",
+          "position": "RF",
+          "is_batter": true,
+          "batting_order_slot": 6
         },
         {
           "id": "ID673237",
@@ -2549,7 +2565,7 @@
           "number": "21",
           "position": "DH",
           "is_batter": true,
-          "batting_order_slot": 5
+          "batting_order_slot": 7
         },
         {
           "id": "ID572233",
@@ -2557,29 +2573,13 @@
           "number": "8",
           "position": "1B",
           "is_batter": true,
-          "batting_order_slot": 6
+          "batting_order_slot": 8
         },
         {
           "id": "ID828599",
           "name": "Lucas Spence",
           "number": "28",
           "position": "CF",
-          "is_batter": true,
-          "batting_order_slot": 7
-        },
-        {
-          "id": "ID669397",
-          "name": "Nick Allen",
-          "number": "20",
-          "position": "2B",
-          "is_batter": true,
-          "batting_order_slot": 8
-        },
-        {
-          "id": "ID543877",
-          "name": "Christian V\u00e1zquez",
-          "number": "2",
-          "position": "C",
           "is_batter": true,
           "batting_order_slot": 9
         }
