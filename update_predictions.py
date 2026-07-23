@@ -260,6 +260,7 @@ def check_and_update_predictions():
     current_preds = load_current_predictions()
     if current_preds.empty:
         print("⚠️  No predictions to update")
+        save_prediction_update_log([], "No predictions file found for today")
         return False
     
     # Step 2: Get current lineups
@@ -281,6 +282,7 @@ def check_and_update_predictions():
     
     if new_preds.empty:
         print("⚠️  Could not regenerate predictions")
+        save_prediction_update_log([], "Prediction regeneration failed")
         return False
     
     # Step 5: Compare predictions
@@ -317,6 +319,7 @@ def check_and_update_predictions():
         return True
     else:
         print("✓ No significant changes detected")
+        save_prediction_update_log([], "No significant changes detected")
         return False
 
 # =====================================================================
