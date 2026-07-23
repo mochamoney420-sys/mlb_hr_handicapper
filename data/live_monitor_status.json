@@ -4,9 +4,9 @@
   "detected_events_this_loop": 0,
   "sent_events_this_loop": 0,
   "micro_signals_this_loop": 0,
-  "processed_event_count": 33,
+  "processed_event_count": 36,
   "odds_players_tracked": 0,
   "live_monitor_poll_seconds": 5,
   "live_odds_poll_seconds": 5,
-  "updated_at": "2026-07-23T12:58:14.064714"
+  "updated_at": "2026-07-23T18:32:16.961030"
 }
