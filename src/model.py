@@ -1,26 +1,17 @@
 # src/model.py
 import xgboost as xgb
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
 def normalize_wrc_plus_feature(df, default_value=100.0):
     aliases = ['wrc_plus', 'wRC_plus', 'wRC+']
-    wrc_plus = None
-
+    wrc_plus = pd.Series(np.nan, index=df.index, dtype='float64')
     for col in aliases:
-        if col not in df.columns:
-            continue
-        candidate = pd.to_numeric(df[col], errors='coerce')
-        if wrc_plus is None:
-            wrc_plus = candidate
-        else:
-            wrc_plus = wrc_plus.fillna(candidate)
+        if col in df.columns:
+            wrc_plus = wrc_plus.fillna(pd.to_numeric(df[col], errors='coerce'))
 
-    if wrc_plus is None:
-        df['wrc_plus'] = default_value
-    else:
-        df['wrc_plus'] = wrc_plus.fillna(default_value)
-
+    df['wrc_plus'] = wrc_plus.fillna(default_value)
     return df
 
 def train_hr_model(model_data):

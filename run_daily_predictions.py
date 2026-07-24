@@ -2336,7 +2336,8 @@ def generate_daily_predictions():
     features_train = [
         # Batter Features (core power + batted ball profile)
         'bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate', 'bat_sweet_spot_rate',
-        'bat_hr_fb_rate', 'bat_pull_rate', 'bat_ev90', 'bat_iso_proxy', 'wrc_plus', 'bat_days_since_last_game',
+        'bat_hr_fb_rate', 'bat_pull_rate', 'bat_ev90', 'bat_iso_proxy', 'bat_days_since_last_game',
+        'wrc_plus',
         'bat_avg_exit_velocity', 'bat_max_exit_velocity', 'bat_avg_launch_angle',
         'bat_15pa_barrel_rate', 'bat_30pa_barrel_rate',
         'bat_15pa_hard_hit_rate', 'bat_30pa_hard_hit_rate',
