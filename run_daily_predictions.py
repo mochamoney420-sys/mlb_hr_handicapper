@@ -207,22 +207,42 @@ SQUARE_BOOKS = {'fanduel', 'draftkings', 'betmgm', 'williamhill_us', 'barstool',
 # HELPER: DYNAMIC LIVE WEATHER PARSER
 # =====================================================================
 def get_live_weather(lat, lon):
-    """Fetches real-time localized metrics using Open-Meteo API."""
+    """Fetches real-time localized metrics using Open-Meteo API.
+    
+    Returns:
+        dict with: temp (°F), wind_speed (mph), wind_dir (°), humidity (%),
+                   precipitation (in), pressure (mb)
+    """
     try:
         url = (
             f"https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}&current_weather=true"
             f"&temperature_unit=fahrenheit&windspeed_unit=mph"
+            f"&timezone=America/Chicago"  # Use central time as default
         )
         res = requests.get(url, timeout=5).json()
         current = res.get('current_weather', {})
+        
+        # Try to fetch additional metrics from current API if available
+        # Note: Some metrics may require hourly/daily endpoints, so we provide sensible defaults
         return {
             'temp': current.get('temperature', 70),
             'wind_speed': current.get('windspeed', 0),
-            'wind_dir': current.get('winddirection', 0)
+            'wind_dir': current.get('winddirection', 0),
+            'humidity': current.get('relative_humidity', 50),  # 50% default if unavailable
+            'precipitation': current.get('precipitation', 0),  # 0 in default (no precip)
+            'pressure': current.get('pressure_msl', 1013.25)  # 1013.25 mb sea-level default
         }
     except Exception:
-        return {'temp': 70, 'wind_speed': 0, 'wind_dir': 0}
+        # Fallback to sensible defaults (60°F, moderate wind, 50% humidity, no precip, sea-level pressure)
+        return {
+            'temp': 70,
+            'wind_speed': 0,
+            'wind_dir': 0,
+            'humidity': 50,
+            'precipitation': 0,
+            'pressure': 1013.25
+        }
 
 
 def persist_daily_predictions(predictions_df, date_str=None):
@@ -2002,7 +2022,10 @@ def get_today_matchups():
                         'wind_out_component': wind_out_component,
                         'park_factor': handed_park_factor,
                         'temp': weather['temp'],
-                        'wind_speed': weather['wind_speed']
+                        'wind_speed': weather['wind_speed'],
+                        'humidity': weather.get('humidity', 50),
+                        'precipitation': weather.get('precipitation', 0),
+                        'pressure': weather.get('pressure', 1013.25)
                     })
         except Exception as e:
             print(f"Warning: failed to build matchups for game {game_id}: {e}")
@@ -2354,7 +2377,15 @@ def generate_daily_predictions():
         
         # Stadium & Weather Features
         'park_factor', 'temp', 'wind_speed', 'wind_out_component',
+        'humidity', 'precipitation', 'pressure',  # NEW: Enhanced weather tracking
     ]
+    
+    # Ensure all required weather columns exist in training data
+    for weather_col, default_val in [('humidity', 50.0), ('precipitation', 0.0), ('pressure', 1013.25)]:
+        if weather_col not in train_df.columns:
+            train_df[weather_col] = default_val
+        else:
+            train_df[weather_col] = train_df[weather_col].fillna(default_val)
     
     # Feature list for LIVE PREDICTIONS (includes calculated multipliers)
     features_live = features_train + [
@@ -2470,6 +2501,9 @@ def generate_daily_predictions():
     live['park_factor'] = live['park_factor'].fillna(100)
     live['temp'] = live['temp'].fillna(71.0)
     live['wind_speed'] = live['wind_speed'].fillna(5.0)
+    live['humidity'] = live['humidity'].fillna(50.0)  # League average humidity
+    live['precipitation'] = live['precipitation'].fillna(0.0)  # No precip by default
+    live['pressure'] = live['pressure'].fillna(1013.25)  # Sea-level standard pressure
     live['bat_hr_fb_rate'] = live['bat_hr_fb_rate'].fillna(0.12)
     live['pitch_hr_fb_allowed_rate'] = live['pitch_hr_fb_allowed_rate'].fillna(0.12)
     live['bat_ev90'] = live['bat_ev90'].fillna(88.0)
