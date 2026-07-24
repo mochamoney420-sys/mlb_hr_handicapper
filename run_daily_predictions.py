@@ -898,15 +898,16 @@ def print_weekly_todo(days_lookback=7):
 
     # 1) Market integration blockers
     if not os.getenv('ODDS_API_KEY'):
-        todos.append(("HIGH", "Set ODDS_API_KEY in .vscode/.env to unlock live market EV and RLM."))
-        todos.append(("HIGH", "Or configure compliant free-source ingest: FREE_ODDS_JSON_PATH / FREE_ODDS_CSV_PATH / FREE_ODDS_PUBLIC_URLS."))
+        todos.append(("INFO", "⚠️  ODDS_API_KEY not set. System works fine without it - predictions still generated."))
+        todos.append(("OPTIONAL", "📊 To unlock live market EV and RLM features: Get API key at https://the-odds-api.com (requires upgrade to Standard plan for player props). Add ODDS_API_KEY to .vscode/.env."))
+        todos.append(("OPTIONAL", "🆓 Alternative: Configure free-source odds ingest (FREE_ODDS_JSON_PATH / FREE_ODDS_CSV_PATH / FREE_ODDS_PUBLIC_URLS)."))
     else:
         try:
             probe = fetch_hr_prop_odds()
             if not probe:
-                todos.append(("HIGH", "Odds API responding without usable HR prop data. Verify plan/market access and request parameters."))
-        except Exception:
-            todos.append(("HIGH", "Odds API probe failed. Verify key, plan tier, and API availability."))
+                todos.append(("HIGH", "🔑 Odds API key present but returning no data. Check if account is deactivated or plan tier is insufficient. Visit https://the-odds-api.com/admin to verify account status."))
+        except Exception as e:
+            todos.append(("HIGH", f"🔑 Odds API error: {str(e)[:60]}. Check account status and plan tier at https://the-odds-api.com/admin"))
 
     webhook = os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook:
