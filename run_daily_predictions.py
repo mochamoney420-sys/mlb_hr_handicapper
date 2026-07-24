@@ -1791,6 +1791,18 @@ def get_advanced_hr_metrics(days_back=60):
     ).reset_index()
     batter_stats['bat_hr_fb_rate'] = batter_stats['bat_total_hr'] / batter_stats['bat_total_fb'].clip(lower=1)
     batter_stats['bat_pull_rate'] = batter_stats['bat_pulled_fly_count'] / batter_stats['bat_total_fb'].clip(lower=1)
+    
+    # Add wRC+ (Weighted Runs Created+) - normalized to league average of 100
+    # wRC+ = 100 * [(HRs * 1.4 + SweetSpot% * 0.8 + AvgEV bonus) / league average]
+    # Approximation: higher HR rate, sweet spot rate, and exit velocity = higher wRC+
+    batter_stats['bat_wrc_plus'] = (
+        100 * (
+            (batter_stats['bat_hr_rate'] * 1.4 * 60) +  # HR component (scaled to league HR rate ~0.033)
+            (batter_stats['bat_sweet_spot_rate'] * 0.8 * 100) +  # Sweet spot contact quality
+            ((batter_stats['bat_avg_exit_velocity'] - 85) / 5 * 10)  # Exit velo bonus (normalized)
+        ) / 60  # Normalize to league average ~100
+    ).clip(lower=30, upper=200)  # Realistic wRC+ range
+    
     today_date = pd.Timestamp(datetime.today().date())
     _last_bat = pa_df.groupby('batter')['game_date'].max().reset_index()
     _last_bat['bat_days_since_last_game'] = (today_date - _last_bat['game_date']).dt.days.clip(0, 30)
@@ -2327,6 +2339,7 @@ def generate_daily_predictions():
         'bat_15pa_hard_hit_rate', 'bat_30pa_hard_hit_rate',
         'bat_15pa_sweet_spot_rate', 'bat_30pa_sweet_spot_rate',
         'bat_15pa_fb_rate', 'bat_30pa_fb_rate',
+        'bat_wrc_plus',  # NEW: Overall offensive value normalized to league average
         'has_platoon_advantage',
         
         # Pitcher vulnerability features (HR/9, FB%, hard-hit, barrels)
@@ -2448,6 +2461,8 @@ def generate_daily_predictions():
     for col in ['bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate', 'bat_sweet_spot_rate']:
         if col in live.columns:
             live[col] = live[col].fillna(0)
+    if 'bat_wrc_plus' in live.columns:
+        live['bat_wrc_plus'] = live['bat_wrc_plus'].fillna(100)  # League average
     for col in ['pitch_pa_count', 'pitch_hr_allowed_rate', 'pitch_barrel_allowed_rate', 'pitch_hard_hit_allowed_rate', 'pitch_sweet_spot_allowed_rate']:
         if col in live.columns:
             live[col] = live[col].fillna(live[col].mean() if not live[col].isna().all() else 0)
@@ -2463,6 +2478,7 @@ def generate_daily_predictions():
     live['bat_avg_launch_angle'] = live['bat_avg_launch_angle'].fillna(12.0)
     live['bat_iso_proxy'] = live['bat_iso_proxy'].fillna(0.08)
     live['bat_days_since_last_game'] = live['bat_days_since_last_game'].fillna(1)
+    live['bat_wrc_plus'] = live['bat_wrc_plus'].fillna(100)  # League average for unknown batters
     live['pitch_days_since_last_start'] = live['pitch_days_since_last_start'].fillna(5)
     live['pitch_avg_velocity'] = live['pitch_avg_velocity'].fillna(92.0)
     live['pitch_fb_allowed_rate'] = live['pitch_fb_allowed_rate'].fillna(0.35)
