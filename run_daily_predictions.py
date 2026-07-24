@@ -1469,7 +1469,22 @@ def prob_to_fair_american(prob):
 def is_line_release_window_et(now_utc=None):
     now_utc = now_utc or datetime.utcnow()
     now_et = now_utc - timedelta(hours=4)
-    return 9 <= now_et.hour < 11
+    # Optimal window: 11:30 AM - 1:00 PM EST
+    # Check if between 11:30 AM and 1:00 PM ET (before 14:00 to account for minute precision)
+    hour = now_et.hour
+    minute = now_et.minute
+    
+    # 11:30 AM to 1:00 PM means:
+    # - Hour 11 with minute >= 30, OR
+    # - Hour 12, OR  
+    # - Hour 13 (1 PM) with minute < 60
+    if hour == 11:
+        return minute >= 30
+    elif hour == 12:
+        return True
+    elif hour == 13:
+        return minute < 60
+    return False
 
 
 def fetch_totals_market_pressure():
