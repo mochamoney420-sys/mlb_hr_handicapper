@@ -388,7 +388,12 @@ def _candidate_discord_webhooks(explicit_webhook=None):
     return list(dict.fromkeys(normalized))
 
 
-def send_discord_webhook(content=None, embeds=None, webhook_url=None):
+def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send=False):
+    """Send Discord webhook message.
+    
+    Args:
+        async_send: If True, spawn thread to send without blocking. For live HR alerts only.
+    """
     webhook_candidates = _candidate_discord_webhooks(explicit_webhook=webhook_url)
     if not webhook_candidates:
         print("Discord webhook not configured; skipping notification.")
@@ -403,10 +408,21 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None):
     if not payload:
         print("Nothing to send to Discord; payload is empty.")
         return False
+    
+    # For live HRs, spawn non-blocking thread to avoid monitoring loop delays
+    if async_send:
+        import threading
+        thread = threading.Thread(target=_send_discord_sync, args=(payload, webhook_candidates), daemon=True)
+        thread.start()
+        return True  # Return immediately
 
+    return _send_discord_sync(payload, webhook_candidates)
+
+def _send_discord_sync(payload, webhook_candidates):
+    """Synchronously send Discord webhook message."""
     for idx, candidate in enumerate(webhook_candidates):
         try:
-            response = requests.post(candidate, json=payload, timeout=8)
+            response = requests.post(candidate, json=payload, timeout=4)
             if response.status_code == 204:
                 if idx > 0:
                     print("Discord notification sent successfully using backup webhook.")
@@ -4128,8 +4144,8 @@ def monitor_live_home_runs():
     else:
         print("Count tendency lookup unavailable (insufficient cached pitch data).")
 
-    odds_poll_seconds = max(5, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '5'), 5) or 5)
-    monitor_sleep_seconds = max(5, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '5'), 5) or 5)
+    odds_poll_seconds = max(3, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '3'), 3) or 3)  # Reduced from 5s to 3s
+    monitor_sleep_seconds = max(2, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '2'), 2) or 2)  # Reduced from 5s to 2s for faster HR detection
     last_odds_poll_ts = 0.0
     best_odds_prev = {}
     best_odds_now = {}
@@ -4276,14 +4292,12 @@ def monitor_live_home_runs():
 
                     payload = {"content": "\n".join(message_lines)}
 
-                    sent = send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL)
-                    if sent:
-                        print(f"Live HR alert sent for play {event_id} in {game_display}.")
-                        processed_home_runs.add(event_id)
-                        save_processed_home_run_events(processed_home_runs)
-                        sent_this_loop += 1
-                    else:
-                        print(f"Live HR webhook post failed for play {event_id}; will retry on next poll.")
+                    # Send Discord alert non-blocking (async) to avoid monitoring loop delays
+                    send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL, async_send=True)
+                    print(f"Live HR alert queued for play {event_id} in {game_display}.")
+                    processed_home_runs.add(event_id)
+                    save_processed_home_run_events(processed_home_runs)
+                    sent_this_loop += 1
             write_live_monitor_status({
                 'mode': 'live_hr_monitor',
                 'in_progress_games': in_progress_games,
@@ -4303,7 +4317,7 @@ def monitor_live_home_runs():
                 'error': str(e),
                 'processed_event_count': len(processed_home_runs),
             })
-            time.sleep(10)
+            time.sleep(2)  # Reduced error recovery sleep from 10s to 2s for faster reconnection
 
 
 def _is_pid_running(pid):
