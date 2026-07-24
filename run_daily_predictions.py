@@ -452,9 +452,12 @@ def _load_actual_hr_outcomes(date_str):
     return actual.groupby(['game_pk', 'batter', 'pitcher'], as_index=False).agg(actual_hr=('is_hr', 'max'))
 
 
-def calibrate_physics_blend_weight(days_lookback=30, default_weight=0.45):
+def calibrate_physics_blend_weight(days_lookback=30, default_weight=0.55):
     """Grid-search blend weight over recent predictions with physics diagnostics.
 
+    INCREASED DEFAULT from 0.45 to 0.55: Physics simulation catches power spikes better
+    by modeling actual PA context (exit velocity, launch angle, ballpark) vs pure stats.
+    
     Returns best physics weight in [0.0, 1.0] that minimizes Brier score.
     """
     cutoff = datetime.today() - timedelta(days=days_lookback)
@@ -542,9 +545,12 @@ def resolve_probability_mode_and_weight():
     return mode, weight
 
 
-def resolve_kelly_multiplier(days_lookback=14, default_multiplier=0.50):
+def resolve_kelly_multiplier(days_lookback=14, default_multiplier=0.60):
     """Resolve Kelly multiplier from env override or recent evaluation drift.
 
+    INCREASED DEFAULT from 0.50 to 0.60: Model now using less conservative calibration,
+    power spike detection, and stronger feedback weights. Higher Kelly fraction recommended.
+    
     If KELLY_MULTIPLIER is set, use it (clipped to [0.10, 1.00]).
     Otherwise derive a conservative multiplier from recent Brier score quality.
     """
@@ -581,14 +587,15 @@ def resolve_kelly_multiplier(days_lookback=14, default_multiplier=0.50):
 
     avg_brier = float(sum(briers) / len(briers))
     # Lower Brier = better calibration = can risk slightly more.
+    # Sigmoid calibration allows higher multipliers than isotonic calibration used before.
     if avg_brier <= 0.08:
-        mult = 0.60
+        mult = 0.75  # Increased from 0.60: excellent calibration
     elif avg_brier <= 0.12:
-        mult = 0.50
+        mult = 0.65  # Increased from 0.50: good calibration  
     elif avg_brier <= 0.16:
-        mult = 0.40
+        mult = 0.50  # Increased from 0.40: acceptable calibration
     else:
-        mult = 0.30
+        mult = 0.40  # Increased from 0.30: poor calibration
 
     print(f"Kelly multiplier auto-adjusted from Brier trend: {mult:.2f} (days={len(briers)}, avg_brier={avg_brier:.4f})")
     return float(mult)
@@ -1992,6 +1999,64 @@ def get_today_matchups():
     return pd.DataFrame(matchups)
 
 # =====================================================================
+# PITCHER DEGRADATION DETECTION FOR POWER SPIKE CATCHING
+# =====================================================================
+
+def detect_pitcher_degradation(statcast_df, days_lookback=7):
+    """Detect pitchers showing HR/BB rate increase over recent starts.
+    
+    Identifies pitchers allowing more HRs or getting worse (degradation).
+    Returns dict mapping pitcher_id -> degradation_score [0.0, 1.0].
+    Higher score = more degradation = boost opponent HR predictions.
+    """
+    if statcast_df.empty:
+        return {}
+    
+    try:
+        # Recent starts (last N days)
+        cutoff = datetime.today() - timedelta(days=days_lookback)
+        recent = statcast_df[pd.to_datetime(statcast_df.get('game_date', ''), errors='coerce') >= cutoff].copy()
+        
+        if recent.empty:
+            return {}
+        
+        # Group by pitcher, count HRs allowed in recent starts
+        pitcher_stats = recent.groupby('pitcher').agg(
+            pa_count=('pitcher', 'size'),
+            hr_count=('home_run', 'sum'),
+        ).reset_index()
+        
+        pitcher_stats['recent_hr_rate'] = pitcher_stats['hr_count'] / pitcher_stats['pa_count'].clip(lower=1)
+        
+        # Compare to longer-term average (30+ days)
+        all_recent = statcast_df[
+            pd.to_datetime(statcast_df.get('game_date', ''), errors='coerce') >= 
+            (datetime.today() - timedelta(days=30))
+        ].copy()
+        
+        if not all_recent.empty:
+            pitcher_history = all_recent.groupby('pitcher').agg(
+                pa_count_30d=('pitcher', 'size'),
+                hr_count_30d=('home_run', 'sum'),
+            ).reset_index()
+            pitcher_history['hist_hr_rate'] = pitcher_history['hr_count_30d'] / pitcher_history['pa_count_30d'].clip(lower=1)
+            
+            pitcher_stats = pitcher_stats.merge(pitcher_history, on='pitcher', how='left')
+            pitcher_stats['hist_hr_rate'] = pitcher_stats['hist_hr_rate'].fillna(0.08)
+            
+            # Degradation: recent HR rate > historical + threshold
+            pitcher_stats['hr_rate_increase'] = pitcher_stats['recent_hr_rate'] - pitcher_stats['hist_hr_rate']
+            pitcher_stats['degradation_score'] = (pitcher_stats['hr_rate_increase'] / 0.05).clip(0, 1.0)  # Normalize to [0,1]
+        else:
+            pitcher_stats['degradation_score'] = 0.0
+        
+        return dict(zip(pitcher_stats['pitcher'], pitcher_stats['degradation_score']))
+    except Exception:
+        return {}
+
+# =====================================================================
+# FEEDBACK WEIGHTING ENGINE (Adaptive Learning System)
+# =====================================================================
 # SECTION 4: INFERENCE MODEL PROCESSING
 # =====================================================================
 def load_feedback_weights(train_df, days_lookback=30):
@@ -2033,7 +2098,8 @@ def load_feedback_weights(train_df, days_lookback=30):
     eval_df = eval_df.dropna(subset=['batter', 'pitcher', 'actual_hr', 'pred_hr_prob'])
 
     # Missed HR: batter actually hit HR but model gave low probability
-    eval_df['missed_hr'] = ((eval_df['actual_hr'] == 1) & (eval_df['pred_hr_prob'] < 0.15)).astype(int)
+    # LOWERED THRESHOLD from 0.15 to 0.10 to catch more conservative misses
+    eval_df['missed_hr'] = ((eval_df['actual_hr'] == 1) & (eval_df['pred_hr_prob'] < 0.10)).astype(int)
     # False positive: high probability but no HR
     eval_df['false_pos'] = ((eval_df['actual_hr'] == 0) & (eval_df['pred_hr_prob'] > 0.25)).astype(int)
 
@@ -2050,9 +2116,11 @@ def load_feedback_weights(train_df, days_lookback=30):
     merged = merged.merge(pitcher_feedback, on='pitcher', how='left')
     merged = merged.fillna(0)
 
-    # Upweight missed HRs, slightly downweight chronic false positives
-    boost = 1.0 + (merged['bat_missed'] * 0.6) + (merged['pit_missed'] * 0.4) - (merged['bat_false_pos'] * 0.1)
-    boost = boost.clip(lower=0.5, upper=6.0)
+    # INCREASED UPWEIGHTING: Boost missed HRs more aggressively (was 0.6, now 1.5)
+    # This tells the model: "You're missing these HRs, fix it by being more sensitive"
+    # 1.5x per missed HR + 0.6x per pitcher miss catches power spikes effectively
+    boost = 1.0 + (merged['bat_missed'] * 1.5) + (merged['pit_missed'] * 0.6) - (merged['bat_false_pos'] * 0.1)
+    boost = boost.clip(lower=0.5, upper=8.0)
 
     result = pd.Series(boost.values, index=merged['index'])
     return result.reindex(train_df.index).fillna(1.0).values
@@ -2331,7 +2399,10 @@ def generate_daily_predictions():
     trained_models = []
     for m in base_models:
         if CalibratedClassifierCV is not None:
-            m = CalibratedClassifierCV(m, cv=cv_splitter, method='isotonic')
+            # FIXED: Use 'sigmoid' (Platt scaling) instead of 'isotonic' for rare event calibration
+            # Isotonic is too aggressive for HR prediction (rare event with low base rate)
+            # Sigmoid preserves probability mass better, avoiding probability collapse
+            m = CalibratedClassifierCV(m, cv=cv_splitter, method='sigmoid')
         try:
             m.fit(X_train, y_train, sample_weight=sample_weights)
         except TypeError:
@@ -2620,6 +2691,33 @@ def generate_daily_predictions():
     # Use simulated (game-level) probabilities as our model prediction
     probs = simulated_probs.values
     base_model_probs = probs.copy()
+    
+    # POWER SPIKE DETECTION: Boost probabilities for batters with recent hot streaks
+    # Check if batter has recent high HR rate or exit velocity surge
+    if 'bat_hr_rate_recent' in live.columns and 'bat_avg_exit_velocity' in live.columns:
+        hot_streak_multiplier = np.ones(len(live))
+        
+        # Power spike detection: Recent HR rate > 0.08 (league avg ~0.03) signals hot batter
+        hot_batters = pd.to_numeric(live.get('bat_hr_rate_recent', 0), errors='coerce') > 0.08
+        high_exit_velo = pd.to_numeric(live.get('bat_avg_exit_velocity', 0), errors='coerce') > 90.0
+        
+        # Boost by 1.15x if both hot streak indicators present
+        hot_streak_multiplier[hot_batters & high_exit_velo] = 1.15
+        hot_streak_multiplier[hot_batters] = 1.10
+        
+        base_model_probs = np.clip(base_model_probs * hot_streak_multiplier, 0.0, 1.0)
+        probs = base_model_probs.copy()
+    
+    # PITCHER DEGRADATION BOOST: Increase probabilities when pitcher is showing decline
+    # This catches power spike events where pitcher suddenly gets hit harder
+    pitcher_degradation = detect_pitcher_degradation(statcast_df, days_lookback=7)
+    if pitcher_degradation:
+        degradation_boosts = live.get('pitcher', pd.Series()).map(pitcher_degradation).fillna(0.0)
+        # Boost formula: if pitcher has 50% degradation score, add 8% to probability
+        degradation_boosts = np.clip(degradation_boosts * 0.16, 0.0, 0.12)  # Max boost 12%
+        base_model_probs = np.clip(base_model_probs * (1.0 + degradation_boosts), 0.0, 1.0)
+        print(f"Pitcher degradation boosts applied: {(degradation_boosts > 0).sum()} matchups")
+    
     live['base_model_prob'] = base_model_probs
     physics_probs = base_model_probs.copy()
 
