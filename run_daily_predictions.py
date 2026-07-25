@@ -66,6 +66,35 @@ except ImportError:
     TimeSeriesSplit = None
 from datetime import datetime, timedelta
 from pybaseball import statcast
+from threading import Thread
+from queue import Queue
+
+# =====================================================================
+# TIMEOUT WRAPPER FOR STATCAST API CALLS
+# =====================================================================
+def statcast_with_timeout(start_dt, end_dt, timeout_seconds=30):
+    """Call statcast() with a timeout to prevent indefinite hangs."""
+    result_queue = Queue()
+    error_queue = Queue()
+    
+    def fetch_data():
+        try:
+            data = statcast(start_dt=start_dt, end_dt=end_dt)
+            result_queue.put(data)
+        except Exception as e:
+            error_queue.put(e)
+    
+    thread = Thread(target=fetch_data, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    
+    if not result_queue.empty():
+        return result_queue.get()
+    elif not error_queue.empty():
+        raise error_queue.get()
+    else:
+        # Timeout occurred
+        return None
 
 # Import error tracking for silent failure detection
 try:
@@ -623,10 +652,13 @@ def load_or_fetch_statcast(date_str):
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f'statcast_{date_str}.csv'
     if cache_file.exists():
-        return pd.read_csv(cache_file)
+        try:
+            return pd.read_csv(cache_file)
+        except Exception as exc:
+            print(f"Cache read failed for {date_str}; refetching from Baseball Savant: {exc}")
 
     try:
-        stats = statcast(start_dt=date_str, end_dt=date_str)
+        stats = statcast_with_timeout(start_dt=date_str, end_dt=date_str)
         if stats is None or stats.empty:
             print(f"No Statcast data available for {date_str}.")
             return pd.DataFrame()
@@ -1439,6 +1471,10 @@ HR_PROP_MARKET_KEY_CANDIDATES = [
     'player_home_runs',
 ]
 
+# Cooldown guard for invalid Odds API key spam.
+_ODDS_API_INVALID_KEY_UNTIL_TS = 0.0
+_ODDS_API_INVALID_KEY_LAST_LOG_TS = 0.0
+
 
 def _get_hr_prop_market_key_candidates():
     """Return market key candidates, allowing env override for fast recovery.
@@ -1463,6 +1499,36 @@ def _odds_api_invalid_market(status_code, body_text):
         return False
     body = str(body_text or '').lower()
     return ('invalid_market' in body) or ('invalid markets' in body) or ('markets not supported' in body)
+
+
+def _odds_api_invalid_key(status_code, body_text):
+    """Return True when Odds API indicates an invalid API key."""
+    body = str(body_text or '').lower()
+    return int(status_code) in {401, 403} and (
+        'invalid_key' in body or 'api key is not valid' in body or 'invalid api key' in body
+    )
+
+
+def _odds_invalid_key_cooldown_active():
+    try:
+        return time.time() < float(_ODDS_API_INVALID_KEY_UNTIL_TS)
+    except Exception:
+        return False
+
+
+def _set_odds_invalid_key_cooldown(reason_text=''):
+    global _ODDS_API_INVALID_KEY_UNTIL_TS, _ODDS_API_INVALID_KEY_LAST_LOG_TS
+    cooldown_seconds = max(60, int(str(os.getenv('ODDS_API_INVALID_KEY_COOLDOWN_SECONDS', '900')).strip() or '900'))
+    now_ts = time.time()
+    _ODDS_API_INVALID_KEY_UNTIL_TS = now_ts + cooldown_seconds
+    # Log at most once per cooldown window.
+    if (now_ts - float(_ODDS_API_INVALID_KEY_LAST_LOG_TS)) >= cooldown_seconds:
+        _ODDS_API_INVALID_KEY_LAST_LOG_TS = now_ts
+        mins = int(round(cooldown_seconds / 60.0))
+        print(
+            "Odds API key appears invalid; suppressing Odds API polling for "
+            f"{mins}m to prevent log spam. {str(reason_text)[:140]}"
+        )
 
 
 def _parse_odds_event_commence_time(event_obj):
@@ -1557,6 +1623,9 @@ def _extract_hr_prop_player_book_odds(games_payload, market_keys=None):
 
 def _fetch_hr_props_raw_from_odds_api(api_key):
     """Fetch HR props from The Odds API with fallback to event-level endpoint."""
+    if _odds_invalid_key_cooldown_active():
+        return {}
+
     market_keys = _get_hr_prop_market_key_candidates()
     unsupported_markets = []
     for market_key in market_keys:
@@ -1578,6 +1647,9 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
                 print(f"Odds API top-level endpoint returned no {market_key} outcomes; trying event-level endpoint.")
             else:
                 body = (getattr(resp, 'text', '') or '')[:220]
+                if _odds_api_invalid_key(resp.status_code, body):
+                    _set_odds_invalid_key_cooldown(reason_text=body)
+                    return {}
                 if _odds_api_invalid_market(resp.status_code, body):
                     unsupported_markets.append(market_key)
                     print(f"Odds API market unsupported for this key/plan ({market_key}); trying next candidate.")
@@ -1592,6 +1664,9 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
             events_resp = requests.get(events_url, timeout=10)
             if events_resp.status_code != 200:
                 body = (getattr(events_resp, 'text', '') or '')[:220]
+                if _odds_api_invalid_key(events_resp.status_code, body):
+                    _set_odds_invalid_key_cooldown(reason_text=body)
+                    return {}
                 print(f"Odds API events list returned {events_resp.status_code}: {body}")
                 continue
 
@@ -1683,6 +1758,12 @@ def fetch_hr_prop_odds():
                 print(f"Free source odds: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
                 return probs
         return {}
+    if _odds_invalid_key_cooldown_active():
+        if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
+            raw_free = load_free_odds_sources()
+            if raw_free:
+                return build_devigged_probs_from_books(raw_free)
+        return {}
     try:
         player_all_odds = _fetch_hr_props_raw_from_odds_api(api_key)
         if not player_all_odds:
@@ -1711,6 +1792,10 @@ def fetch_hr_prop_odds_raw():
     Used for RLM monitoring and per-book line movement tracking."""
     api_key = os.getenv('ODDS_API_KEY')
     if not api_key:
+        if load_free_odds_sources is not None:
+            return load_free_odds_sources()
+        return {}
+    if _odds_invalid_key_cooldown_active():
         if load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
@@ -1948,26 +2033,34 @@ def get_advanced_hr_metrics(days_back=60):
     all_days_data = []
     today = datetime.today()
 
-    print(f"Syncing historical metrics from the last {days_back} days...")
+    print(f"Loading historical metrics from cache and Baseball Savant (last {days_back} days)...")
+    cached_count = 0
+    fetched_count = 0
     for i in range(1, days_back + 1):
         target_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
         cache_file = os.path.join(cache_dir, f"statcast_{target_date}.csv")
 
         if os.path.exists(cache_file):
-            all_days_data.append(pd.read_csv(cache_file))
-            continue
+            try:
+                all_days_data.append(pd.read_csv(cache_file))
+                cached_count += 1
+                continue
+            except Exception as e:
+                print(f"  Warning: Could not read cache for {target_date}: {str(e)[:40]}")
 
         try:
-            day_df = statcast(start_dt=target_date, end_dt=target_date)
+            day_df = statcast_with_timeout(start_dt=target_date, end_dt=target_date)
             if day_df is not None and not day_df.empty:
                 day_df.to_csv(cache_file, index=False)
                 all_days_data.append(day_df)
-            time.sleep(1)
-        except Exception:
-            continue
+                fetched_count += 1
+        except Exception as e:
+            print(f"  Warning: Could not fetch Statcast for {target_date}: {str(e)[:40]}")
 
+    print(f"✅ Loaded {cached_count} days from cache, fetched {fetched_count} days from Baseball Savant")
+    
     if not all_days_data:
-        raise ValueError("Critical Error: Missing training baseline vectors.")
+        raise ValueError("Critical Error: No Statcast training data available from cache or Baseball Savant.")
 
     df = pd.concat(all_days_data, ignore_index=True)
     pitch_df = df.copy()
@@ -2443,6 +2536,353 @@ def load_feedback_weights(train_df, days_lookback=30):
     return final_weights
 
 
+def _closed_loop_coeff_path():
+    data_dir = Path('data')
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / 'closed_loop_coefficients.json'
+
+
+def load_closed_loop_coefficients():
+    """Load adaptive closed-loop coefficients with safe defaults."""
+    defaults = {
+        'temp_weight': 1.00,
+        'wind_weight': 1.00,
+        'spin_weight': 1.00,
+        'fatigue_weight': 1.00,
+        'pitch_intent_weight': 0.22,
+        'last_updated': None,
+        'samples_seen': 0,
+    }
+    path = _closed_loop_coeff_path()
+    if not path.exists():
+        return defaults
+    try:
+        payload = _json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(payload, dict):
+            return defaults
+        merged = defaults.copy()
+        merged.update(payload)
+        for k in ['temp_weight', 'wind_weight', 'spin_weight', 'fatigue_weight', 'pitch_intent_weight']:
+            merged[k] = float(merged.get(k, defaults[k]))
+        merged['samples_seen'] = int(merged.get('samples_seen', 0))
+        return merged
+    except Exception:
+        return defaults
+
+
+def _save_closed_loop_coefficients(coeffs):
+    try:
+        path = _closed_loop_coeff_path()
+        out = dict(coeffs or {})
+        out['last_updated'] = datetime.now().isoformat()
+        path.write_text(_json.dumps(out, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _load_cached_statcast_window(end_date, days_back=21):
+    """Load a rolling Statcast cache window ending before end_date."""
+    frames = []
+    for i in range(1, max(2, int(days_back)) + 1):
+        d = (end_date - timedelta(days=i)).strftime('%Y-%m-%d')
+        fp = Path('cache') / f'statcast_{d}.csv'
+        if not fp.exists():
+            continue
+        try:
+            frames.append(pd.read_csv(fp))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    try:
+        return pd.concat(frames, ignore_index=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _pitch_mix_vector(df):
+    if df is None or df.empty or 'pitch_type' not in df.columns:
+        return {}
+    vc = df['pitch_type'].dropna().astype(str).value_counts(normalize=True)
+    return {str(k): float(v) for k, v in vc.items()}
+
+
+def _tv_distance(vec_a, vec_b):
+    keys = set(vec_a.keys()) | set(vec_b.keys())
+    if not keys:
+        return 0.0
+    return 0.5 * sum(abs(float(vec_a.get(k, 0.0)) - float(vec_b.get(k, 0.0))) for k in keys)
+
+
+def run_post_mortem_backpropagation(days_lookback=7):
+    """Closed-loop post-mortem layer that rewrites adaptive coefficients.
+
+    The loop inspects recent prediction misses, re-queries game Statcast slices,
+    diagnoses likely failure modes, and nudges weight coefficients for next runs.
+    """
+    coeffs = load_closed_loop_coefficients()
+    cutoff = datetime.today() - timedelta(days=max(1, int(days_lookback)))
+
+    eval_files = []
+    for fp in sorted(Path('data').glob('evaluation_*.csv')):
+        try:
+            d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+            if d >= cutoff:
+                eval_files.append((d, fp))
+        except Exception:
+            continue
+
+    if not eval_files:
+        return {
+            'coefficients': coeffs,
+            'samples': 0,
+            'false_pos': 0,
+            'diagnostics': {},
+        }
+
+    def _num_series(df, col, default):
+        if col in df.columns:
+            s = df[col]
+        else:
+            s = pd.Series([default] * len(df), index=df.index)
+        return pd.to_numeric(s, errors='coerce').fillna(default)
+
+    false_pos_rows = []
+    missed_rows = []
+    for d, fp in eval_files:
+        try:
+            ev = pd.read_csv(fp)
+            if ev.empty:
+                continue
+            ev['pred_hr_prob'] = _num_series(ev, 'pred_hr_prob', 0.0)
+            ev['actual_hr'] = _num_series(ev, 'actual_hr', 0.0).astype(int)
+            false_pos_rows.append(ev[(ev['pred_hr_prob'] >= 0.18) & (ev['actual_hr'] == 0)].copy())
+            missed_rows.append(ev[(ev['pred_hr_prob'] <= 0.10) & (ev['actual_hr'] == 1)].copy())
+        except Exception:
+            continue
+
+    false_pos = pd.concat(false_pos_rows, ignore_index=True) if false_pos_rows else pd.DataFrame()
+    missed = pd.concat(missed_rows, ignore_index=True) if missed_rows else pd.DataFrame()
+
+    n_false = len(false_pos)
+    n_missed = len(missed)
+    total_samples = n_false + n_missed
+    if total_samples == 0:
+        return {
+            'coefficients': coeffs,
+            'samples': 0,
+            'false_pos': 0,
+            'diagnostics': {},
+        }
+
+    temp_false_rate = 0.0
+    wind_false_rate = 0.0
+    spin_miss_rate = 0.0
+    fatigue_false_rate = 0.0
+
+    if not false_pos.empty:
+        t = _num_series(false_pos, 'temp', 72.0)
+        w = _num_series(false_pos, 'wind_out_component', 0.0)
+        f_idx = _num_series(false_pos, 'circadian_disruption_index', 0.0)
+        v_fat = _num_series(false_pos, 'visual_fatigue_modifier', 1.0)
+        temp_false_rate = float((t >= 84).mean())
+        wind_false_rate = float((w >= 6).mean())
+        fatigue_false_rate = float(((f_idx >= 10) | (v_fat <= 0.96)).mean())
+
+    if not missed.empty:
+        spin_flag = _num_series(missed, 'spin_decay_flag', 0.0)
+        spin_rpm = _num_series(missed, 'spin_decay_rpm', 0.0)
+        spin_miss_rate = float(((spin_flag > 0) | (spin_rpm >= 140)).mean())
+
+    # Deep diagnosis via exact-game Statcast slices.
+    bat_speed_drop_hits = 0
+    pitch_mix_shift_hits = 0
+    wind_shift_proxy_hits = 0
+    diagnosis_sample = false_pos.head(60)
+    date_cache = {}
+
+    for _, r in diagnosis_sample.iterrows():
+        try:
+            gpk = pd.to_numeric(r.get('game_pk', np.nan), errors='coerce')
+            batter = pd.to_numeric(r.get('batter', np.nan), errors='coerce')
+            pitcher = pd.to_numeric(r.get('pitcher', np.nan), errors='coerce')
+            pred_date = str(r.get('prediction_timestamp', '') or '')[:10]
+            if len(pred_date) != 10:
+                continue
+            if pred_date not in date_cache:
+                date_cache[pred_date] = load_or_fetch_statcast(pred_date)
+            day_sc = date_cache.get(pred_date)
+            if day_sc is None or day_sc.empty:
+                continue
+
+            game_slice = day_sc[
+                (pd.to_numeric(day_sc.get('game_pk', np.nan), errors='coerce') == float(gpk)) &
+                (pd.to_numeric(day_sc.get('batter', np.nan), errors='coerce') == float(batter)) &
+                (pd.to_numeric(day_sc.get('pitcher', np.nan), errors='coerce') == float(pitcher))
+            ].copy()
+            if game_slice.empty:
+                continue
+
+            # Bat-speed drop diagnosis.
+            game_ev = pd.to_numeric(game_slice.get('launch_speed', np.nan), errors='coerce').dropna()
+            if not game_ev.empty:
+                hist = _load_cached_statcast_window(datetime.strptime(pred_date, '%Y-%m-%d'), days_back=21)
+                hist_ev = pd.Series(dtype=float)
+                if not hist.empty:
+                    hist_ev = pd.to_numeric(
+                        hist[pd.to_numeric(hist.get('batter', np.nan), errors='coerce') == float(batter)].get('launch_speed', np.nan),
+                        errors='coerce'
+                    ).dropna()
+                if len(hist_ev) >= 20 and game_ev.mean() <= (hist_ev.mean() - 1.5):
+                    bat_speed_drop_hits += 1
+
+            # Pitch-mix shift diagnosis.
+            hist2 = _load_cached_statcast_window(datetime.strptime(pred_date, '%Y-%m-%d'), days_back=21)
+            if not hist2.empty:
+                p_hist = hist2[pd.to_numeric(hist2.get('pitcher', np.nan), errors='coerce') == float(pitcher)]
+                game_mix = _pitch_mix_vector(game_slice)
+                hist_mix = _pitch_mix_vector(p_hist)
+                if _tv_distance(game_mix, hist_mix) >= 0.22:
+                    pitch_mix_shift_hits += 1
+
+            # Wind-vector shift proxy: favorable pregame wind but weak in-game contact.
+            pre_wind = float(pd.to_numeric(r.get('wind_out_component', 0.0), errors='coerce'))
+            hard_hit_rate = float((pd.to_numeric(game_slice.get('launch_speed', 0), errors='coerce') >= 95).mean())
+            if pre_wind >= 6.0 and hard_hit_rate <= 0.10:
+                wind_shift_proxy_hits += 1
+        except Exception:
+            continue
+
+    sample_n = max(1, len(diagnosis_sample))
+    bat_speed_drop_rate = bat_speed_drop_hits / sample_n
+    pitch_mix_shift_rate = pitch_mix_shift_hits / sample_n
+    wind_shift_proxy_rate = wind_shift_proxy_hits / sample_n
+
+    # Reward-function backprop: adjust coefficients for next day.
+    coeffs['temp_weight'] = float(np.clip(coeffs['temp_weight'] * (1.0 - 0.015 * temp_false_rate), 0.88, 1.12))
+    coeffs['wind_weight'] = float(np.clip(coeffs['wind_weight'] * (1.0 - 0.015 * max(wind_false_rate, wind_shift_proxy_rate)), 0.88, 1.15))
+    coeffs['spin_weight'] = float(np.clip(coeffs['spin_weight'] * (1.0 + 0.015 * max(spin_miss_rate, pitch_mix_shift_rate)), 0.88, 1.20))
+    coeffs['fatigue_weight'] = float(np.clip(coeffs['fatigue_weight'] * (1.0 + 0.015 * max(fatigue_false_rate, bat_speed_drop_rate)), 0.88, 1.20))
+    coeffs['samples_seen'] = int(coeffs.get('samples_seen', 0)) + int(total_samples)
+    _save_closed_loop_coefficients(coeffs)
+
+    report = {
+        'as_of': datetime.now().isoformat(),
+        'samples': int(total_samples),
+        'false_pos': int(n_false),
+        'missed_hr': int(n_missed),
+        'diagnostics': {
+            'temp_false_rate': round(temp_false_rate, 4),
+            'wind_false_rate': round(wind_false_rate, 4),
+            'spin_miss_rate': round(spin_miss_rate, 4),
+            'fatigue_false_rate': round(fatigue_false_rate, 4),
+            'bat_speed_drop_rate': round(bat_speed_drop_rate, 4),
+            'pitch_mix_shift_rate': round(pitch_mix_shift_rate, 4),
+            'wind_shift_proxy_rate': round(wind_shift_proxy_rate, 4),
+        },
+        'coefficients': {
+            'temp_weight': round(coeffs['temp_weight'], 6),
+            'wind_weight': round(coeffs['wind_weight'], 6),
+            'spin_weight': round(coeffs['spin_weight'], 6),
+            'fatigue_weight': round(coeffs['fatigue_weight'], 6),
+            'pitch_intent_weight': round(coeffs['pitch_intent_weight'], 6),
+        },
+    }
+    try:
+        out_path = Path('data') / f"closed_loop_report_{datetime.today().strftime('%Y-%m-%d')}.json"
+        out_path.write_text(_json.dumps(report, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+    return report
+
+
+def compute_pitcher_intent_fear_factor(statcast_df, elite_batters):
+    """Track pitcher intent via rolling out-of-zone % vs elite power hitters."""
+    if statcast_df is None or statcast_df.empty or not elite_batters:
+        return {}
+    if 'zone' not in statcast_df.columns or 'pitcher' not in statcast_df.columns:
+        return {}
+    try:
+        work = statcast_df.copy()
+        work['batter'] = pd.to_numeric(work.get('batter', np.nan), errors='coerce')
+        work['pitcher'] = pd.to_numeric(work.get('pitcher', np.nan), errors='coerce')
+        work['zone'] = pd.to_numeric(work.get('zone', np.nan), errors='coerce')
+        work['game_pk'] = pd.to_numeric(work.get('game_pk', np.nan), errors='coerce')
+        work = work.dropna(subset=['batter', 'pitcher', 'zone', 'game_pk'])
+        work = work[work['batter'].isin(set(float(x) for x in elite_batters))].copy()
+        if work.empty:
+            return {}
+
+        work['is_out_zone'] = ((work['zone'] < 1) | (work['zone'] > 9)).astype(int)
+        pg = work.groupby(['pitcher', 'game_pk'], as_index=False).agg(out_zone_rate=('is_out_zone', 'mean'))
+        if pg.empty:
+            return {}
+
+        baseline = float(pg['out_zone_rate'].mean())
+        fear = {}
+        for pid, g in pg.groupby('pitcher'):
+            last3 = g.sort_values('game_pk').tail(3)
+            rate = float(last3['out_zone_rate'].mean())
+            # Above-baseline out-of-zone behavior => greater intentional avoidance.
+            fear[str(int(pid))] = float(np.clip((rate - baseline) / 0.20, 0.0, 1.0))
+        return fear
+    except Exception:
+        return {}
+
+
+def run_adversarial_debate_layer(live_df, rounds=5000):
+    """Dual-agent adversarial layer (Optimist vs Pessimist/Sportsbook)."""
+    if live_df is None or live_df.empty:
+        return live_df
+
+    rounds = max(500, int(rounds))
+    out = live_df.copy()
+
+    bat_barrel = pd.to_numeric(out.get('bat_barrel_rate', 0.0), errors='coerce').fillna(0.0)
+    bat_hh = pd.to_numeric(out.get('bat_hard_hit_rate', 0.0), errors='coerce').fillna(0.0)
+    park = pd.to_numeric(out.get('park_factor', 100.0), errors='coerce').fillna(100.0)
+    temp = pd.to_numeric(out.get('temp', 72.0), errors='coerce').fillna(72.0)
+    wind_out = pd.to_numeric(out.get('wind_out_component', 0.0), errors='coerce').fillna(0.0)
+    pitch_hr9 = pd.to_numeric(out.get('pitch_hr_per_9', 1.1), errors='coerce').fillna(1.1)
+    pitch_hr_allowed = pd.to_numeric(out.get('pitch_hr_allowed_rate', 0.04), errors='coerce').fillna(0.04)
+    umpire_impact = pd.to_numeric(out.get('umpire_strike_zone_impact', 1.0), errors='coerce').fillna(1.0)
+    bullpen_home = pd.to_numeric(out.get('bullpen_quality_score_home', 50.0), errors='coerce').fillna(50.0)
+    bullpen_away = pd.to_numeric(out.get('bullpen_quality_score_away', 50.0), errors='coerce').fillna(50.0)
+    fear = pd.to_numeric(out.get('pitcher_fear_factor', 0.0), errors='coerce').fillna(0.0)
+
+    optimist = (
+        ((bat_barrel - 0.08) / 0.08) * 0.90
+        + ((bat_hh - 0.35) / 0.20) * 0.75
+        + ((park - 100.0) / 20.0) * 0.55
+        + ((temp - 72.0) / 18.0) * 0.25
+        + (wind_out / 10.0) * 0.30
+        + ((pitch_hr9 - 1.1) / 0.6) * 0.55
+    )
+
+    pessim = (
+        ((0.05 - pitch_hr_allowed) / 0.03) * 0.65
+        + ((umpire_impact - 1.0) / 0.08) * 0.35
+        + (((bullpen_home + bullpen_away) / 2.0 - 50.0) / 20.0) * 0.30
+        + (fear * 1.10)
+    )
+
+    debate_logit = optimist - pessim
+    p_opt = 1.0 / (1.0 + np.exp(-debate_logit))
+    opt_wins = np.round(p_opt * rounds).astype(int)
+    pes_wins = rounds - opt_wins
+    margin = (opt_wins - pes_wins) / float(rounds)
+    mult = np.clip(1.0 + (margin * 0.22), 0.82, 1.18)
+
+    out['optimist_score'] = optimist
+    out['pessimist_score'] = pessim
+    out['debate_rounds'] = rounds
+    out['optimist_wins'] = opt_wins
+    out['pessimist_wins'] = pes_wins
+    out['adversarial_margin'] = margin
+    out['adversarial_multiplier'] = mult
+    return out
+
+
 # =====================================================================
 # PROFESSIONAL-GRADE MONTE CARLO SIMULATION ENGINE
 # =====================================================================
@@ -2647,6 +3087,19 @@ def generate_daily_predictions():
     sample_weights = load_feedback_weights(train_df)
     missed_count = int((sample_weights > 1.2).sum())
     print(f"Feedback weights loaded — {missed_count} training rows upweighted from past misses.")
+
+    # Closed-loop reward backprop layer: rewrite adaptive coefficients from recent outcomes.
+    closed_loop_report = run_post_mortem_backpropagation(days_lookback=7)
+    adaptive_coeffs = load_closed_loop_coefficients()
+    if closed_loop_report.get('samples', 0) > 0:
+        print(
+            "Closed-loop backprop updated coefficients: "
+            f"temp={adaptive_coeffs.get('temp_weight', 1.0):.3f}, "
+            f"wind={adaptive_coeffs.get('wind_weight', 1.0):.3f}, "
+            f"spin={adaptive_coeffs.get('spin_weight', 1.0):.3f}, "
+            f"fatigue={adaptive_coeffs.get('fatigue_weight', 1.0):.3f} "
+            f"(samples={closed_loop_report.get('samples', 0)})"
+        )
     
     # Feature list for MODEL TRAINING (only features that exist in train_df)
     features_train = [
@@ -2737,22 +3190,34 @@ def generate_daily_predictions():
         model_names.append('RandomForest')
 
     # IMPROVEMENT #7: Add Logistic Regression (captures linear relationships)
+    # Wrapped in pipeline with SimpleImputer to handle NaN values
     try:
         from sklearn.linear_model import LogisticRegression
-        base_models.append(LogisticRegression(
-            max_iter=1000, class_weight='balanced', random_state=42
-        ))
-        model_names.append('LogisticRegression')
+        from sklearn.pipeline import Pipeline
+        from sklearn.impute import SimpleImputer
+        
+        lr_pipeline = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('lr', LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42))
+        ])
+        base_models.append(lr_pipeline)
+        model_names.append('LogisticRegression+Imputer')
     except ImportError:
         pass
 
     # IMPROVEMENT #7: Add Neural Network (captures non-linear interactions)
+    # Also wrapped with imputer for NaN handling
     try:
         from sklearn.neural_network import MLPClassifier
-        base_models.append(MLPClassifier(
-            hidden_layer_sizes=(128, 64, 32), max_iter=500, random_state=42, early_stopping=True
-        ))
-        model_names.append('NeuralNetwork')
+        from sklearn.pipeline import Pipeline
+        from sklearn.impute import SimpleImputer
+        
+        nn_pipeline = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('nn', MLPClassifier(hidden_layer_sizes=(128, 64, 32), max_iter=500, random_state=42, early_stopping=True))
+        ])
+        base_models.append(nn_pipeline)
+        model_names.append('NeuralNetwork+Imputer')
     except ImportError:
         pass
 
@@ -3039,6 +3504,23 @@ def generate_daily_predictions():
             else:
                 live[col] = live[col].fillna(50.0)
 
+    # Pitcher intent pivot variable: out-of-zone avoidance against elite power bats.
+    elite_power = set(
+        b_stats[
+            (pd.to_numeric(b_stats.get('bat_iso_proxy', 0.0), errors='coerce').fillna(0.0) >= 0.17) |
+            (pd.to_numeric(b_stats.get('bat_wrc_plus', 100.0), errors='coerce').fillna(100.0) >= 130) |
+            (pd.to_numeric(b_stats.get('bat_hr_rate', 0.0), errors='coerce').fillna(0.0) >= 0.05)
+        ]['batter'].dropna().astype(float).tolist()
+    ) if 'batter' in b_stats.columns else set()
+    fear_map = compute_pitcher_intent_fear_factor(statcast_df, elite_power)
+    live['pitcher_fear_factor'] = pd.to_numeric(
+        live.get('pitcher', pd.Series([np.nan] * len(live))).apply(
+            lambda x: fear_map.get(str(int(x)), 0.0) if pd.notna(x) else 0.0
+        ),
+        errors='coerce'
+    ).fillna(0.0)
+    live['is_elite_power_batter'] = pd.to_numeric(live.get('batter', np.nan), errors='coerce').isin(elite_power).astype(int)
+
     X_live = live[features_train]
     all_probs = [m.predict_proba(X_live)[:, 1] for m in trained_models]
     probs = sum(all_probs) / len(all_probs)
@@ -3134,7 +3616,7 @@ def generate_daily_predictions():
                 _physics_series = pd.to_numeric(live['physics_hr_prob'], errors='coerce')
                 _base_series = pd.Series(base_model_probs, index=_physics_series.index)
                 physics_probs = _physics_series.fillna(_base_series).values
-        except Exception as _physics_err:
+        except BaseException as _physics_err:
             print(f"Physics pipeline skipped: {_physics_err}")
 
     # Runtime probability mode selection and blend calibration.
@@ -3156,6 +3638,61 @@ def generate_daily_predictions():
     live['blend_weight_physics'] = physics_weight if prob_mode == 'blended' else 0.0
     live['probability_mode'] = prob_mode
     live['physics_delta'] = probs - base_model_probs
+
+    def _live_num(col, default):
+        if col in live.columns:
+            s = live[col]
+        else:
+            s = pd.Series([default] * len(live), index=live.index)
+        return pd.to_numeric(s, errors='coerce').fillna(default)
+
+    # Closed-loop adaptive coefficient layer (reward-function backprop application).
+    temp_signal = ((_live_num('temp', 72.0) - 75.0) / 20.0).clip(0.0, 1.0)
+    wind_signal = (_live_num('wind_out_component', 0.0) / 12.0).clip(0.0, 1.0)
+    spin_signal = (
+        _live_num('spin_decay_flag', 0.0)
+        + (_live_num('spin_decay_rpm', 0.0) / 300.0)
+    ).clip(0.0, 1.0)
+    fatigue_signal = (
+        (_live_num('circadian_disruption_index', 0.0) / 24.0)
+        + (1.0 - _live_num('visual_fatigue_modifier', 1.0))
+    ).clip(0.0, 1.0)
+
+    temp_w = float(adaptive_coeffs.get('temp_weight', 1.0))
+    wind_w = float(adaptive_coeffs.get('wind_weight', 1.0))
+    spin_w = float(adaptive_coeffs.get('spin_weight', 1.0))
+    fatigue_w = float(adaptive_coeffs.get('fatigue_weight', 1.0))
+
+    adaptive_mult = (
+        1.0
+        + ((temp_w - 1.0) * temp_signal)
+        + ((wind_w - 1.0) * wind_signal)
+        + ((spin_w - 1.0) * spin_signal)
+        + ((fatigue_w - 1.0) * fatigue_signal)
+    ).clip(0.75, 1.30)
+    probs = np.clip(probs * adaptive_mult.values, 0.0, 1.0)
+    live['adaptive_feedback_multiplier'] = adaptive_mult.values
+
+    # Pitcher intent suppression: elite hitters see fewer hittable strikes from fearful pitchers.
+    intent_coeff = float(adaptive_coeffs.get('pitch_intent_weight', 0.22))
+    env_prime = (
+        ((_live_num('park_factor', 100.0) - 100.0) / 25.0)
+        + (_live_num('wind_out_component', 0.0) / 12.0)
+        + ((_live_num('temp', 72.0) - 72.0) / 20.0)
+    ).clip(0.0, 1.2)
+    fear = _live_num('pitcher_fear_factor', 0.0)
+    elite_flag = _live_num('is_elite_power_batter', 0.0)
+    intent_suppression = (1.0 - (intent_coeff * fear * env_prime * elite_flag)).clip(0.70, 1.00)
+    probs = np.clip(probs * intent_suppression.values, 0.0, 1.0)
+    live['pitcher_intent_suppression'] = intent_suppression.values
+
+    # Multi-agent adversarial synthesis (Optimist vs Pessimist) before final betting math.
+    try:
+        debate_rounds = max(500, int(str(os.getenv('ADVERSARIAL_DEBATE_ROUNDS', '5000')).strip() or '5000'))
+    except Exception:
+        debate_rounds = 5000
+    live = run_adversarial_debate_layer(live, rounds=debate_rounds)
+    probs = np.clip(probs * pd.to_numeric(live.get('adversarial_multiplier', 1.0), errors='coerce').fillna(1.0).values, 0.0, 1.0)
 
     # =====================================================================
     # PROFESSIONAL UPGRADE 2: Kelly Criterion with Simulated Probabilities
@@ -3364,6 +3901,17 @@ def generate_daily_predictions():
     physics_output_defaults = {
         'physics_hr_prob': 0.0,
         'physics_per_pa_hr_prob': 0.0,
+        'adaptive_feedback_multiplier': 1.0,
+        'pitcher_fear_factor': 0.0,
+        'pitcher_intent_suppression': 1.0,
+        'is_elite_power_batter': 0,
+        'optimist_score': 0.0,
+        'pessimist_score': 0.0,
+        'debate_rounds': 5000,
+        'optimist_wins': 2500,
+        'pessimist_wins': 2500,
+        'adversarial_margin': 0.0,
+        'adversarial_multiplier': 1.0,
         'density_altitude_ft': 0.0,
         'air_density_kg_m3': 1.225,
         'drag_multiplier': 1.0,
@@ -3400,6 +3948,9 @@ def generate_daily_predictions():
                                     'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
                                     'kelly_multiplier',
                                     'base_model_prob', 'physics_delta', 'blend_weight_physics', 'probability_mode',
+                                    'adaptive_feedback_multiplier', 'pitcher_fear_factor', 'pitcher_intent_suppression',
+                                    'is_elite_power_batter', 'optimist_score', 'pessimist_score', 'debate_rounds',
+                                    'optimist_wins', 'pessimist_wins', 'adversarial_margin', 'adversarial_multiplier',
                                     'best_book', 'best_market_odds_american', 'best_market_implied_prob',
                                     'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
                                     'release_window_sniper_signal', 'line_release_window_flag', 'nrfi_under_drag_score',
@@ -4532,6 +5083,10 @@ def monitor_live_home_runs():
 
     odds_poll_seconds = max(3, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '3'), 3) or 3)  # Reduced from 5s to 3s
     monitor_sleep_seconds = max(2, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '2'), 2) or 2)  # Reduced from 5s to 2s for faster HR detection
+    heartbeat_enabled = str(os.getenv('LIVE_HEARTBEAT_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    heartbeat_minutes = max(1, _safe_int(os.getenv('LIVE_HEARTBEAT_MINUTES', '10'), 10) or 10)
+    heartbeat_every_seconds = heartbeat_minutes * 60
+    last_heartbeat_ts = 0.0
     last_odds_poll_ts = 0.0
     best_odds_prev = {}
     best_odds_now = {}
@@ -4557,7 +5112,24 @@ def monitor_live_home_runs():
                     print(f"Live odds poll failed: {odds_err}")
 
             for game in games:
-                if game.get('status') != 'In Progress':
+                status_parts = [
+                    str(game.get('status', '') or ''),
+                    str(game.get('detailed_state', '') or ''),
+                    str(game.get('game_status', '') or ''),
+                ]
+                status_text = " ".join(status_parts).lower()
+                is_live_state = any(
+                    token in status_text
+                    for token in [
+                        'in progress',
+                        'manager challenge',
+                        'review',
+                        'warmup',
+                        'delayed',
+                        'live',
+                    ]
+                )
+                if not is_live_state:
                     continue
                 in_progress_games += 1
                 game_id = game.get('game_pk') or game.get('game_id')
@@ -4706,6 +5278,23 @@ def monitor_live_home_runs():
             # Log HR detection vs send gap for debugging
             if detected_this_loop > 0 and detected_this_loop > sent_this_loop:
                 print(f"⚠️  HR detection gap: {detected_this_loop} detected but {sent_this_loop} sent Discord alerts")
+
+            # Optional liveness heartbeat so ops can verify the monitor is healthy between HR events.
+            if heartbeat_enabled and in_progress_games > 0 and (now_ts - last_heartbeat_ts) >= heartbeat_every_seconds:
+                hb_lines = [
+                    "💓 **LIVE MONITOR HEARTBEAT**",
+                    f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')}",
+                    f"🎮 In-progress games: {in_progress_games}",
+                    f"⚾ Processed HR events today: {len(processed_home_runs)}",
+                    f"📈 Loop summary: detected={detected_this_loop}, sent={sent_this_loop}, micro={micro_signals_this_loop}",
+                    f"🔁 Poll rates: monitor={monitor_sleep_seconds}s, odds={odds_poll_seconds}s",
+                ]
+                hb_ok = send_discord_webhook(content="\n".join(hb_lines), webhook_url=WEBHOOK_URL, async_send=False)
+                if hb_ok:
+                    last_heartbeat_ts = now_ts
+                    print(f"Heartbeat sent ({heartbeat_minutes}m cadence)")
+                else:
+                    print("⚠️ Heartbeat send failed; will retry next cycle")
             
             discord_success_rate = (sent_this_loop / detected_this_loop * 100) if detected_this_loop > 0 else 0
             write_live_monitor_status({
@@ -4799,7 +5388,7 @@ def pull_games(date_str):
     """Fetch and return Statcast data for a given date (YYYY-MM-DD)."""
     print(f"Initiating Statcast pitch metric ingestion tracking for: {date_str}")
     try:
-        df = statcast(start_dt=date_str, end_dt=date_str)
+        df = statcast_with_timeout(start_dt=date_str, end_dt=date_str)
         return df
     except Exception as e:
         print(f"Error fetching data via pybaseball module: {e}")

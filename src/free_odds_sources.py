@@ -324,10 +324,34 @@ def fetch_public_url_html(url: str, timeout: int = 10) -> str:
 def load_odds_from_public_urls(urls: List[str]) -> Dict[str, Dict[str, int]]:
     merged: Dict[str, Dict[str, int]] = {}
     for url in urls:
-        html = fetch_public_url_html(url)
-        if not html:
+        part: Dict[str, Dict[str, int]] = {}
+
+        # Prefer JSON when a public endpoint returns machine-readable payloads.
+        # Fallback to HTML parsing for public pages.
+        if requests is not None:
+            try:
+                resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    content_type = (resp.headers.get("Content-Type", "") or "").lower()
+                    if "json" in content_type or url.lower().endswith(".json"):
+                        try:
+                            payload = resp.json()
+                            part = _parse_json_payload(payload)
+                        except Exception:
+                            part = {}
+                    if not part:
+                        part = parse_public_html_odds(resp.text)
+            except Exception:
+                part = {}
+
+        if not part:
+            html = fetch_public_url_html(url)
+            if html:
+                part = parse_public_html_odds(html)
+
+        if not part:
             continue
-        part = parse_public_html_odds(html)
+
         part = _validate_and_filter(part, f"public_url:{url}")
         for player, book_map in part.items():
             merged.setdefault(player, {}).update(book_map)
@@ -340,7 +364,7 @@ def load_free_odds_sources() -> Dict[str, Dict[str, int]]:
     Environment options:
     - FREE_ODDS_JSON_PATH: local JSON export path
     - FREE_ODDS_CSV_PATH: local CSV export path
-    - FREE_ODDS_PUBLIC_URLS: comma-separated public URLs
+    - FREE_ODDS_PUBLIC_URLS: comma-separated public URLs (JSON feeds and/or HTML pages)
     """
     merged: Dict[str, Dict[str, int]] = {}
 
