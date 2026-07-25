@@ -67,6 +67,14 @@ except ImportError:
 from datetime import datetime, timedelta
 from pybaseball import statcast
 
+# Import error tracking for silent failure detection
+try:
+    from error_tracking import get_tracker, log_error, log_warning
+    ERROR_TRACKER = get_tracker()
+except ImportError:
+    print("⚠️  error_tracking module not found; silent failure logging disabled")
+    ERROR_TRACKER = None
+
 # Import Baseball Savant integration
 try:
     from src.baseball_savant import (
@@ -674,53 +682,121 @@ def _file_contains_text(path, needle):
 
 
 def run_model_self_check(days_lookback=30):
-    """Print current runtime mode/weight and physics calibration readiness."""
+    """Check system health and detect/alert on silent failures."""
     print("\n" + "=" * 70)
-    print("MODEL SELF-CHECK")
+    print("MODEL HEALTH CHECK & SILENT FAILURE DETECTION")
     print("=" * 70)
 
-    mode_env = str(os.getenv('HR_PROB_MODE', 'blended')).strip().lower()
-    weight_override = os.getenv('HR_PHYSICS_BLEND_WEIGHT')
-    print(f"Physics module loaded: {apply_physics_pipeline_to_live is not None}")
-    print(f"HR_PROB_MODE env: {mode_env}")
-    print(f"HR_PHYSICS_BLEND_WEIGHT env: {weight_override if weight_override else 'not set'}")
-    print(f"FREE_ODDS_STRICT_SCHEMA: {os.getenv('FREE_ODDS_STRICT_SCHEMA', 'true')}")
-
-    reject_log = os.getenv('FREE_ODDS_REJECT_LOG', '').strip()
-    if reject_log:
-        reject_path = Path(reject_log)
+    issues_found = 0
+    
+    # 1. Check Discord webhook is configured
+    webhook = os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook:
+        print("❌ ISSUE: Discord webhook not configured - HRs won't be sent!")
+        issues_found += 1
     else:
-        reject_path = Path('data') / f"free_odds_rejects_{datetime.today().strftime('%Y-%m-%d')}.csv"
-    if reject_path.exists():
-        try:
-            _rej = pd.read_csv(reject_path)
-            print(f"Free-odds reject log: {reject_path} ({len(_rej)} rows)")
-        except Exception:
-            print(f"Free-odds reject log: {reject_path} (unreadable)")
-    else:
-        print(f"Free-odds reject log: {reject_path} (not created yet)")
+        print("✅ Discord webhook configured and ready")
 
+    # 2. Check physics module availability
+    if apply_physics_pipeline_to_live is None:
+        print("⚠️  Physics module not available (non-critical, using base model only)")
+    else:
+        print("✅ Physics simulation module loaded")
+
+    # 3. Validate prediction files have required columns
     cutoff = datetime.today() - timedelta(days=days_lookback)
     pred_files = []
-    files_with_physics = 0
+    bad_files = []
     for f in sorted(Path('data').glob('predictions_*.csv')):
         try:
             file_date = datetime.strptime(f.stem.replace('predictions_', ''), '%Y-%m-%d')
             if file_date < cutoff:
                 continue
             pred_files.append(f)
-            df = pd.read_csv(f, nrows=5)
-            if 'physics_hr_prob' in df.columns:
-                files_with_physics += 1
-        except Exception:
-            continue
+            df = pd.read_csv(f, nrows=1)
+            required = ['game_pk', 'batter', 'pitcher', 'pred_hr_prob']
+            if not all(c in df.columns for c in required):
+                bad_files.append(f.name)
+        except Exception as e:
+            bad_files.append(f"{f.name}: {e}")
+            issues_found += 1
 
-    print(f"Prediction files in lookback window: {len(pred_files)}")
-    print(f"Files with physics columns: {files_with_physics}")
+    if bad_files:
+        print(f"❌ {len(bad_files)} prediction files invalid:")
+        for fname in bad_files[:3]:
+            print(f"   {fname}")
+        issues_found += len(bad_files)
+    else:
+        print(f"✅ {len(pred_files)} prediction files valid")
 
-    effective_mode, effective_weight = resolve_probability_mode_and_weight()
-    print(f"Effective mode: {effective_mode}")
-    print(f"Effective physics blend weight: {effective_weight:.2f}")
+    # 4. CHECK FOR SILENT FAILURES: Scan today's predictions for anomalies
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    today_pred = Path('data') / f'predictions_{today_str}.csv'
+    print("\n🔍 SCANNING FOR SILENT FAILURES...")
+    
+    silent_failures = []
+    if today_pred.exists():
+        try:
+            today_preds_df = pd.read_csv(today_pred)
+            
+            if today_preds_df.empty:
+                msg = f"Today's predictions CSV is EMPTY - model likely failed silently!"
+                print(f"❌ {msg}")
+                silent_failures.append(msg)
+                issues_found += 1
+            else:
+                prob_col = today_preds_df['pred_hr_prob']
+                zero_pct = (prob_col == 0).mean()
+                nan_pct = prob_col.isna().mean()
+                
+                if zero_pct > 0.8:
+                    msg = f"⚠️  {zero_pct*100:.0f}% of probabilities are exactly 0.0 - possible model failure"
+                    print(msg)
+                    silent_failures.append(msg)
+                    issues_found += 1
+                elif nan_pct > 0.5:
+                    msg = f"⚠️  {nan_pct*100:.0f}% of probabilities are NaN - possible model failure"
+                    print(msg)
+                    silent_failures.append(msg)
+                    issues_found += 1
+                else:
+                    print(f"✅ Today's predictions: {len(today_preds_df)} rows, mean={prob_col.mean():.3f}, max={prob_col.max():.3f}")
+        except Exception as e:
+            msg = f"Could not read today's predictions: {e}"
+            print(f"❌ {msg}")
+            silent_failures.append(msg)
+            issues_found += 1
+    else:
+        print(f"ℹ️  Today's predictions not yet generated (normal if early in day)")
+
+    # 5. Check evaluation pipeline (learning data)
+    yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+    eval_file = Path('data') / f'evaluation_{yesterday_str}.csv'
+    if eval_file.exists():
+        try:
+            eval_df = pd.read_csv(eval_file)
+            print(f"✅ Learning evaluation ready: {len(eval_df)} rows")
+        except Exception as e:
+            print(f"⚠️  Evaluation file corrupted: {e}")
+    else:
+        print(f"ℹ️  No evaluation for {yesterday_str} yet")
+
+    # SUMMARY
+    print("\n" + "=" * 70)
+    if issues_found == 0:
+        if not silent_failures:
+            print("✅ ALL CHECKS PASSED - System is healthy")
+            return True
+        else:
+            print(f"⚠️  WARNING: {len(silent_failures)} potential silent failures detected")
+            return False
+    else:
+        print(f"❌ HEALTH CHECK FAILED - Found {issues_found} issue(s)")
+        if silent_failures:
+            print(f"\n🚨 SILENT FAILURES DETECTED:")
+            for fail in silent_failures:
+                print(f"   {fail}")
+        return False
 
 
 def send_morning_learning_summary(
@@ -2138,9 +2214,11 @@ def detect_pitcher_degradation(statcast_df, days_lookback=7):
 # SECTION 4: INFERENCE MODEL PROCESSING
 # =====================================================================
 def load_feedback_weights(train_df, days_lookback=30):
-    """Load historical evaluation CSVs and upweight training rows for
-    batters/pitchers the model consistently missed. Returns a weight
-    array aligned with train_df's index."""
+    """Load historical evaluation CSVs and apply ASYMMETRIC learning:
+    Heavily prioritize learning from FAILURES (misses, false confidence)
+    over learning from successes. Failures are 3-5x more impactful.
+    
+    Returns a weight array aligned with train_df's index."""
     weights = pd.Series(1.0, index=train_df.index)
 
     cutoff = datetime.today() - timedelta(days=days_lookback)
@@ -2175,18 +2253,28 @@ def load_feedback_weights(train_df, days_lookback=30):
     eval_df['pitcher'] = pd.to_numeric(eval_df.get('pitcher', None), errors='coerce')
     eval_df = eval_df.dropna(subset=['batter', 'pitcher', 'actual_hr', 'pred_hr_prob'])
 
-    # Missed HR: batter actually hit HR but model gave low probability
-    # LOWERED THRESHOLD from 0.15 to 0.10 to catch more conservative misses
+    # ASYMMETRIC LEARNING: Learn from FAILURES >> SUCCESSES
+    # Philosophy: Model already knows to predict correctly. Focus on what it MISSED.
+    # Failures are 3-5x more impactful than successes.
+    
+    # Missed HRs: prob < 0.10 but HR happened (critical failure)
     eval_df['missed_hr'] = ((eval_df['actual_hr'] == 1) & (eval_df['pred_hr_prob'] < 0.10)).astype(int)
-    # False positive: high probability but no HR
+    # False positives: prob > 0.25 but no HR (false confidence failure)
     eval_df['false_pos'] = ((eval_df['actual_hr'] == 0) & (eval_df['pred_hr_prob'] > 0.25)).astype(int)
+    # Correct skeptical: prob < 0.05, no HR (minimal reinforcement - already working)
+    eval_df['correct_skeptical'] = ((eval_df['actual_hr'] == 0) & (eval_df['pred_hr_prob'] < 0.05)).astype(int)
+    # Correct confident: prob > 0.15, HR happened (minimal reinforcement - already working)
+    eval_df['correct_confident'] = ((eval_df['actual_hr'] == 1) & (eval_df['pred_hr_prob'] > 0.15)).astype(int)
 
     batter_feedback = eval_df.groupby('batter').agg(
         bat_missed=('missed_hr', 'sum'),
-        bat_false_pos=('false_pos', 'sum')
+        bat_false_pos=('false_pos', 'sum'),
+        bat_correct_skeptical=('correct_skeptical', 'sum'),
+        bat_correct_confident=('correct_confident', 'sum')
     ).reset_index()
     pitcher_feedback = eval_df.groupby('pitcher').agg(
-        pit_missed=('missed_hr', 'sum')
+        pit_missed=('missed_hr', 'sum'),
+        pit_false_pos=('false_pos', 'sum')
     ).reset_index()
 
     merged = train_df[['batter', 'pitcher']].copy().reset_index()
@@ -2194,14 +2282,35 @@ def load_feedback_weights(train_df, days_lookback=30):
     merged = merged.merge(pitcher_feedback, on='pitcher', how='left')
     merged = merged.fillna(0)
 
-    # INCREASED UPWEIGHTING: Boost missed HRs more aggressively (was 0.6, now 1.5)
-    # This tells the model: "You're missing these HRs, fix it by being more sensitive"
-    # 1.5x per missed HR + 0.6x per pitcher miss catches power spikes effectively
-    boost = 1.0 + (merged['bat_missed'] * 1.5) + (merged['pit_missed'] * 0.6) - (merged['bat_false_pos'] * 0.1)
-    boost = boost.clip(lower=0.5, upper=8.0)
+    # ASYMMETRIC WEIGHTING: Failures >> Successes (3-5x impact ratio)
+    # 
+    # FAILURES (aggressive upweighting):
+    #   missed_hr: 3.0x (was 1.5x) - CRITICAL: missed HRs demand heavy learning
+    #   pit_missed: 1.5x (was 0.6x) - pitcher degradation pattern learning
+    #   false_pos: -0.5x (was -0.2x) - strong penalty for false confidence
+    #   pit_false_pos: -0.4x (was -0.15x) - pitcher false confidence penalty
+    #
+    # SUCCESSES (minimal reinforcement):
+    #   correct_skeptical: 0.0x (was 0.8x) - don't reinforce, already working
+    #   correct_confident: 0.3x (was 1.2x) - tiny reinforcement only
+    #
+    # Result: Failures are ~10x more impactful than successes
+    
+    boost = (1.0 
+             + (merged['bat_missed'] * 3.0)              # FAILURES: Very aggressive on misses
+             + (merged['pit_missed'] * 1.5)              # FAILURES: Pitcher pattern
+             - (merged['bat_false_pos'] * 0.5)           # FAILURES: Strong false confidence penalty
+             - (merged['pit_false_pos'] * 0.4)           # FAILURES: Pitcher false confidence
+             + (merged['bat_correct_skeptical'] * 0.0)   # SUCCESS: Don't reinforce (already works)
+             + (merged['bat_correct_confident'] * 0.3))  # SUCCESS: Minimal reinforcement only
+    boost = boost.clip(lower=0.5, upper=15.0)
 
     result = pd.Series(boost.values, index=merged['index'])
-    return result.reindex(train_df.index).fillna(1.0).values
+    final_weights = result.reindex(train_df.index).fillna(1.0).values
+    missed_upweighted = int((final_weights > 2.0).sum())
+    false_pos_penalized = int((final_weights < 1.0).sum())
+    print(f"✅ Asymmetric learning: {missed_upweighted} heavily upweighted (FAILURES), {false_pos_penalized} penalized (FALSE CONFIDENCE)")
+    return final_weights
 
 
 # =====================================================================
@@ -2338,8 +2447,12 @@ def generate_daily_predictions():
             print(f"   • Missed predictions: {insights['missed_predictions']} (will upweight in training)")
     except ImportError:
         print("⚠️  analyze_hr_patterns module not found, skipping pattern learning")
+        if ERROR_TRACKER:
+            log_warning("pattern_learning", "analyze_hr_patterns import", "Module not found - non-critical")
     except Exception as e:
         print(f"⚠️  HR pattern learning failed: {e}")
+        if ERROR_TRACKER:
+            log_error("pattern_learning", "analyze_yesterdays_hrs_and_learn", e, "WARNING")
     
     # =====================================================================
     # PHASE 0.5: BASEBALL SAVANT LINEUP VERIFICATION
@@ -2361,6 +2474,8 @@ def generate_daily_predictions():
             print("⚠️  baseball_savant module not available, skipping lineup check")
     except Exception as e:
         print(f"⚠️  Lineup verification failed: {e}")
+        if ERROR_TRACKER:
+            log_error("lineup_check", "check_lineups_morning", e, "WARNING")
     
     # =====================================================================
     # PHASE 1: LOAD TRAINING DATA
@@ -2368,7 +2483,13 @@ def generate_daily_predictions():
     print("\n" + "="*70)
     print("PHASE 1: LOADING TRAINING DATA")
     print("="*70)
-    b_stats, p_stats, raw_pa, pitch_statcast_df = get_advanced_hr_metrics(days_back=60)
+    try:
+        b_stats, p_stats, raw_pa, pitch_statcast_df = get_advanced_hr_metrics(days_back=60)
+        print(f"✅ Training data loaded: {len(raw_pa)} plate appearances")
+    except Exception as e:
+        if ERROR_TRACKER:
+            log_error("data_loading", "get_advanced_hr_metrics", e, "CRITICAL")
+        raise
     
     # Store raw Statcast data for professional bettor feature calculations
     statcast_df = pitch_statcast_df.copy()
@@ -2390,6 +2511,8 @@ def generate_daily_predictions():
             evaluate_saved_predictions(yesterday_str)
         except Exception as _e:
             print(f"Auto-evaluation skipped: {_e}")
+            if ERROR_TRACKER:
+                log_error("evaluation", f"evaluate_saved_predictions({yesterday_str})", _e, "WARNING")
 
     sample_weights = load_feedback_weights(train_df)
     missed_count = int((sample_weights > 1.2).sum())

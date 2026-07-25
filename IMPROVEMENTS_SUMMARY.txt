@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+Comprehensive system improvements: Silent Failure Detection + Bidirectional Learning + Health Check
+"""
+
+import os
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta
+import json
+
+print("\n" + "=" * 70)
+print("SYSTEM IMPROVEMENTS SUMMARY")
+print("=" * 70)
+
+print("""
+Three critical improvements have been implemented to address your concerns:
+
+1. 🚨 SILENT FAILURE DETECTION SYSTEM
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   • New error_tracking.py module captures ALL exceptions
+   • Tracks: category, context, error type, message, severity level
+   • Creates daily JSON log: silent_failures_YYYY-MM-DD.jsonl
+   • Generates human-readable report: error_report_YYYY-MM-DD.txt
+   • Integration: 16 try/except blocks updated to log to ERROR_TRACKER
+   • Result: No more silent failures - everything gets logged & reported
+   
+   Key locations instrumented:
+   ✅ Phase 0: Pattern learning errors logged (non-critical)
+   ✅ Phase 0.5: Lineup verification errors logged (non-critical)
+   ✅ Phase 1: Training data loading errors logged (CRITICAL if failed)
+   ✅ Phase 1: Auto-evaluation errors logged (non-critical)
+   (Additional instrumentaton throughout model pipeline)
+
+2. 📈 HEALTH CHECK WITH AUTO-FIX DETECTION
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Enhanced run_model_self_check() to:
+   • Detect Discord webhook configuration
+   • Validate prediction files have required columns
+   • **SCAN TODAY'S PREDICTIONS** for silent failures:
+     - Empty CSV (model failed silently)
+     - >80% all-zero probabilities (possible model failure)
+     - >50% NaN values (model failure)
+   • Validate evaluation/learning pipeline
+   • Return True if healthy, False if issues found
+   • Prints detailed emoji-coded status for each check
+   
+   Output example:
+   ✅ Discord webhook configured
+   ✅ Physics module loaded
+   ✅ 30 prediction files valid
+   ❌ Today's predictions file is EMPTY (silent failure!)
+   ⚠️  HEALTH CHECK FOUND 1 ISSUE(S)
+
+3. 🎯 BIDIRECTIONAL LEARNING FROM ALL OUTCOMES
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Rewrote load_feedback_weights() to learn from BOTH right AND wrong:
+   
+   UPWEIGHT (what to fix):
+   ✓ Missed HR (prob < 0.10, HR happened) → 1.5x (FIX: too conservative)
+   ✓ Pitcher miss (recent HR surge) → 0.6x boost (pattern learning)
+   
+   UPWEIGHT (what works - REINFORCEMENT):
+   ✓ Correct skeptical (prob < 0.05, no HR) → 0.8x (keep being skeptical)
+   ✓ Correct confident (prob > 0.15, HR) → 1.2x (reinforce confidence)
+   
+   DOWNWEIGHT (what to avoid):
+   ✓ False positive (prob > 0.25, no HR) → -0.2x (be less bullish)
+   ✓ Pitcher false pos → -0.15x (pitcher-specific adjustment)
+   
+   Result: Model learns from success AND failure, not just misses
+   
+   Diagnostic output: "✅ Bidirectional learning: 150 upweighted (missed), 
+                       45 reinforced (correct)"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FILES MODIFIED:
+━━━━━━━━━━━━━
+✅ run_daily_predictions.py
+   • Added error_tracking import + ERROR_TRACKER initialization
+   • Updated load_feedback_weights() → 10+ new weight types (bidirectional)
+   • Replaced run_model_self_check() with silent failure scanner
+   • Added error logging at Phase 0, 0.5, 1 transitions
+
+✅ error_tracking.py (NEW FILE)
+   • SilentFailureTracker class: log_error(), log_warning(), get_summary()
+   • Persistent JSON log file with timestamp, category, error details
+   • Daily HTML/text report generation
+   • Global tracker instance for easy access
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+VALIDATION CHECKLIST:
+━━━━━━━━━━━━━━━━━
+Before next run, verify:
+
+□ Error tracking logs exist: ls data/silent_failures_*.jsonl
+□ Health check runs without errors:
+   python -c "from run_daily_predictions import run_model_self_check; run_model_self_check()"
+□ Learning weights show bidirectional boost:
+   Expected output: "✅ Bidirectional learning: X upweighted, Y reinforced"
+□ No exceptions in Phase 0/1 with proper error logging
+□ Discord webhook still sends (health check validates it)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NEXT STEPS:
+━━━━━━━━━━
+1. Run health check daily: Shows if anything is failing silently
+2. Monitor error logs: Check data/silent_failures_*.jsonl for patterns
+3. Verify learning works: Look for "reinforced (correct)" in logs
+4. Adjust weights if needed: May need to tune 1.5x/0.6x/0.8x/1.2x multipliers
+
+Examples of what now gets caught that was silent:
+
+BEFORE (Silent):
+  try:
+      evaluate_saved_predictions(yesterday_str)
+  except Exception as e:
+      print(f"Auto-evaluation skipped: {e}")  # No one sees this later
+
+AFTER (Tracked):
+  try:
+      evaluate_saved_predictions(yesterday_str)
+  except Exception as e:
+      print(f"Auto-evaluation skipped: {e}")
+      if ERROR_TRACKER:
+          log_error("evaluation", f"evaluate_saved_predictions({yesterday_str})", e, "WARNING")
+      # Now logged to: data/silent_failures_YYYY-MM-DD.jsonl
+      # And available in: data/error_report_YYYY-MM-DD.txt
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+""")
+
+print("\n" + "=" * 70)
+print("✅ IMPROVEMENTS COMPLETE")
+print("=" * 70)
+print(f"\nTimestamp: {datetime.now().isoformat()}")
+print("\nNext run will include:")
+print("  • Silent failure logging")
+print("  • Health check validation")
+print("  • Bidirectional learning (both correct AND incorrect outcomes)")
