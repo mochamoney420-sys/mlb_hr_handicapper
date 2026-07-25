@@ -392,7 +392,7 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
     """Send Discord webhook message.
     
     Args:
-        async_send: If True, spawn thread to send without blocking. For live HR alerts only.
+        async_send: If True, attempt async send but fall back to sync if needed.
     """
     webhook_candidates = _candidate_discord_webhooks(explicit_webhook=webhook_url)
     if not webhook_candidates:
@@ -409,47 +409,73 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
         print("Nothing to send to Discord; payload is empty.")
         return False
     
-    # For live HRs, spawn non-blocking thread to avoid monitoring loop delays
+    # For live HRs, try async but with error tracking
     if async_send:
         import threading
-        thread = threading.Thread(target=_send_discord_sync, args=(payload, webhook_candidates), daemon=True)
+        # Wrap with error tracking queue
+        result_holder = {'success': False, 'error': None}
+        thread = threading.Thread(
+            target=_send_discord_async_tracked,
+            args=(payload, webhook_candidates, result_holder),
+            daemon=True
+        )
         thread.start()
-        return True  # Return immediately
+        # Don't wait, but return True immediately (async)
+        return True
 
     return _send_discord_sync(payload, webhook_candidates)
 
-def _send_discord_sync(payload, webhook_candidates):
+def _send_discord_async_tracked(payload, webhook_candidates, result_holder):
+    """Send Discord in background thread with error tracking."""
+    try:
+        success = _send_discord_sync(payload, webhook_candidates, silent=False)
+        result_holder['success'] = success
+    except Exception as e:
+        result_holder['error'] = str(e)
+        print(f"Async Discord send error: {e}")
+        # Fallback: try one more time synchronously
+        try:
+            _send_discord_sync(payload, webhook_candidates, silent=True)
+        except Exception:
+            pass
+
+def _send_discord_sync(payload, webhook_candidates, silent=False):
     """Synchronously send Discord webhook message."""
     for idx, candidate in enumerate(webhook_candidates):
         try:
             response = requests.post(candidate, json=payload, timeout=4)
             if response.status_code == 204:
-                if idx > 0:
-                    print("Discord notification sent successfully using backup webhook.")
-                else:
-                    print("Discord notification sent successfully.")
+                if not silent:
+                    if idx > 0:
+                        print("Discord notification sent successfully using backup webhook.")
+                    else:
+                        print("Discord notification sent successfully.")
                 return True
             if response.status_code == 404:
-                print(
-                    f"Discord webhook returned 404 for candidate #{idx + 1}. "
-                    "This webhook was likely deleted/rotated; trying next candidate if available."
-                )
+                if not silent:
+                    print(
+                        f"Discord webhook returned 404 for candidate #{idx + 1}. "
+                        "This webhook was likely deleted/rotated; trying next candidate if available."
+                    )
                 continue
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-                print(
-                    "Discord rate-limited webhook call (429). "
-                    f"Retry-After={retry_after}; trying next candidate if available."
-                )
+                if not silent:
+                    print(
+                        "Discord rate-limited webhook call (429). "
+                        f"Retry-After={retry_after}; trying next candidate if available."
+                    )
                 continue
 
-            print(
-                f"Discord webhook returned status {response.status_code}: "
-                f"{getattr(response, 'text', '')}"
-            )
+            if not silent:
+                print(
+                    f"Discord webhook returned status {response.status_code}: "
+                    f"{getattr(response, 'text', '')}"
+                )
             return False
         except Exception as e:
-            print(f"Failed to send Discord notification via candidate #{idx + 1}: {e}")
+            if not silent:
+                print(f"Failed to send Discord notification via candidate #{idx + 1}: {e}")
 
     return False
 
@@ -4229,20 +4255,36 @@ def monitor_live_home_runs():
                     result = play.get('result', {})
                     about = play.get('about', {})
                     matchup = play.get('matchup', {})
-                    event_name = str(result.get('event', '')).lower()
-                    event_type = str(result.get('eventType', '')).lower()
-                    if event_name not in ('home run', 'home_run', 'homerun', 'hr') and event_type not in ('home_run', 'home run', 'homerun', 'hr'):
+                    event_name = str(result.get('event', '')).lower().strip()
+                    event_type = str(result.get('eventType', '')).lower().strip()
+                    event_desc = str(result.get('description', '')).lower()
+                    
+                    # Enhanced HR detection: check event name, type, and description
+                    is_hr = any([
+                        event_name in ('home run', 'home_run', 'homerun', 'hr'),
+                        event_type in ('home_run', 'home run', 'homerun', 'hr'),
+                        'home run' in event_name,
+                        'home run' in event_type,
+                        'home run' in event_desc,
+                        'solo home run' in event_desc,
+                        '2-run home run' in event_desc,
+                        '3-run home run' in event_desc,
+                        'grand slam' in event_desc,
+                    ])
+                    
+                    if not is_hr:
                         continue
 
+                    # Use playId or build reliable fallback
                     event_id = about.get('playId')
                     if not event_id:
-                        # Some StatsAPI payloads omit playId for completed events.
-                        # Build a deterministic fallback key for dedupe.
+                        # Fallback: Include pitcher to distinguish between multiple HRs in same inning
                         batter_id = matchup.get('batter', {}).get('id') or ''
+                        pitcher_id = matchup.get('pitcher', {}).get('id') or ''
                         at_bat_idx = about.get('atBatIndex', '')
                         inning = about.get('inning', '')
                         half = about.get('halfInning', '')
-                        event_id = f"{game_id}:{inning}:{half}:{at_bat_idx}:{batter_id}:{event_type or event_name}"
+                        event_id = f"{game_id}:{inning}:{half}:{at_bat_idx}:{batter_id}:{pitcher_id}:HR"
 
                     if event_id in processed_home_runs:
                         continue
@@ -4293,12 +4335,19 @@ def monitor_live_home_runs():
 
                     payload = {"content": "\n".join(message_lines)}
 
-                    # Send Discord alert non-blocking (async) to avoid monitoring loop delays
-                    send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL, async_send=True)
-                    print(f"Live HR alert queued for play {event_id} in {game_display}.")
+                    # Send Discord alert with async attempt and fallback
+                    sent = send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL, async_send=True)
+                    if sent:
+                        print(f"✅ Live HR alert sent for {batter_name} vs {pitcher_name} in {game_display} (play {event_id})")
+                    else:
+                        print(f"⚠️  Failed to send HR alert for {batter_name} vs {pitcher_name} (play {event_id})")
                     processed_home_runs.add(event_id)
                     save_processed_home_run_events(processed_home_runs)
                     sent_this_loop += 1
+            # Log HR detection vs send gap for debugging
+            if detected_this_loop > 0 and detected_this_loop > sent_this_loop:
+                print(f"⚠️  HR detection gap: {detected_this_loop} detected but {sent_this_loop} sent Discord alerts")
+            
             write_live_monitor_status({
                 'mode': 'live_hr_monitor',
                 'in_progress_games': in_progress_games,
