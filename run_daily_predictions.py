@@ -396,11 +396,12 @@ def _candidate_discord_webhooks(explicit_webhook=None):
     return list(dict.fromkeys(normalized))
 
 
-def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send=False):
+def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send=False, retries=3):
     """Send Discord webhook message.
     
     Args:
         async_send: If True, attempt async send but fall back to sync if needed.
+        retries: Number of retry attempts for sync sends (default 3 for live HRs).
     """
     webhook_candidates = _candidate_discord_webhooks(explicit_webhook=webhook_url)
     if not webhook_candidates:
@@ -431,7 +432,14 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
         # Don't wait, but return True immediately (async)
         return True
 
-    return _send_discord_sync(payload, webhook_candidates)
+    # Synchronous send with retry
+    for attempt in range(retries):
+        result = _send_discord_sync(payload, webhook_candidates)
+        if result:
+            return True
+        if attempt < retries - 1:
+            time.sleep(0.5)  # Brief backoff between retries
+    return False
 
 def _send_discord_async_tracked(payload, webhook_candidates, result_holder):
     """Send Discord in background thread with error tracking."""
@@ -3345,8 +3353,8 @@ def generate_daily_predictions():
             print(top_ev.to_string(index=False))
     top_ev = _annotate_time_windows(top_ev)
 
-    print(f"\nTop {min(5, len(top_prob))} Daily Projected HR Probabilities:")
-    print(top_prob.head(5).to_string(index=False))
+    print(f"\nMost Likely Homers (≥{discord_min_prob*100:.0f}% confidence) - {len(top_prob)} candidates:")
+    print(top_prob.to_string(index=False))
     print(f"\nRadar Coverage: {len(radar)} additional candidates")
 
     # =====================================================================
@@ -3397,7 +3405,7 @@ def generate_daily_predictions():
     summary_lines = [
         f"\u26be MLB HR MODEL SNAPSHOT ({target_date})",
         f"Candidates ranked: {len(rankings)}",
-        f"Delivered top probability picks: {len(top_prob)}",
+        f"Most Likely Homers: {len(top_prob)} candidates ≥{discord_min_prob*100:.0f}% confidence",
         f"Delivered radar picks: {len(radar)}",
         f"Delivered +EV picks: {len(top_ev)}",
         f"Time windows: <= {discord_window_1_hours}h, <= {discord_window_2_hours}h, later",
@@ -3409,7 +3417,7 @@ def generate_daily_predictions():
         print("No predictions available to send to Discord.")
         return live
 
-    sent_prob = _post_pick_table_batches(top_prob, f"\u26be Top Probability HR Picks (Top {len(top_prob)})")
+    sent_prob = _post_pick_table_batches(top_prob, f"⚾ Most Likely Homers ({len(top_prob)} candidates ≥{discord_min_prob*100:.0f}%)")
     sent_ev = True
     sent_radar = _post_pick_table_batches(radar, f"\U0001f535 HR Radar Picks (Physics Movers & Sleepers) ({len(radar)})")
     if not top_ev.empty:
@@ -3500,7 +3508,7 @@ def monitor_odds_rlm():
 # ==========================================
 def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_inning):
     """Check today's predictions for the HR batter, log outcome to live_feedback CSV,
-    and return (model_prob, was_predicted, was_top5, model_rank) for Discord annotation."""
+    and return (model_prob, was_predicted, was_most_likely_homer, model_rank) for Discord annotation."""
     today_str = datetime.today().strftime('%Y-%m-%d')
     pred_file = Path('data') / f'predictions_{today_str}.csv'
 
@@ -3508,7 +3516,7 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
     batter_id = None
     pitcher_id = None
     was_predicted = False
-    was_top5 = False
+    was_most_likely_homer = False
     model_rank = None
 
     if pred_file.exists():
@@ -3521,8 +3529,10 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
                 batter_id = row.get('batter')
                 pitcher_id = row.get('pitcher')
                 was_predicted = model_prob >= 0.15
-                top5_names = preds.nlargest(5, 'pred_hr_prob')['batter_name'].str.lower().str.strip().tolist()
-                was_top5 = batter_name.lower().strip() in top5_names
+                # Most Likely Homers: all batters model thinks have >= 12% chance (not fixed top 5)
+                most_likely_threshold = 0.12
+                most_likely_names = preds[preds['pred_hr_prob'] >= most_likely_threshold]['batter_name'].str.lower().str.strip().tolist()
+                was_most_likely_homer = batter_name.lower().strip() in most_likely_names
                 model_rank = int((preds['pred_hr_prob'] > model_prob).sum() + 1)
         except Exception:
             pass
@@ -3538,7 +3548,7 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
         'inning': f'{inning_half} {num_inning}',
         'model_prob': model_prob if model_prob is not None else '',
         'was_predicted': was_predicted,
-        'was_top5': was_top5,
+        'was_most_likely_homer': was_most_likely_homer,
         'actual_hr': 1
     }
 
@@ -3550,7 +3560,7 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
     else:
         fb_df.to_csv(feedback_file, index=False)
 
-    return model_prob, was_predicted, was_top5, model_rank
+    return model_prob, was_predicted, was_most_likely_homer, model_rank
 
 
 def _live_hr_processed_path(date_str=None):
@@ -4280,6 +4290,7 @@ def monitor_live_home_runs():
         raise RuntimeError("DISCORD_MLB_WEBHOOK or DISCORD_WEBHOOK_URL not set; configure env var or GitHub secret")
 
     print("🚀 Monitoring started: Waiting for live MLB home run events...")
+    print(f"📡 Discord webhook: {WEBHOOK_URL[:30]}...{WEBHOOK_URL[-10:] if len(WEBHOOK_URL) > 40 else ''}")
     print("⚡ Micro-signal engine enabled: release-axis tilt, odds inversion, predictable count windows")
     processed_home_runs = load_processed_home_run_events()
     micro_alert_keys = set()
@@ -4422,10 +4433,10 @@ def monitor_live_home_runs():
                     alert_ts = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')
 
                     # Log live outcome against today's predictions for learning feedback
-                    _model_prob, _was_predicted, _was_top5, _model_rank = None, False, False, None
+                    _model_prob, _was_predicted, _was_most_likely_homer, _model_rank = None, False, False, None
                     if batter_name:
                         try:
-                            _model_prob, _was_predicted, _was_top5, _model_rank = log_live_hr_feedback(
+                            _model_prob, _was_predicted, _was_most_likely_homer, _model_rank = log_live_hr_feedback(
                                 batter_name, pitcher_name, game_id, inning_half, num_inning
                             )
                         except Exception:
@@ -4443,11 +4454,11 @@ def monitor_live_home_runs():
                         message_lines.append(f"\U0001f3af Pitcher: {pitcher_name}")
                     if _model_prob is not None:
                         prob_str = f"{_model_prob * 100:.1f}%"
-                        if _was_top5:
-                            message_lines.append(f"\u2705 **Model called it!** (Prob: {prob_str}) — Top 5 pick")
+                        if _was_most_likely_homer:
+                            message_lines.append(f"\u2705 **Model called it!** (Prob: {prob_str}) — Most Likely Homer")
                         elif _model_rank is not None:
                             message_lines.append(
-                                f"\U0001f4ca Model rank: #{_model_rank} (Prob: {prob_str}) — not a Top 5 list pick"
+                                f"\U0001f4ca Model rank: #{_model_rank} (Prob: {prob_str}) — not in Most Likely Homers"
                             )
                         elif _was_predicted:
                             message_lines.append(f"\u2705 Model signaled HR risk (Prob: {prob_str})")
@@ -4458,29 +4469,32 @@ def monitor_live_home_runs():
 
                     payload = {"content": "\n".join(message_lines)}
 
-                    # Send Discord alert with async attempt and fallback
-                    sent = send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL, async_send=True)
+                    # Send Discord alert synchronously (don't mark as processed until confirmed sent)
+                    sent = send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL, async_send=False)
                     if sent:
-                        print(f"✅ Live HR alert sent for {batter_name} vs {pitcher_name} in {game_display} (play {event_id})")
+                        print(f"✅ Live HR alert CONFIRMED for {batter_name} vs {pitcher_name} in {game_display} (play {event_id})")
+                        processed_home_runs.add(event_id)
+                        save_processed_home_run_events(processed_home_runs)
+                        sent_this_loop += 1
                     else:
-                        print(f"⚠️  Failed to send HR alert for {batter_name} vs {pitcher_name} (play {event_id})")
-                    processed_home_runs.add(event_id)
-                    save_processed_home_run_events(processed_home_runs)
-                    sent_this_loop += 1
+                        print(f"⚠️  FAILED to send HR alert for {batter_name} vs {pitcher_name} (play {event_id}) — will retry next loop")
             # Log HR detection vs send gap for debugging
             if detected_this_loop > 0 and detected_this_loop > sent_this_loop:
                 print(f"⚠️  HR detection gap: {detected_this_loop} detected but {sent_this_loop} sent Discord alerts")
             
+            discord_success_rate = (sent_this_loop / detected_this_loop * 100) if detected_this_loop > 0 else 0
             write_live_monitor_status({
                 'mode': 'live_hr_monitor',
                 'in_progress_games': in_progress_games,
                 'detected_events_this_loop': detected_this_loop,
                 'sent_events_this_loop': sent_this_loop,
+                'discord_success_rate_pct': round(discord_success_rate, 1),
                 'micro_signals_this_loop': micro_signals_this_loop,
                 'processed_event_count': len(processed_home_runs),
                 'odds_players_tracked': len(best_odds_now),
                 'live_monitor_poll_seconds': monitor_sleep_seconds,
                 'live_odds_poll_seconds': odds_poll_seconds,
+                'updated_at': datetime.now().isoformat(),
             })
             time.sleep(monitor_sleep_seconds)
         except Exception as e:
