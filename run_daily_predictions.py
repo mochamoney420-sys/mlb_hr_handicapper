@@ -2113,6 +2113,20 @@ def get_advanced_hr_metrics(days_back=60):
 
     return batter_stats, pitcher_stats, pa_df, pitch_df
 
+# Normalize external wRC+ naming variants to a single feature name.
+def normalize_wrc_plus_feature(df, default_value=100.0):
+    if df is None:
+        return df
+
+    aliases = ['wrc_plus', 'wRC_plus', 'wRC+']
+    wrc_plus = pd.Series(np.nan, index=df.index, dtype='float64')
+    for col in aliases:
+        if col in df.columns:
+            wrc_plus = wrc_plus.fillna(pd.to_numeric(df[col], errors='coerce'))
+
+    df['wrc_plus'] = wrc_plus.fillna(default_value)
+    return df
+
 # =====================================================================
 # SECTION 3: DAILY LIVE LINEUPS FETCHING
 # =====================================================================
@@ -3059,6 +3073,7 @@ def generate_daily_predictions():
     _drop_all = list(set(_b_drop + _p_drop))
     train_df = raw_pa.drop(columns=_drop_all, errors='ignore').merge(b_stats, on='batter', how='inner')
     train_df = train_df.merge(p_stats, on='pitcher', how='inner')
+    train_df = normalize_wrc_plus_feature(train_df)
 
     # Auto-evaluate yesterday's predictions to feed the learning loop
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -3094,6 +3109,7 @@ def generate_daily_predictions():
         # Batter Features (core power + batted ball profile)
         'bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate', 'bat_sweet_spot_rate',
         'bat_hr_fb_rate', 'bat_pull_rate', 'bat_ev90', 'bat_iso_proxy', 'bat_days_since_last_game',
+        'wrc_plus',
         'bat_avg_exit_velocity', 'bat_max_exit_velocity', 'bat_avg_launch_angle',
         'bat_15pa_barrel_rate', 'bat_30pa_barrel_rate',
         'bat_15pa_hard_hit_rate', 'bat_30pa_hard_hit_rate',
@@ -3259,6 +3275,7 @@ def generate_daily_predictions():
     # Join live matchups with player vectors where available (use inner to ensure features exist)
     live = live_matchups.merge(b_stats, on='batter', how='left')
     live = live.merge(p_stats, on='pitcher', how='left')
+    live = normalize_wrc_plus_feature(live)
 
     # Fill missing numeric features with reasonable baselines
     for col in ['bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate', 'bat_sweet_spot_rate']:

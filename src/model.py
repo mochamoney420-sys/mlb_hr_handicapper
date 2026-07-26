@@ -1,6 +1,18 @@
 # src/model.py
 import xgboost as xgb
+import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split
+
+def normalize_wrc_plus_feature(df, default_value=100.0):
+    aliases = ['wrc_plus', 'wRC_plus', 'wRC+']
+    wrc_plus = pd.Series(np.nan, index=df.index, dtype='float64')
+    for col in aliases:
+        if col in df.columns:
+            wrc_plus = wrc_plus.fillna(pd.to_numeric(df[col], errors='coerce'))
+
+    df['wrc_plus'] = wrc_plus.fillna(default_value)
+    return df
 
 def train_hr_model(model_data):
     """
@@ -8,12 +20,13 @@ def train_hr_model(model_data):
     the probability of a player hitting a home run.
     """
     print("Training XGBoost Home Run prediction model...")
+    model_data = normalize_wrc_plus_feature(model_data.copy())
     
     # 1. Select the specific high-density features for prediction
     features = [
         'batter_barrel_rate', 'batter_hard_hit_rate', 'batter_fb_rate', 'batter_pull_rate',
         'pitcher_barrel_rate_allowed', 'pitcher_fb_rate_allowed', 
-        'park_factor_hr', 'temperature', 'wind_speed_outward'
+        'park_factor_hr', 'temperature', 'wind_speed_outward', 'wrc_plus'
     ]
 
     X = model_data[features]

@@ -25,6 +25,7 @@ if __name__ == "__main__":
         'park_factor_hr': [105] * 50,
         'temperature': [82.0] * 50,
         'wind_speed_outward': [12.5] * 50,
+        'wRC_plus': [118.0] * 50,
         'hit_home_run': [0, 1] * 25  # Alternate 0 and 1 targets to satisfy XGBoost criteria
     })
     
