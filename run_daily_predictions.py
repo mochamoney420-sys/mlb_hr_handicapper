@@ -3622,10 +3622,19 @@ def generate_daily_predictions():
             f"(physics={physics_weight:.2f}, base={1 - physics_weight:.2f})"
         )
 
+    # Guard against extreme physics-driven jumps on already-high baseline hitters.
+    physics_uplift_cap = np.where(
+        base_model_probs >= 0.35,
+        0.10,
+        np.where(base_model_probs >= 0.20, 0.12, 0.15)
+    )
+    probs = np.minimum(probs, base_model_probs + physics_uplift_cap)
+
     live['physics_hr_prob'] = physics_probs
     live['blend_weight_physics'] = physics_weight if prob_mode == 'blended' else 0.0
     live['probability_mode'] = prob_mode
     live['physics_delta'] = probs - base_model_probs
+    live['physics_uplift_cap'] = physics_uplift_cap
 
     def _live_num(col, default):
         if col in live.columns:
@@ -3681,6 +3690,20 @@ def generate_daily_predictions():
         debate_rounds = 5000
     live = run_adversarial_debate_layer(live, rounds=debate_rounds)
     probs = np.clip(probs * pd.to_numeric(live.get('adversarial_multiplier', 1.0), errors='coerce').fillna(1.0).values, 0.0, 1.0)
+
+    # Cap stacked post-model boosts so one row cannot dominate the card from layered multipliers.
+    stacked_multiplier_cap = np.where(
+        base_model_probs >= 0.35,
+        1.25,
+        np.where(base_model_probs >= 0.20, 1.35, 1.50)
+    )
+    safe_base = np.clip(base_model_probs, 1e-6, 1.0)
+    observed_multiplier = probs / safe_base
+    capped_multiplier = np.minimum(observed_multiplier, stacked_multiplier_cap)
+    probs = np.clip(safe_base * capped_multiplier, 0.0, 1.0)
+    live['stacked_boost_multiplier_raw'] = observed_multiplier
+    live['stacked_boost_multiplier_cap'] = stacked_multiplier_cap
+    live['stacked_boost_multiplier_final'] = capped_multiplier
 
     # =====================================================================
     # PROFESSIONAL UPGRADE 2: Kelly Criterion with Simulated Probabilities
@@ -3936,9 +3959,12 @@ def generate_daily_predictions():
                                     'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
                                     'kelly_multiplier',
                                     'base_model_prob', 'physics_delta', 'blend_weight_physics', 'probability_mode',
+                                    'physics_uplift_cap',
                                     'adaptive_feedback_multiplier', 'pitcher_fear_factor', 'pitcher_intent_suppression',
                                     'is_elite_power_batter', 'optimist_score', 'pessimist_score', 'debate_rounds',
                                     'optimist_wins', 'pessimist_wins', 'adversarial_margin', 'adversarial_multiplier',
+                                    'stacked_boost_multiplier_raw', 'stacked_boost_multiplier_cap',
+                                    'stacked_boost_multiplier_final',
                                     'best_book', 'best_market_odds_american', 'best_market_implied_prob',
                                     'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
                                     'release_window_sniper_signal', 'line_release_window_flag', 'nrfi_under_drag_score',
