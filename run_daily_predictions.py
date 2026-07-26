@@ -15,6 +15,7 @@ if sys.platform == 'win32':
 # SECTION 1: IMPORTS & ENV LOADING
 # =====================================================================
 import argparse
+import atexit
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -76,18 +77,18 @@ def statcast_with_timeout(start_dt, end_dt, timeout_seconds=30):
     """Call statcast() with a timeout to prevent indefinite hangs."""
     result_queue = Queue()
     error_queue = Queue()
-    
+
     def fetch_data():
         try:
             data = statcast(start_dt=start_dt, end_dt=end_dt)
             result_queue.put(data)
         except Exception as e:
             error_queue.put(e)
-    
+
     thread = Thread(target=fetch_data, daemon=True)
     thread.start()
     thread.join(timeout=timeout_seconds)
-    
+
     if not result_queue.empty():
         return result_queue.get()
     elif not error_queue.empty():
@@ -101,13 +102,13 @@ try:
     from error_tracking import get_tracker, log_error, log_warning
     ERROR_TRACKER = get_tracker()
 except ImportError:
-    print("⚠️  error_tracking module not found; silent failure logging disabled")
+    print("Warning: error_tracking module not found; silent failure logging disabled")
     ERROR_TRACKER = None
 
 # Import Baseball Savant integration
 try:
     from src.baseball_savant import (
-        check_lineups_morning, check_lineups_pregame, 
+        check_lineups_morning, check_lineups_pregame,
         save_lineup_report, get_batted_balls_quality_metrics,
         get_todays_games, get_game_lineups
     )
@@ -275,94 +276,6 @@ def get_pitcher_recent_form(df, pitcher_id, lookback_games=5):
         return 1.0
     except:
         return 1.0
-
-def apply_park_adjustment(prob, batter_hand, home_team, away_team):
-    """IMPROVEMENT #3: Park-Adjusted Metrics
-    Adjusts probability based on home park HR-friendliness"""
-    try:
-        home_factor = PARK_HR_FACTORS.get(home_team, 100) / 100.0
-        # Home batters get park factor, away batters get inverse
-        multiplier = home_factor
-        adjusted = prob * multiplier
-        return max(0.01, min(0.99, adjusted))
-    except:
-        return prob
-
-def calculate_confidence_interval(prob, sample_size=100):
-    """IMPROVEMENT #4: Model Calibration - Confidence Intervals
-    Returns (lower, upper) bounds at 95% confidence"""
-    try:
-        if sample_size < 5:
-            return (max(0.01, prob - 0.1), min(0.99, prob + 0.1))
-        std_error = math.sqrt((prob * (1 - prob)) / sample_size)
-        z_score = 1.96  # 95% CI
-        lower = max(0.01, prob - (z_score * std_error))
-        upper = min(0.99, prob + (z_score * std_error))
-        return (lower, upper)
-    except:
-        return (prob * 0.8, prob * 1.2)
-
-def get_batter_consistency(df, batter_id):
-    """IMPROVEMENT #8: Volatility-Weighted Features
-    Returns consistency score (0-1): higher = more consistent"""
-    try:
-        batter_data = df[df['batter'] == batter_id]
-        if len(batter_data) < 10:
-            return 0.5
-        game_hr_rates = batter_data.groupby('game_pk')['is_hr'].mean()
-        std_dev = game_hr_rates.std()
-        mean_hr = game_hr_rates.mean()
-        if mean_hr > 0:
-            cv = std_dev / mean_hr  # Coefficient of variation
-            consistency = 1.0 / (1.0 + cv)  # Convert to 0-1 scale
-            return max(0.0, min(1.0, consistency))
-        return 0.5
-    except:
-        return 0.5
-
-def apply_time_decay_weight(date_val, reference_date, half_life_days=14):
-    """IMPROVEMENT #9: Time Decay on Training Data
-    More recent data gets higher weight"""
-    try:
-        days_old = (reference_date - pd.to_datetime(date_val)).days
-        if days_old < 0:
-            return 1.0
-        weight = 2.0 ** (-days_old / half_life_days)  # Exponential decay
-        return max(0.1, min(1.0, weight))
-    except:
-        return 1.0
-
-def estimate_model_reliability(pred_prob, consistency_score, sample_size):
-    """IMPROVEMENT #4: Confidence/Reliability Level
-    Returns: 'HIGH', 'MEDIUM', or 'LOW' confidence"""
-    try:
-        # Reliability based on probability extremes, consistency, and sample
-        if pred_prob < 0.05 or pred_prob > 0.95:
-            return 'LOW'  # Very confident predictions unreliable
-        if consistency_score < 0.4 or sample_size < 20:
-            return 'LOW'
-        if consistency_score > 0.7 and sample_size > 50 and 0.15 < pred_prob < 0.85:
-            return 'HIGH'
-        return 'MEDIUM'
-    except:
-        return 'MEDIUM'
-
-def check_batter_injury_status(batter_name):
-    """IMPROVEMENT #5: Injury/Roster Monitor
-    Flag if batter is likely injured or benched"""
-    # In production, would query MLB APIs for current roster status
-    # For now, returns safe default
-    return False
-
-def get_count_fastball_tendency(pitcher_id, count_str, tendency_lookup=None):
-    """IMPROVEMENT #6: Live Count-Based Adjustment
-    Returns likelihood pitcher throws fastball in given count"""
-    if not tendency_lookup or pitcher_id not in tendency_lookup:
-        return 0.55  # League average fastball rate
-    count_data = tendency_lookup.get(pitcher_id, {}).get(count_str, {})
-    return count_data.get('fastball_rate', 0.55)
-
-# =====================================================================
 # HELPER: DYNAMIC LIVE WEATHER PARSER
 # =====================================================================
 def get_live_weather(lat, lon):
@@ -2614,6 +2527,81 @@ def _tv_distance(vec_a, vec_b):
     return 0.5 * sum(abs(float(vec_a.get(k, 0.0)) - float(vec_b.get(k, 0.0))) for k in keys)
 
 
+
+def apply_park_adjustment(prob, batter_hand, home_team, away_team):
+    """IMPROVEMENT #3: Park-Adjusted Metrics
+    Adjusts probability based on home park HR-friendliness"""
+    try:
+        home_factor = PARK_HR_FACTORS.get(home_team, 100) / 100.0
+        multiplier = home_factor
+        adjusted = prob * multiplier
+        return max(0.01, min(0.99, adjusted))
+    except:
+        return prob
+
+
+def calculate_confidence_interval(prob, sample_size=100):
+    """IMPROVEMENT #4: Model Calibration - Confidence Intervals
+    Returns (lower, upper) bounds at 95% confidence"""
+    try:
+        if sample_size < 5:
+            return (max(0.01, prob - 0.1), min(0.99, prob + 0.1))
+        std_error = math.sqrt((prob * (1 - prob)) / sample_size)
+        z_score = 1.96
+        lower = max(0.01, prob - (z_score * std_error))
+        upper = min(0.99, prob + (z_score * std_error))
+        return (lower, upper)
+    except:
+        return (prob * 0.8, prob * 1.2)
+
+
+def get_batter_consistency(df, batter_id):
+    """IMPROVEMENT #8: Volatility-Weighted Features
+    Returns consistency score (0-1): higher = more consistent"""
+    try:
+        batter_data = df[df['batter'] == batter_id]
+        if len(batter_data) < 10:
+            return 0.5
+        game_hr_rates = batter_data.groupby('game_pk')['is_hr'].mean()
+        std_dev = game_hr_rates.std()
+        mean_hr = game_hr_rates.mean()
+        if mean_hr > 0:
+            cv = std_dev / mean_hr
+            consistency = 1.0 / (1.0 + cv)
+            return max(0.0, min(1.0, consistency))
+        return 0.5
+    except:
+        return 0.5
+
+
+def apply_time_decay_weight(date_val, reference_date, half_life_days=14):
+    """IMPROVEMENT #9: Time Decay on Training Data
+    More recent data gets higher weight"""
+    try:
+        days_old = (reference_date - pd.to_datetime(date_val)).days
+        if days_old < 0:
+            return 1.0
+        weight = 2.0 ** (-days_old / half_life_days)
+        return max(0.1, min(1.0, weight))
+    except:
+        return 1.0
+
+
+def estimate_model_reliability(pred_prob, consistency_score, sample_size):
+    """IMPROVEMENT #4: Confidence/Reliability Level
+    Returns: 'HIGH', 'MEDIUM', or 'LOW' confidence"""
+    try:
+        if pred_prob < 0.05 or pred_prob > 0.95:
+            return 'LOW'
+        if consistency_score < 0.4 or sample_size < 20:
+            return 'LOW'
+        if consistency_score > 0.7 and sample_size > 50 and 0.15 < pred_prob < 0.85:
+            return 'HIGH'
+        return 'MEDIUM'
+    except:
+        return 'MEDIUM'
+
+
 def run_post_mortem_backpropagation(days_lookback=7):
     """Closed-loop post-mortem layer that rewrites adaptive coefficients.
 
@@ -4366,6 +4354,103 @@ def save_processed_home_run_events(processed_ids, date_str=None):
         pass
 
 
+def _normalize_half_inning_label(value):
+    text = str(value or '').strip().lower()
+    if text.startswith('t'):
+        return 'top'
+    if text.startswith('b'):
+        return 'bottom'
+    return text or 'unknown'
+
+
+def _build_fallback_hr_event_id(game_id, inning, half_inning, at_bat_idx, batter_id, pitcher_id):
+    return f"{game_id}:{inning}:{_normalize_half_inning_label(half_inning)}:{at_bat_idx}:{batter_id}:{pitcher_id}:HR"
+
+
+def _build_fallback_hr_event_id_from_statcast_row(row):
+    game_id = _safe_int(row.get('game_pk'))
+    inning = _safe_int(row.get('inning'))
+    half_inning = row.get('inning_topbot') or row.get('half_inning') or row.get('inning_half') or ''
+    at_bat_idx = _safe_int(row.get('at_bat_number')) or _safe_int(row.get('atBatIndex')) or ''
+    batter_id = _safe_int(row.get('batter'))
+    pitcher_id = _safe_int(row.get('pitcher'))
+    if game_id is None or inning is None or batter_id is None or pitcher_id is None:
+        return None
+    return _build_fallback_hr_event_id(game_id, inning, half_inning, at_bat_idx, batter_id, pitcher_id)
+
+
+def backfill_unprocessed_today_home_runs(processed_home_runs, webhook_url):
+    """Reconcile today's Statcast HR feed against processed IDs and send any missed alerts."""
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    try:
+        sc = load_or_fetch_statcast(today_str)
+    except Exception as e:
+        print(f"Live HR backfill skipped: {e}")
+        return 0
+
+    if sc is None or sc.empty or 'events' not in sc.columns:
+        return 0
+
+    hr_rows = sc[sc['events'] == 'home_run'].copy()
+    if hr_rows.empty:
+        return 0
+
+    sent_count = 0
+    hr_rows['fallback_event_id'] = hr_rows.apply(_build_fallback_hr_event_id_from_statcast_row, axis=1)
+    hr_rows = hr_rows[hr_rows['fallback_event_id'].notna()].copy()
+
+    for _, row in hr_rows.iterrows():
+        fallback_event_id = str(row.get('fallback_event_id'))
+        if fallback_event_id in processed_home_runs:
+            continue
+
+        batter_name = str(row.get('batter_name') or row.get('player_name') or row.get('batter') or 'Unknown Batter')
+        pitcher_name = str(row.get('pitcher_name') or row.get('pitcher') or 'Unknown Pitcher')
+        inning_half = str(row.get('inning_topbot') or row.get('half_inning') or row.get('inning_half') or '')
+        num_inning = _safe_int(row.get('inning')) or 0
+        game_id = _safe_int(row.get('game_pk'))
+
+        # Reuse learning feedback so the catch-up event is indistinguishable from live detection.
+        model_prob, was_predicted, was_most_likely_homer, model_rank = log_live_hr_feedback(
+            batter_name, pitcher_name, game_id, inning_half, num_inning
+        )
+
+        alert_ts = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')
+        message_lines = [
+            "🚨 **LIVE HOME RUN ALERT** 🚨",
+            f"⏰ Time: {alert_ts}",
+            f"🏟️ *{row.get('home_team','Home')} @ {row.get('away_team','Away')}* ({inning_half} {num_inning})",
+            "⚾ Backfill reconciliation caught a missed HR event",
+        ]
+        if batter_name:
+            message_lines.append(f"👤 Batter: {batter_name}")
+        if pitcher_name:
+            message_lines.append(f"🎯 Pitcher: {pitcher_name}")
+        if model_prob is not None:
+            prob_str = f"{model_prob * 100:.1f}%"
+            if was_most_likely_homer:
+                message_lines.append(f"✅ **Model called it!** (Prob: {prob_str}) — Most Likely Homer")
+            elif model_rank is not None:
+                message_lines.append(f"📊 Model rank: #{model_rank} (Prob: {prob_str})")
+            elif was_predicted:
+                message_lines.append(f"✅ Model signaled HR risk (Prob: {prob_str})")
+            else:
+                message_lines.append(f"⚠️ Model missed (had: {prob_str}) — logged for retraining")
+
+        sent = send_discord_webhook(content="\n".join(message_lines), webhook_url=webhook_url, async_send=False)
+        if sent:
+            processed_home_runs.add(fallback_event_id)
+            processed_home_runs.add(f"{game_id}:{row.get('inning')}:{_normalize_half_inning_label(inning_half)}:{row.get('at_bat_number') or row.get('atBatIndex') or ''}:{_safe_int(row.get('batter'))}:{_safe_int(row.get('pitcher'))}:HR")
+            sent_count += 1
+            print(f"✅ Backfill HR alert CONFIRMED for {batter_name} vs {pitcher_name} (play {fallback_event_id})")
+        else:
+            print(f"⚠️ Backfill failed to send HR alert for {batter_name} vs {pitcher_name} (play {fallback_event_id})")
+
+    if sent_count > 0:
+        save_processed_home_run_events(processed_home_runs)
+    return sent_count
+
+
 def write_live_monitor_status(status):
     path = Path('data') / 'live_monitor_status.json'
     Path('data').mkdir(parents=True, exist_ok=True)
@@ -5065,260 +5150,285 @@ def monitor_live_home_runs():
     if not WEBHOOK_URL:
         raise RuntimeError("DISCORD_MLB_WEBHOOK or DISCORD_WEBHOOK_URL not set; configure env var or GitHub secret")
 
-    print("🚀 Monitoring started: Waiting for live MLB home run events...")
-    print(f"📡 Discord webhook: {WEBHOOK_URL[:30]}...{WEBHOOK_URL[-10:] if len(WEBHOOK_URL) > 40 else ''}")
-    print("⚡ Micro-signal engine enabled: release-axis tilt, odds inversion, predictable count windows")
-    processed_home_runs = load_processed_home_run_events()
-    micro_alert_keys = set()
+    if not _claim_live_monitor_pidfile():
+        return
 
-    power_profile = load_live_power_profile()
-    tendency_lookup = build_pitch_count_fastball_tendency_lookup(
-        days_back=max(14, _safe_int(os.getenv('LIVE_COUNT_LOOKBACK_DAYS', '45'), 45) or 45),
-        min_sample=max(10, _safe_int(os.getenv('LIVE_COUNT_MIN_SAMPLE', '25'), 25) or 25),
-    )
-    if tendency_lookup:
-        print(f"Loaded count tendency lookup: {len(tendency_lookup)} pitcher-count patterns")
-    else:
-        print("Count tendency lookup unavailable (insufficient cached pitch data).")
+    current_pid = os.getpid()
+    atexit.register(_release_live_monitor_pidfile, current_pid)
 
-    odds_poll_seconds = max(3, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '3'), 3) or 3)  # Reduced from 5s to 3s
-    monitor_sleep_seconds = max(2, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '2'), 2) or 2)  # Reduced from 5s to 2s for faster HR detection
-    heartbeat_enabled = str(os.getenv('LIVE_HEARTBEAT_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
-    heartbeat_minutes = max(1, _safe_int(os.getenv('LIVE_HEARTBEAT_MINUTES', '10'), 10) or 10)
-    heartbeat_every_seconds = heartbeat_minutes * 60
-    last_heartbeat_ts = 0.0
-    last_odds_poll_ts = 0.0
-    best_odds_prev = {}
-    best_odds_now = {}
+    try:
+        print("🚀 Monitoring started: Waiting for live MLB home run events...")
+        print(f"📡 Discord webhook: {WEBHOOK_URL[:30]}...{WEBHOOK_URL[-10:] if len(WEBHOOK_URL) > 40 else ''}")
+        print("⚡ Micro-signal engine enabled: release-axis tilt, odds inversion, predictable count windows")
+        processed_home_runs = load_processed_home_run_events()
+        micro_alert_keys = set()
 
-    while True:
-        try:
-            today_str = datetime.today().strftime('%m/%d/%Y')
-            games = statsapi.schedule(date=today_str) or []
-            in_progress_games = 0
-            detected_this_loop = 0
-            sent_this_loop = 0
-            micro_signals_this_loop = 0
+        power_profile = load_live_power_profile()
+        tendency_lookup = build_pitch_count_fastball_tendency_lookup(
+            days_back=max(14, _safe_int(os.getenv('LIVE_COUNT_LOOKBACK_DAYS', '45'), 45) or 45),
+            min_sample=max(10, _safe_int(os.getenv('LIVE_COUNT_MIN_SAMPLE', '25'), 25) or 25),
+        )
+        if tendency_lookup:
+            print(f"Loaded count tendency lookup: {len(tendency_lookup)} pitcher-count patterns")
+        else:
+            print("Count tendency lookup unavailable (insufficient cached pitch data).")
 
-            now_ts = time.time()
-            if (now_ts - last_odds_poll_ts) >= odds_poll_seconds:
-                try:
-                    odds_raw = fetch_hr_prop_odds_raw()
-                    if odds_raw:
-                        best_odds_prev = best_odds_now
-                        best_odds_now = _extract_best_live_odds(odds_raw)
-                    last_odds_poll_ts = now_ts
-                except Exception as odds_err:
-                    print(f"Live odds poll failed: {odds_err}")
+        odds_poll_seconds = max(3, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '3'), 3) or 3)  # Reduced from 5s to 3s
+        monitor_sleep_seconds = max(2, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '2'), 2) or 2)  # Reduced from 5s to 2s for faster HR detection
+        heartbeat_enabled = str(os.getenv('LIVE_HEARTBEAT_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+        heartbeat_minutes = max(1, _safe_int(os.getenv('LIVE_HEARTBEAT_MINUTES', '10'), 10) or 10)
+        heartbeat_every_seconds = heartbeat_minutes * 60
+        backfill_every_seconds = max(30, _safe_int(os.getenv('LIVE_HR_BACKFILL_SECONDS', '60'), 60) or 60)
+        last_heartbeat_ts = 0.0
+        last_backfill_ts = 0.0
+        last_odds_poll_ts = 0.0
+        best_odds_prev = {}
+        best_odds_now = {}
 
-            for game in games:
-                status_parts = [
-                    str(game.get('status', '') or ''),
-                    str(game.get('detailed_state', '') or ''),
-                    str(game.get('game_status', '') or ''),
-                ]
-                status_text = " ".join(status_parts).lower()
-                is_live_state = any(
-                    token in status_text
-                    for token in [
-                        'in progress',
-                        'manager challenge',
-                        'review',
-                        'warmup',
-                        'delayed',
-                        'live',
+        # Catch up immediately on any HRs that occurred before the monitor started.
+        backfill_sent = backfill_unprocessed_today_home_runs(processed_home_runs, WEBHOOK_URL)
+        if backfill_sent:
+            print(f"Backfill reconciliation sent {backfill_sent} missed HR alert(s) at startup")
+        last_backfill_ts = time.time()
+        _send_live_monitor_startup_report(
+            WEBHOOK_URL,
+            current_pid,
+            processed_home_runs,
+            backfill_sent,
+            monitor_sleep_seconds,
+            odds_poll_seconds,
+        )
+
+        while True:
+            try:
+                today_str = datetime.today().strftime('%m/%d/%Y')
+                games = statsapi.schedule(date=today_str) or []
+                in_progress_games = 0
+                detected_this_loop = 0
+                sent_this_loop = 0
+                micro_signals_this_loop = 0
+
+                now_ts = time.time()
+                if (now_ts - last_backfill_ts) >= backfill_every_seconds:
+                    try:
+                        backfill_sent = backfill_unprocessed_today_home_runs(processed_home_runs, WEBHOOK_URL)
+                        if backfill_sent:
+                            print(f"Backfill reconciliation sent {backfill_sent} missed HR alert(s)")
+                        last_backfill_ts = now_ts
+                    except Exception as backfill_err:
+                        print(f"Live HR backfill failed: {backfill_err}")
+
+                if (now_ts - last_odds_poll_ts) >= odds_poll_seconds:
+                    try:
+                        odds_raw = fetch_hr_prop_odds_raw()
+                        if odds_raw:
+                            best_odds_prev = best_odds_now
+                            best_odds_now = _extract_best_live_odds(odds_raw)
+                        last_odds_poll_ts = now_ts
+                    except Exception as odds_err:
+                        print(f"Live odds poll failed: {odds_err}")
+
+                for game in games:
+                    status_parts = [
+                        str(game.get('status', '') or ''),
+                        str(game.get('detailed_state', '') or ''),
+                        str(game.get('game_status', '') or ''),
                     ]
-                )
-                if not is_live_state:
-                    continue
-                in_progress_games += 1
-                game_id = game.get('game_pk') or game.get('game_id')
-                if not game_id:
-                    continue
-                play_by_play = statsapi.get('game', {'gamePk': game_id}) or {}
-                all_plays = play_by_play.get('liveData', {}).get('plays', {}).get('allPlays', [])
+                    status_text = " ".join(status_parts).lower()
+                    is_live_state = any(
+                        token in status_text
+                        for token in [
+                            'in progress',
+                            'manager challenge',
+                            'review',
+                            'warmup',
+                            'delayed',
+                            'live',
+                        ]
+                    )
+                    if not is_live_state:
+                        continue
+                    in_progress_games += 1
+                    game_id = game.get('game_pk') or game.get('game_id')
+                    if not game_id:
+                        continue
+                    play_by_play = statsapi.get('game', {'gamePk': game_id}) or {}
+                    all_plays = play_by_play.get('liveData', {}).get('plays', {}).get('allPlays', [])
 
-                # Micro-signal: release-axis tilt
-                for alert in _detect_release_axis_tilt_signal(game, play_by_play, power_profile, micro_alert_keys):
-                    msg = _format_micro_signal_message(alert)
-                    if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
-                        micro_signals_this_loop += 1
-                        sent_this_loop += 1
-                        print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
-
-                # Micro-signal: predictable pitch sequence in hitter's counts
-                for alert in _detect_predictable_count_signal(game, play_by_play, power_profile, tendency_lookup, micro_alert_keys):
-                    msg = _format_micro_signal_message(alert)
-                    if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
-                        micro_signals_this_loop += 1
-                        sent_this_loop += 1
-                        print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
-
-                # Micro-signal: odds inversion after hard-hit lineout clusters
-                for alert in _detect_live_odds_inversion_signal(
-                    game,
-                    play_by_play,
-                    power_profile,
-                    best_odds_now,
-                    best_odds_prev,
-                    micro_alert_keys,
-                ):
-                    msg = _format_micro_signal_message(alert)
-                    if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
-                        micro_signals_this_loop += 1
-                        sent_this_loop += 1
-                        print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
-
-                # Live reprice: send refreshed HR predictions when pitcher quality deteriorates.
-                reprice_alert = _build_live_reprice_predictions(game, play_by_play, power_profile, best_odds_now, best_odds_prev)
-                if reprice_alert:
-                    reprice_key = f"reprice:{reprice_alert.get('game_id')}:{reprice_alert.get('pitcher_id')}"
-                    if reprice_key not in micro_alert_keys:
-                        micro_alert_keys.add(reprice_key)
-                        save_live_reprice_snapshot(reprice_alert)
-                        msg = _format_micro_signal_message(reprice_alert)
+                    for alert in _detect_release_axis_tilt_signal(game, play_by_play, power_profile, micro_alert_keys):
+                        msg = _format_micro_signal_message(alert)
                         if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
                             micro_signals_this_loop += 1
                             sent_this_loop += 1
-                            print(f"Live reprice sent: {reprice_alert.get('pitcher_name')} ({reprice_alert.get('game_display','')})")
+                            print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
 
-                for play in all_plays:
-                    result = play.get('result', {})
-                    about = play.get('about', {})
-                    matchup = play.get('matchup', {})
-                    event_name = str(result.get('event', '')).lower().strip()
-                    event_type = str(result.get('eventType', '')).lower().strip()
-                    event_desc = str(result.get('description', '')).lower()
-                    
-                    # Enhanced HR detection: check event name, type, and description
-                    is_hr = any([
-                        event_name in ('home run', 'home_run', 'homerun', 'hr'),
-                        event_type in ('home_run', 'home run', 'homerun', 'hr'),
-                        'home run' in event_name,
-                        'home run' in event_type,
-                        'home run' in event_desc,
-                        'solo home run' in event_desc,
-                        '2-run home run' in event_desc,
-                        '3-run home run' in event_desc,
-                        'grand slam' in event_desc,
-                    ])
-                    
-                    if not is_hr:
-                        continue
+                    for alert in _detect_predictable_count_signal(game, play_by_play, power_profile, tendency_lookup, micro_alert_keys):
+                        msg = _format_micro_signal_message(alert)
+                        if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
+                            micro_signals_this_loop += 1
+                            sent_this_loop += 1
+                            print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
 
-                    # Use playId or build reliable fallback
-                    event_id = about.get('playId')
-                    if not event_id:
-                        # Fallback: Include pitcher to distinguish between multiple HRs in same inning
-                        batter_id = matchup.get('batter', {}).get('id') or ''
-                        pitcher_id = matchup.get('pitcher', {}).get('id') or ''
-                        at_bat_idx = about.get('atBatIndex', '')
-                        inning = about.get('inning', '')
-                        half = about.get('halfInning', '')
-                        event_id = f"{game_id}:{inning}:{half}:{at_bat_idx}:{batter_id}:{pitcher_id}:HR"
+                    for alert in _detect_live_odds_inversion_signal(
+                        game,
+                        play_by_play,
+                        power_profile,
+                        best_odds_now,
+                        best_odds_prev,
+                        micro_alert_keys,
+                    ):
+                        msg = _format_micro_signal_message(alert)
+                        if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
+                            micro_signals_this_loop += 1
+                            sent_this_loop += 1
+                            print(f"Micro signal sent: {alert.get('type')} ({alert.get('game_display','')})")
 
-                    if event_id in processed_home_runs:
-                        continue
-                    detected_this_loop += 1
+                    reprice_alert = _build_live_reprice_predictions(game, play_by_play, power_profile, best_odds_now, best_odds_prev)
+                    if reprice_alert:
+                        reprice_key = f"reprice:{reprice_alert.get('game_id')}:{reprice_alert.get('pitcher_id')}"
+                        if reprice_key not in micro_alert_keys:
+                            micro_alert_keys.add(reprice_key)
+                            save_live_reprice_snapshot(reprice_alert)
+                            msg = _format_micro_signal_message(reprice_alert)
+                            if msg and send_discord_webhook(content=msg, webhook_url=WEBHOOK_URL):
+                                micro_signals_this_loop += 1
+                                sent_this_loop += 1
+                                print(f"Live reprice sent: {reprice_alert.get('pitcher_name')} ({reprice_alert.get('game_display','')})")
 
-                    description = result.get('description', 'A home run was hit!')
-                    inning_half = about.get('halfInning', '')
-                    num_inning = about.get('inning', '')
-                    batter_name = matchup.get('batter', {}).get('fullName') or ''
-                    pitcher_name = matchup.get('pitcher', {}).get('fullName') or ''
-                    game_display = f"{game.get('away_name','Away')} @ {game.get('home_name','Home')}"
-                    alert_ts = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')
+                    for play in all_plays:
+                        result = play.get('result', {})
+                        about = play.get('about', {})
+                        matchup = play.get('matchup', {})
+                        event_name = str(result.get('event', '')).lower().strip()
+                        event_type = str(result.get('eventType', '')).lower().strip()
+                        event_desc = str(result.get('description', '')).lower()
 
-                    # Log live outcome against today's predictions for learning feedback
-                    _model_prob, _was_predicted, _was_most_likely_homer, _model_rank = None, False, False, None
-                    if batter_name:
-                        try:
-                            _model_prob, _was_predicted, _was_most_likely_homer, _model_rank = log_live_hr_feedback(
-                                batter_name, pitcher_name, game_id, inning_half, num_inning
-                            )
-                        except Exception:
-                            pass
+                        is_hr = any([
+                            event_name in ('home run', 'home_run', 'homerun', 'hr'),
+                            event_type in ('home_run', 'home run', 'homerun', 'hr'),
+                            'home run' in event_name,
+                            'home run' in event_type,
+                            'home run' in event_desc,
+                            'solo home run' in event_desc,
+                            '2-run home run' in event_desc,
+                            '3-run home run' in event_desc,
+                            'grand slam' in event_desc,
+                        ])
+                        if not is_hr:
+                            continue
 
-                    message_lines = [
-                        "\U0001f6a8 **LIVE HOME RUN ALERT** \U0001f6a8",
-                        f"\u23f0 Time: {alert_ts}",
-                        f"\U0001f3df\ufe0f *{game_display}* ({inning_half} {num_inning})",
-                        f"\u26be {description}"
-                    ]
-                    if batter_name:
-                        message_lines.append(f"\U0001f464 Batter: {batter_name}")
-                    if pitcher_name:
-                        message_lines.append(f"\U0001f3af Pitcher: {pitcher_name}")
-                    if _model_prob is not None:
-                        prob_str = f"{_model_prob * 100:.1f}%"
-                        if _was_most_likely_homer:
-                            message_lines.append(f"\u2705 **Model called it!** (Prob: {prob_str}) — Most Likely Homer")
-                        elif _model_rank is not None:
-                            message_lines.append(
-                                f"\U0001f4ca Model rank: #{_model_rank} (Prob: {prob_str}) — not in Most Likely Homers"
-                            )
-                        elif _was_predicted:
-                            message_lines.append(f"\u2705 Model signaled HR risk (Prob: {prob_str})")
+                        event_id = about.get('playId')
+                        fallback_event_id = _build_fallback_hr_event_id(
+                            game_id,
+                            about.get('inning', ''),
+                            about.get('halfInning', ''),
+                            about.get('atBatIndex', ''),
+                            matchup.get('batter', {}).get('id') or '',
+                            matchup.get('pitcher', {}).get('id') or '',
+                        )
+                        if not event_id:
+                            event_id = fallback_event_id
+
+                        if event_id in processed_home_runs or fallback_event_id in processed_home_runs:
+                            continue
+                        detected_this_loop += 1
+
+                        description = result.get('description', 'A home run was hit!')
+                        inning_half = about.get('halfInning', '')
+                        num_inning = about.get('inning', '')
+                        batter_name = matchup.get('batter', {}).get('fullName') or ''
+                        pitcher_name = matchup.get('pitcher', {}).get('fullName') or ''
+                        game_display = f"{game.get('away_name','Away')} @ {game.get('home_name','Home')}"
+                        alert_ts = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')
+
+                        _model_prob, _was_predicted, _was_most_likely_homer, _model_rank = None, False, False, None
+                        if batter_name:
+                            try:
+                                _model_prob, _was_predicted, _was_most_likely_homer, _model_rank = log_live_hr_feedback(
+                                    batter_name, pitcher_name, game_id, inning_half, num_inning
+                                )
+                            except Exception:
+                                pass
+
+                        message_lines = [
+                            "🚨 **LIVE HOME RUN ALERT** 🚨",
+                            f"⏰ Time: {alert_ts}",
+                            f"🏟️ *{game_display}* ({inning_half} {num_inning})",
+                            f"⚾ {description}"
+                        ]
+                        if batter_name:
+                            message_lines.append(f"👤 Batter: {batter_name}")
+                        if pitcher_name:
+                            message_lines.append(f"🎯 Pitcher: {pitcher_name}")
+                        if _model_prob is not None:
+                            prob_str = f"{_model_prob * 100:.1f}%"
+                            if _was_most_likely_homer:
+                                message_lines.append(f"✅ **Model called it!** (Prob: {prob_str}) — Most Likely Homer")
+                            elif _model_rank is not None:
+                                message_lines.append(
+                                    f"📊 Model rank: #{_model_rank} (Prob: {prob_str}) — not in Most Likely Homers"
+                                )
+                            elif _was_predicted:
+                                message_lines.append(f"✅ Model signaled HR risk (Prob: {prob_str})")
+                            else:
+                                message_lines.append(f"⚠️ Model missed (had: {prob_str}) — logged for retraining")
                         else:
-                            message_lines.append(f"\u26a0\ufe0f Model missed (had: {prob_str}) — logged for retraining")
+                            message_lines.append("⚠️ Not in today's predictions — logged for retraining")
+
+                        sent = send_discord_webhook(content="\n".join(message_lines), webhook_url=WEBHOOK_URL, async_send=False)
+                        if sent:
+                            print(f"✅ Live HR alert CONFIRMED for {batter_name} vs {pitcher_name} in {game_display} (play {event_id})")
+                            processed_home_runs.add(event_id)
+                            processed_home_runs.add(fallback_event_id)
+                            save_processed_home_run_events(processed_home_runs)
+                            sent_this_loop += 1
+                        else:
+                            print(f"⚠️  FAILED to send HR alert for {batter_name} vs {pitcher_name} (play {event_id}) — will retry next loop")
+
+                if detected_this_loop > 0 and detected_this_loop > sent_this_loop:
+                    print(f"⚠️  HR detection gap: {detected_this_loop} detected but {sent_this_loop} sent Discord alerts")
+
+                if heartbeat_enabled and in_progress_games > 0 and (now_ts - last_heartbeat_ts) >= heartbeat_every_seconds:
+                    hb_lines = [
+                        "💓 **LIVE MONITOR HEARTBEAT**",
+                        f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')}",
+                        f"🎮 In-progress games: {in_progress_games}",
+                        f"⚾ Processed HR events today: {len(processed_home_runs)}",
+                        f"📈 Loop summary: detected={detected_this_loop}, sent={sent_this_loop}, micro={micro_signals_this_loop}",
+                        f"🔁 Poll rates: monitor={monitor_sleep_seconds}s, odds={odds_poll_seconds}s",
+                    ]
+                    hb_ok = send_discord_webhook(content="\n".join(hb_lines), webhook_url=WEBHOOK_URL, async_send=False)
+                    if hb_ok:
+                        last_heartbeat_ts = now_ts
+                        print(f"Heartbeat sent ({heartbeat_minutes}m cadence)")
                     else:
-                        message_lines.append(f"\u26a0\ufe0f Not in today's predictions — logged for retraining")
+                        print("⚠️ Heartbeat send failed; will retry next cycle")
 
-                    payload = {"content": "\n".join(message_lines)}
-
-                    # Send Discord alert synchronously (don't mark as processed until confirmed sent)
-                    sent = send_discord_webhook(content=payload.get("content"), webhook_url=WEBHOOK_URL, async_send=False)
-                    if sent:
-                        print(f"✅ Live HR alert CONFIRMED for {batter_name} vs {pitcher_name} in {game_display} (play {event_id})")
-                        processed_home_runs.add(event_id)
-                        save_processed_home_run_events(processed_home_runs)
-                        sent_this_loop += 1
-                    else:
-                        print(f"⚠️  FAILED to send HR alert for {batter_name} vs {pitcher_name} (play {event_id}) — will retry next loop")
-            # Log HR detection vs send gap for debugging
-            if detected_this_loop > 0 and detected_this_loop > sent_this_loop:
-                print(f"⚠️  HR detection gap: {detected_this_loop} detected but {sent_this_loop} sent Discord alerts")
-
-            # Optional liveness heartbeat so ops can verify the monitor is healthy between HR events.
-            if heartbeat_enabled and in_progress_games > 0 and (now_ts - last_heartbeat_ts) >= heartbeat_every_seconds:
-                hb_lines = [
-                    "💓 **LIVE MONITOR HEARTBEAT**",
-                    f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')}",
-                    f"🎮 In-progress games: {in_progress_games}",
-                    f"⚾ Processed HR events today: {len(processed_home_runs)}",
-                    f"📈 Loop summary: detected={detected_this_loop}, sent={sent_this_loop}, micro={micro_signals_this_loop}",
-                    f"🔁 Poll rates: monitor={monitor_sleep_seconds}s, odds={odds_poll_seconds}s",
-                ]
-                hb_ok = send_discord_webhook(content="\n".join(hb_lines), webhook_url=WEBHOOK_URL, async_send=False)
-                if hb_ok:
-                    last_heartbeat_ts = now_ts
-                    print(f"Heartbeat sent ({heartbeat_minutes}m cadence)")
-                else:
-                    print("⚠️ Heartbeat send failed; will retry next cycle")
-            
-            discord_success_rate = (sent_this_loop / detected_this_loop * 100) if detected_this_loop > 0 else 0
-            write_live_monitor_status({
-                'mode': 'live_hr_monitor',
-                'in_progress_games': in_progress_games,
-                'detected_events_this_loop': detected_this_loop,
-                'sent_events_this_loop': sent_this_loop,
-                'discord_success_rate_pct': round(discord_success_rate, 1),
-                'micro_signals_this_loop': micro_signals_this_loop,
-                'processed_event_count': len(processed_home_runs),
-                'odds_players_tracked': len(best_odds_now),
-                'live_monitor_poll_seconds': monitor_sleep_seconds,
-                'live_odds_poll_seconds': odds_poll_seconds,
-                'updated_at': datetime.now().isoformat(),
-            })
-            time.sleep(monitor_sleep_seconds)
-        except Exception as e:
-            print("Error checking live feeds:", e)
-            write_live_monitor_status({
-                'mode': 'live_hr_monitor',
-                'error': str(e),
-                'processed_event_count': len(processed_home_runs),
-            })
-            time.sleep(2)  # Reduced error recovery sleep from 10s to 2s for faster reconnection
+                discord_success_rate = (sent_this_loop / detected_this_loop * 100) if detected_this_loop > 0 else 0
+                write_live_monitor_status({
+                    'mode': 'live_hr_monitor',
+                    'in_progress_games': in_progress_games,
+                    'detected_events_this_loop': detected_this_loop,
+                    'sent_events_this_loop': sent_this_loop,
+                    'discord_success_rate_pct': round(discord_success_rate, 1),
+                    'micro_signals_this_loop': micro_signals_this_loop,
+                    'processed_event_count': len(processed_home_runs),
+                    'odds_players_tracked': len(best_odds_now),
+                    'live_monitor_poll_seconds': monitor_sleep_seconds,
+                    'live_odds_poll_seconds': odds_poll_seconds,
+                    'updated_at': datetime.now().isoformat(),
+                })
+                time.sleep(monitor_sleep_seconds)
+            except Exception as e:
+                print("Error checking live feeds:", e)
+                write_live_monitor_status({
+                    'mode': 'live_hr_monitor',
+                    'error': str(e),
+                    'processed_event_count': len(processed_home_runs),
+                })
+                time.sleep(2)
+    finally:
+        _release_live_monitor_pidfile(expected_pid=current_pid)
 
 
 def _is_pid_running(pid):
@@ -5357,29 +5467,147 @@ def _is_pid_running(pid):
         return False
 
 
+def _live_monitor_pid_file():
+    return Path('data') / 'live_monitor.pid'
+
+
+def _live_monitor_log_file():
+    return Path('data') / 'live_monitor.log'
+
+
+def _rotate_live_monitor_log_if_needed():
+    """Rotate the live monitor log before launch so it cannot grow forever."""
+    log_path = _live_monitor_log_file()
+    if not log_path.exists():
+        return
+
+    try:
+        max_mb = max(1, _safe_int(os.getenv('LIVE_MONITOR_LOG_MAX_MB', '2'), 2) or 2)
+        backup_count = max(1, _safe_int(os.getenv('LIVE_MONITOR_LOG_BACKUPS', '3'), 3) or 3)
+        max_bytes = max_mb * 1024 * 1024
+        if log_path.stat().st_size < max_bytes:
+            return
+
+        for idx in range(backup_count, 0, -1):
+            src = log_path.with_name(f"{log_path.name}.{idx}")
+            dst = log_path.with_name(f"{log_path.name}.{idx + 1}")
+            if not src.exists():
+                continue
+            if idx == backup_count:
+                src.unlink(missing_ok=True)
+            else:
+                src.replace(dst)
+
+        log_path.replace(log_path.with_name(f"{log_path.name}.1"))
+        print(f"Rotated live monitor log at {max_mb} MB with {backup_count} backup(s)")
+    except Exception as e:
+        print(f"⚠️ Could not rotate live monitor log: {e}")
+
+
+def _release_live_monitor_pidfile(expected_pid=None):
+    pid_file = _live_monitor_pid_file()
+    try:
+        if not pid_file.exists():
+            return
+        current_text = pid_file.read_text(encoding='utf-8').strip()
+        current_pid = int(current_text)
+        if expected_pid is not None and current_pid != int(expected_pid):
+            return
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _claim_live_monitor_pidfile():
+    """Return True when this process successfully becomes the active live monitor."""
+    pid_file = _live_monitor_pid_file()
+    Path('data').mkdir(parents=True, exist_ok=True)
+    current_pid = os.getpid()
+
+    if pid_file.exists():
+        try:
+            existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
+            if existing_pid != current_pid and _is_pid_running(existing_pid):
+                print(f"Live monitor already active under PID {existing_pid}; exiting duplicate watcher.")
+                return False
+        except Exception:
+            pass
+
+    try:
+        pid_file.write_text(str(current_pid), encoding='utf-8')
+        return True
+    except Exception as e:
+        print(f"Could not write live monitor PID file: {e}")
+        return False
+
+
+def _read_live_monitor_log_tail(max_lines=20):
+    try:
+        log_path = _live_monitor_log_file()
+        if not log_path.exists():
+            return ''
+        lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
+        return "\n".join(lines[-max(1, int(max_lines)):])
+    except Exception:
+        return ''
+
+
+def _send_live_monitor_startup_report(webhook_url, current_pid, processed_home_runs, backfill_sent, monitor_sleep_seconds, odds_poll_seconds):
+    """Send a one-time startup sanity report so ops can verify the watcher is alive."""
+    lines = [
+        "🟢 **LIVE MONITOR STARTED**",
+        f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')}",
+        f"🆔 PID: {current_pid}",
+        f"⚾ Processed HR events loaded: {len(processed_home_runs)}",
+        f"🔁 Backfill alerts sent at startup: {int(backfill_sent or 0)}",
+        f"📡 Poll rates: monitor={monitor_sleep_seconds}s, odds={odds_poll_seconds}s",
+    ]
+    ok = send_discord_webhook(content="\n".join(lines), webhook_url=webhook_url, async_send=False)
+    if ok:
+        print("Startup sanity report sent")
+    else:
+        print("⚠️ Startup sanity report failed")
+    return ok
+
+
 def launch_live_monitor_background():
     """Launch one background live monitor process unless already running."""
-    pid_file = Path('data') / 'live_monitor.pid'
+    pid_file = _live_monitor_pid_file()
+    log_file = _live_monitor_log_file()
     Path('data').mkdir(parents=True, exist_ok=True)
 
     if pid_file.exists():
         try:
-            existing_pid = int(pid_file.read_text().strip())
+            existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
             if _is_pid_running(existing_pid):
                 print(f"Live monitor already running (PID {existing_pid}).")
                 return
         except Exception:
             pass
+        _release_live_monitor_pidfile()
 
     try:
+        _rotate_live_monitor_log_if_needed()
+        with log_file.open('a', encoding='utf-8') as log_handle:
+            log_handle.write(f"\n[{datetime.now().isoformat()}] Launching live monitor background process\n")
+            log_handle.flush()
         child = subprocess.Popen(
             [sys.executable, __file__, "--live"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_file.open('a', encoding='utf-8'),
+            stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
         )
-        pid_file.write_text(str(child.pid), encoding='utf-8')
-        print(f"✅ Live monitor launched in background (PID {child.pid}).")
+        time.sleep(2)
+        exit_code = child.poll()
+        if exit_code is not None:
+            _release_live_monitor_pidfile(expected_pid=child.pid)
+            tail = _read_live_monitor_log_tail(max_lines=25)
+            print(f"⚠️ Live monitor exited immediately with code {exit_code}.")
+            if tail:
+                print("Recent live monitor log:")
+                print(tail)
+            return
+        print(f"✅ Live monitor launched in background (PID {child.pid}). Log: {log_file}")
     except Exception as e:
         print(f"⚠️ Could not start live monitor: {e}")
 
