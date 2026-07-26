@@ -29,6 +29,18 @@ except Exception:  # pragma: no cover
     BeautifulSoup = None
 
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+_SHARP_PIPELINE_CACHE_TS = 0.0
+_SHARP_PIPELINE_CACHE_DATA: Dict[str, Dict[str, int]] = {}
+
+
 def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip()).lower()
 
@@ -321,6 +333,61 @@ def fetch_public_url_html(url: str, timeout: int = 10) -> str:
         return ""
 
 
+def _fetch_public_json(url: str, timeout: int = 10) -> Optional[object]:
+    """Attempt to fetch JSON from a public URL; return None on failure."""
+    if requests is None:
+        return None
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def fetch_circa_sports_mlb() -> Optional[object]:
+    """Public web gateway endpoint for Circa sports inventory."""
+    url = os.getenv("FREE_ODDS_CIRCA_URL", "https://circasports.com").strip()
+    return _fetch_public_json(url)
+
+
+def fetch_sharp_aggregations() -> Optional[object]:
+    """Public feed for sharp consensus pricing when available."""
+    url = os.getenv("FREE_ODDS_SHARP_CONSENSUS_URL", "https://actionnetwork.com").strip()
+    return _fetch_public_json(url)
+
+
+def run_sharp_pipeline() -> Dict[str, Optional[object]]:
+    """Fetch sharp source payloads for downstream parsing."""
+    sharp_data = {
+        "circa": fetch_circa_sports_mlb(),
+        "sharp_consensus": fetch_sharp_aggregations(),
+    }
+    print("Sharp Pipeline Sync: Successfully pulled true market-maker lines.")
+    return sharp_data
+
+
+def _parse_sharp_pipeline_to_odds(sharp_data: Dict[str, Optional[object]]) -> Dict[str, Dict[str, int]]:
+    """Parse sharp payloads into {player: {book: american_odds}} when possible."""
+    merged: Dict[str, Dict[str, int]] = {}
+
+    circa_parsed = _parse_json_payload(sharp_data.get("circa")) if sharp_data.get("circa") is not None else {}
+    sharp_parsed = (
+        _parse_json_payload(sharp_data.get("sharp_consensus"))
+        if sharp_data.get("sharp_consensus") is not None
+        else {}
+    )
+
+    for player, book_map in (circa_parsed or {}).items():
+        merged.setdefault(player, {}).update(book_map)
+
+    for player, book_map in (sharp_parsed or {}).items():
+        merged.setdefault(player, {}).update(book_map)
+
+    return merged
+
+
 def load_odds_from_public_urls(urls: List[str]) -> Dict[str, Dict[str, int]]:
     merged: Dict[str, Dict[str, int]] = {}
     for url in urls:
@@ -386,6 +453,29 @@ def load_free_odds_sources() -> Dict[str, Dict[str, int]]:
         p = load_odds_from_public_urls(public_urls)
         for player, book_map in p.items():
             merged.setdefault(player, {}).update(book_map)
+
+    use_sharp_pipeline = os.getenv("FREE_ODDS_USE_SHARP_PIPELINE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if use_sharp_pipeline:
+        try:
+            import time
+
+            global _SHARP_PIPELINE_CACHE_TS, _SHARP_PIPELINE_CACHE_DATA
+            ttl_sec = max(30, int(float(os.getenv("FREE_ODDS_SHARP_TTL_SECONDS", "300"))))
+            now_ts = time.time()
+
+            if _SHARP_PIPELINE_CACHE_DATA and (now_ts - _SHARP_PIPELINE_CACHE_TS) < ttl_sec:
+                sharp_rows = _SHARP_PIPELINE_CACHE_DATA
+            else:
+                sharp_payload = run_sharp_pipeline()
+                sharp_rows = _parse_sharp_pipeline_to_odds(sharp_payload)
+                sharp_rows = _validate_and_filter(sharp_rows, "sharp_pipeline") if sharp_rows else {}
+                _SHARP_PIPELINE_CACHE_DATA = sharp_rows
+                _SHARP_PIPELINE_CACHE_TS = now_ts
+
+            for player, book_map in (sharp_rows or {}).items():
+                merged.setdefault(player, {}).update(book_map)
+        except Exception:
+            pass
 
     return merged
 
