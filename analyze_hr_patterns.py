@@ -160,6 +160,43 @@ def extract_hr_patterns(actual_hrs, training_data):
     
     return patterns, summary_stats
 
+def build_learning_insights_from_evaluation(eval_df):
+    """Build a learning report from yesterday's evaluation file when live feedback is absent."""
+    if eval_df is None or eval_df.empty:
+        return None
+
+    eval_df = eval_df.copy()
+    eval_df['actual_hr'] = pd.to_numeric(eval_df.get('actual_hr', 0), errors='coerce').fillna(0).astype(int)
+    eval_df['pred_hr_prob'] = pd.to_numeric(eval_df.get('pred_hr_prob', 0), errors='coerce').fillna(0.0)
+
+    patterns = []
+    summary_stats = {}
+    for _, row in eval_df[eval_df['actual_hr'] == 1].iterrows():
+        pattern = {
+            'batter_name': row.get('batter_name', 'Unknown'),
+            'pitcher_name': row.get('pitcher_name', 'Unknown'),
+            'model_prob': float(row.get('pred_hr_prob', 0.0)),
+        }
+        patterns.append(pattern)
+        summary_stats[str(pattern['batter_name'])] = summary_stats.get(str(pattern['batter_name']), 0) + 1
+
+    if not patterns:
+        return None
+
+    insights = {
+        'analysis_date': datetime.today().strftime('%Y-%m-%d'),
+        'total_hrs_analyzed': len(patterns),
+        'unique_batters': len(summary_stats),
+        'missed_predictions': int(sum(1 for p in patterns if p.get('model_prob', 0) < 0.10)),
+        'accurate_predictions': int(sum(1 for p in patterns if p.get('model_prob', 0) >= 0.10)),
+        'patterns': patterns,
+        'key_findings': [],
+    }
+
+    insights['key_findings'].append(f"⚠️  Model missed {insights['missed_predictions']}/{insights['total_hrs_analyzed']} HRs (need to upweight these batters)")
+    return insights
+
+
 def generate_learning_insights(patterns, summary_stats):
     """Create a learning report from yesterday's HR patterns."""
     
@@ -301,6 +338,20 @@ def analyze_yesterdays_hrs_and_learn():
     actual_hrs = load_yesterdays_home_runs()
     
     if actual_hrs.empty:
+        yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+        eval_file = Path('data') / f'evaluation_{yesterday}.csv'
+        if eval_file.exists():
+            try:
+                eval_df = pd.read_csv(eval_file)
+                insights = build_learning_insights_from_evaluation(eval_df)
+                if insights:
+                    report_file = save_learning_report(insights)
+                    if report_file:
+                        print(f"✅ Learning report saved from evaluation fallback: {report_file}")
+                    print_learning_report(insights)
+                    return {'insights': insights, 'feedback_boost': {}, 'patterns': []}
+            except Exception as exc:
+                print(f"⚠️  Evaluation fallback failed: {exc}")
         print("ℹ️  No home runs to learn from today")
         return {}
     

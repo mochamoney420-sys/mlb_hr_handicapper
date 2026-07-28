@@ -1254,6 +1254,16 @@ def send_morning_learning_summary(
         except Exception:
             pass
 
+    if not insights:
+        yesterday_eval_path = Path('data') / f"evaluation_{(datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')}.csv"
+        if yesterday_eval_path.exists():
+            try:
+                from analyze_hr_patterns import build_learning_insights_from_evaluation
+                eval_df = pd.read_csv(yesterday_eval_path)
+                insights = build_learning_insights_from_evaluation(eval_df) or {}
+            except Exception:
+                insights = {}
+
     findings = []
     if insights:
         findings = [str(x) for x in insights.get('key_findings', [])[:3]]
@@ -3376,8 +3386,12 @@ def validate_model_dataflow(train_df, live_df, required_features=None):
             issues.append("Training dataframe missing target column 'is_hr'")
 
     if live_df is None:
-        issues.append("Live dataframe is None")
-    elif hasattr(live_df, 'columns'):
+        return issues
+
+    if hasattr(live_df, 'columns'):
+        if getattr(live_df, 'empty', False) and len(live_df.columns) == 0:
+            return issues
+
         missing_live = [col for col in required_features if col not in live_df.columns]
         if missing_live:
             issues.append(f"Live missing feature columns: {', '.join(missing_live)}")
@@ -4076,9 +4090,10 @@ def generate_daily_predictions():
         else:
             train_df[weather_col] = train_df[weather_col].fillna(default_val)
 
+    # Validate training data first; live dataframe is assembled later in the flow.
     dataflow_issues = validate_model_dataflow(
         train_df,
-        live_df=None,
+        live_df=pd.DataFrame(),
         required_features=features_train,
     )
     if dataflow_issues:
@@ -4221,6 +4236,16 @@ def generate_daily_predictions():
     # Join live matchups with player vectors where available (use inner to ensure features exist)
     live = live_matchups.merge(b_stats, on='batter', how='left')
     live = live.merge(p_stats, on='pitcher', how='left')
+
+    live_dataflow_issues = validate_model_dataflow(
+        train_df,
+        live,
+        required_features=features_live,
+    )
+    if live_dataflow_issues:
+        print("ℹ️ Live dataflow validation:")
+        for issue in live_dataflow_issues:
+            print(f"  - {issue}")
 
     # Fill missing numeric features with reasonable baselines
     for col in ['bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate', 'bat_sweet_spot_rate']:
@@ -5100,7 +5125,12 @@ def generate_daily_predictions():
         top_prob = prob_pool.head(discord_top_prob_n).copy()
 
     radar = pd.DataFrame()
-    if 'physics_delta' in live.columns:
+    if 'physics_hr_prob' in live.columns or 'base_model_prob' in live.columns:
+        if 'physics_delta' not in live.columns:
+            live['physics_delta'] = (
+                pd.to_numeric(live.get('physics_hr_prob', 0.0), errors='coerce').fillna(0.0)
+                - pd.to_numeric(live.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
+            )
         radar = live[[
             'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
             'kelly_fraction', 'ev_percent', 'game_time', 'physics_delta'

@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import run_daily_predictions as rdp
+from analyze_hr_patterns import build_learning_insights_from_evaluation
 from run_daily_predictions import (
     apply_daily_hr_volume_constraints,
     apply_poisson_hr_filter,
@@ -59,6 +60,11 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertLess(adjusted["pred_hr_prob"].iloc[0], 0.20)
         self.assertAlmostEqual(adjusted["pred_hr_prob"].sum(), 0.1, places=3)
 
+    def test_validate_model_dataflow_does_not_flag_missing_live_df_when_not_ready(self):
+        train_df = pd.DataFrame({"batter": [1], "pitcher": [2], "is_hr": [0]})
+        issues = validate_model_dataflow(train_df, None, required_features=["bat_pa_count"])
+        self.assertFalse(any("Live dataframe is None" in issue for issue in issues))
+
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
             {
@@ -81,6 +87,22 @@ class ConfidenceLabelTests(unittest.TestCase):
         weights = build_feedback_weight_series(train_df, feedback_df)
 
         self.assertGreater(weights[1], 1.0)
+
+    def test_build_learning_insights_from_evaluation_uses_verified_hr_rows(self):
+        eval_df = pd.DataFrame(
+            {
+                "batter_name": ["A", "B"],
+                "pitcher_name": ["X", "Y"],
+                "pred_hr_prob": [0.02, 0.22],
+                "actual_hr": [1, 1],
+            }
+        )
+
+        insights = build_learning_insights_from_evaluation(eval_df)
+
+        self.assertEqual(insights["total_hrs_analyzed"], 2)
+        self.assertEqual(insights["missed_predictions"], 1)
+        self.assertEqual(insights["accurate_predictions"], 1)
 
 
 if __name__ == "__main__":
