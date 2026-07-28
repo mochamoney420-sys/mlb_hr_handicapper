@@ -3044,6 +3044,68 @@ def detect_pitcher_degradation(statcast_df, days_lookback=7):
 # =====================================================================
 # SECTION 4: INFERENCE MODEL PROCESSING
 # =====================================================================
+def build_feedback_weight_series(train_df, feedback_df):
+    """Create per-row training weights from recent feedback, using game_pk as a fallback when batter/pitcher IDs are missing."""
+    if train_df is None:
+        return pd.Series([1.0], dtype=float)
+
+    weights = pd.Series(1.0, index=train_df.index, dtype=float)
+    if feedback_df is None or feedback_df.empty:
+        return weights
+
+    fb = feedback_df.copy()
+    fb['actual_hr'] = pd.to_numeric(fb.get('actual_hr', 0), errors='coerce').fillna(0).astype(int)
+    fb['pred_hr_prob'] = pd.to_numeric(fb.get('pred_hr_prob', 0), errors='coerce').fillna(0.0)
+    fb['batter'] = pd.to_numeric(fb.get('batter', np.nan), errors='coerce')
+    fb['pitcher'] = pd.to_numeric(fb.get('pitcher', np.nan), errors='coerce')
+    fb['game_pk'] = pd.to_numeric(fb.get('game_pk', np.nan), errors='coerce')
+    fb['event_date'] = pd.to_datetime(fb.get('event_date', None), errors='coerce')
+
+    has_game_pk = 'game_pk' in train_df.columns
+    has_batter = 'batter' in train_df.columns
+    has_pitcher = 'pitcher' in train_df.columns
+
+    for _, row in fb.iterrows():
+        try:
+            prob = float(row['pred_hr_prob'])
+            actual = int(row['actual_hr'])
+        except Exception:
+            continue
+
+        if prob <= 0:
+            continue
+
+        multiplier = 1.0
+        if actual == 1 and prob < 0.10:
+            multiplier = 3.5
+        elif actual == 0 and prob > 0.20:
+            multiplier = 0.7
+        elif actual == 1 and prob < 0.20:
+            multiplier = 1.8
+        elif actual == 0 and prob < 0.05:
+            multiplier = 1.1
+
+        if pd.notna(row.get('event_date')):
+            recency = apply_time_decay_weight(row['event_date'], datetime.today(), half_life_days=7)
+            multiplier *= max(0.5, min(1.5, float(recency)))
+
+        match_mask = pd.Series(False, index=train_df.index)
+        if has_batter and has_pitcher and pd.notna(row['batter']) and pd.notna(row['pitcher']):
+            match_mask |= (train_df['batter'] == row['batter']) & (train_df['pitcher'] == row['pitcher'])
+        elif has_batter and pd.notna(row['batter']):
+            match_mask |= (train_df['batter'] == row['batter'])
+        elif has_pitcher and pd.notna(row['pitcher']):
+            match_mask |= (train_df['pitcher'] == row['pitcher'])
+
+        if has_game_pk and pd.notna(row['game_pk']):
+            match_mask |= (train_df['game_pk'] == row['game_pk'])
+
+        if match_mask.any():
+            weights.loc[match_mask] *= multiplier
+
+    return weights.clip(lower=0.5, upper=15.0)
+
+
 def load_feedback_weights(train_df, days_lookback=30):
     """Load historical evaluation CSVs and apply ASYMMETRIC learning:
     Heavily prioritize learning from FAILURES (misses, false confidence)
@@ -3178,7 +3240,9 @@ def load_feedback_weights(train_df, days_lookback=30):
     boost = boost.clip(lower=0.5, upper=15.0)
 
     result = pd.Series(boost.values, index=merged['index'])
-    final_weights = result.reindex(train_df.index).fillna(1.0).values
+    base_weights = result.reindex(train_df.index).fillna(1.0)
+    feedback_weights = build_feedback_weight_series(train_df, eval_df)
+    final_weights = (base_weights * feedback_weights).clip(lower=0.5, upper=15.0).values
     missed_upweighted = int((final_weights > 2.0).sum())
     false_pos_penalized = int((final_weights < 1.0).sum())
     print(
@@ -3403,6 +3467,91 @@ def estimate_model_reliability(pred_prob, consistency_score, sample_size):
         return 'LOW'
     except:
         return 'MEDIUM'
+
+
+def apply_daily_hr_volume_constraints(preds_df, game_count=1, avg_hr_per_game=2.3):
+    """Calibrate daily HR probabilities to a league-average volumetric cap.
+
+    The model returns a ranking of probabilities for the full slate. Since HRs are rare,
+    the summed probabilities should be constrained by the expected number of HRs in the
+    games scheduled today. This function scales down the probabilities by a single factor
+    so the expected total HR count matches the league-average expectation.
+    """
+    try:
+        if preds_df is None:
+            return preds_df
+        work = preds_df.copy()
+        if work.empty:
+            return work
+
+        work['pred_hr_prob'] = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+        if work['pred_hr_prob'].le(0).all():
+            return work
+
+        expected_total_hr = max(0.01, float(game_count or 1) * float(avg_hr_per_game or 2.3))
+        total_prob = float(work['pred_hr_prob'].sum())
+        if total_prob <= 0:
+            return work
+
+        scaling_factor = min(1.0, max(0.05, expected_total_hr / total_prob))
+        work['pred_hr_prob'] = np.clip(work['pred_hr_prob'] * scaling_factor, 0.0, 0.99)
+        work['pred_hr_prob'] = work['pred_hr_prob'].round(6)
+        return work
+    except Exception:
+        return preds_df
+
+
+def _poisson_tail_probability(k, lambd):
+    """Return P(X >= k) for X ~ Poisson(lambda)."""
+    try:
+        if lambd <= 0:
+            return 0.0
+        total = 0.0
+        for i in range(int(k)):
+            total += (lambd ** i) * math.exp(-lambd) / math.factorial(i)
+        return max(0.0, min(1.0, 1.0 - total))
+    except Exception:
+        return 0.0
+
+
+def apply_poisson_hr_filter(preds_df, k=5, p_threshold=0.05, min_game_prob=0.20):
+    """Downgrade game-level HR predictions when the implied Poisson tail is implausibly rare."""
+    try:
+        if preds_df is None:
+            return preds_df
+        work = preds_df.copy()
+        if work.empty:
+            return work
+
+        work['pred_hr_prob'] = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+        if work['pred_hr_prob'].le(0).all():
+            return work
+
+        if 'game_pk' in work.columns:
+            frames = []
+            for _, group in work.groupby('game_pk', dropna=False):
+                group = group.copy()
+                game_total_prob = float(group['pred_hr_prob'].sum())
+                if game_total_prob >= min_game_prob:
+                    lambda_value = max(0.5, min(5.0, game_total_prob * 5.0))
+                    tail_prob = _poisson_tail_probability(k, lambda_value)
+                    if tail_prob < p_threshold:
+                        group['pred_hr_prob'] = np.clip(group['pred_hr_prob'] * 0.75, 0.0, 0.99)
+                frames.append(group)
+            if frames:
+                work = pd.concat(frames, ignore_index=True)
+        else:
+            game_total_prob = float(work['pred_hr_prob'].sum())
+            if game_total_prob >= min_game_prob:
+                lambda_value = max(0.5, game_total_prob * 10.0)
+                tail_prob = _poisson_tail_probability(k, lambda_value)
+                if tail_prob < p_threshold:
+                    work['pred_hr_prob'] = np.clip(work['pred_hr_prob'] * 0.75, 0.0, 0.99)
+
+        work['pred_hr_prob'] = work['pred_hr_prob'].round(6)
+        return work
+    except Exception:
+        return preds_df
 
 
 def run_post_mortem_backpropagation(days_lookback=7):
@@ -4542,6 +4691,12 @@ def generate_daily_predictions():
         return max(round(edge / _b * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
 
     live['pred_hr_prob'] = probs
+    live = apply_daily_hr_volume_constraints(
+        live,
+        game_count=max(1, int(len(live.get('game_pk').dropna().unique()) // 9)) if 'game_pk' in live.columns else 1,
+        avg_hr_per_game=2.3,
+    )
+    live = apply_poisson_hr_filter(live, k=5, p_threshold=0.05, min_game_prob=0.20)
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     
     # =====================================================================
@@ -4958,9 +5113,9 @@ def generate_daily_predictions():
         radar = radar[
             ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
         ]
+        radar['physics_delta_abs'] = radar['physics_delta'].abs()
         radar = radar.sort_values(
-            by=['physics_delta', 'hr_probability'],
-            key=lambda s: s.abs() if s.name == 'physics_delta' else s,
+            by=['physics_delta_abs', 'hr_probability'],
             ascending=[False, False]
         ).head(discord_radar_n).reset_index(drop=True)
 
