@@ -104,6 +104,15 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertIn("physics_delta", rankings.columns)
         self.assertAlmostEqual(rankings["physics_delta"].iloc[0], 0.08)
 
+    def test_ensure_discord_radar_columns_adds_prob_and_physics_defaults(self):
+        radar = pd.DataFrame({"batter_name": ["A"]})
+
+        ensured = rdp._ensure_discord_radar_columns(radar)
+
+        self.assertIn("hr_probability", ensured.columns)
+        self.assertIn("physics_delta", ensured.columns)
+        self.assertEqual(ensured["hr_probability"].iloc[0], 0.0)
+
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
             {

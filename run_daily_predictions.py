@@ -3459,6 +3459,27 @@ def apply_time_decay_weight(date_val, reference_date, half_life_days=14):
         return 1.0
 
 
+def _ensure_discord_radar_columns(rankings_df):
+    """Ensure ranking output always has the columns required for Discord sorting."""
+    if rankings_df is None:
+        return pd.DataFrame()
+
+    work = rankings_df.copy()
+    if 'hr_probability' not in work.columns:
+        if 'pred_hr_prob' in work.columns:
+            work['hr_probability'] = pd.to_numeric(work['pred_hr_prob'], errors='coerce').fillna(0.0)
+        else:
+            work['hr_probability'] = 0.0
+
+    if 'physics_delta' not in work.columns:
+        work['physics_delta'] = 0.0
+
+    if 'ev_pct' not in work.columns and 'ev_percent' in work.columns:
+        work['ev_pct'] = pd.to_numeric(work['ev_percent'], errors='coerce').fillna(0.0)
+
+    return work
+
+
 def _prepare_discord_rankings(live_df):
     """Prepare a ranking frame for Discord output while preserving reliability labels."""
     if live_df is None:
@@ -5162,38 +5183,31 @@ def generate_daily_predictions():
     if top_prob.empty:
         top_prob = prob_pool.head(discord_top_prob_n).copy()
 
-    radar = pd.DataFrame()
-    if 'physics_hr_prob' in live.columns or 'base_model_prob' in live.columns:
-        if 'physics_delta' not in live.columns:
-            live['physics_delta'] = (
-                pd.to_numeric(live.get('physics_hr_prob', 0.0), errors='coerce').fillna(0.0)
-                - pd.to_numeric(live.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
-            )
-        radar = _prepare_discord_rankings(
-            live[[
-                'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
-                'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta'
-            ]]
-        ).copy()
-        if 'physics_delta' not in radar.columns:
-            radar['physics_delta'] = 0.0
-        radar['hr_probability'] = pd.to_numeric(radar['hr_probability'], errors='coerce').fillna(0.0)
-        radar['physics_delta'] = pd.to_numeric(radar['physics_delta'], errors='coerce').fillna(0.0)
-        radar = radar[radar['hr_probability'] >= max(0.03, discord_min_prob * 0.7)]
+    if 'physics_delta' not in live.columns:
+        live['physics_delta'] = 0.0
 
-        top_keys = set(zip(top_prob['batter_name'].astype(str), top_prob['pitcher_name'].astype(str)))
-        radar = radar[
-            ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
-        ]
-        if 'physics_delta' not in radar.columns:
-            radar['physics_delta'] = 0.0
-        physics_delta_series = pd.to_numeric(radar.get('physics_delta', 0.0), errors='coerce').fillna(0.0)
-        radar['physics_delta'] = physics_delta_series
-        radar['physics_delta_abs'] = physics_delta_series.abs()
-        radar = radar.sort_values(
-            by=['physics_delta_abs', 'hr_probability'],
-            ascending=[False, False]
-        ).head(discord_radar_n).reset_index(drop=True)
+    radar = _prepare_discord_rankings(
+        live[[
+            'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
+            'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta'
+        ]]
+    ).copy()
+    radar = _ensure_discord_radar_columns(radar)
+    radar['hr_probability'] = pd.to_numeric(radar['hr_probability'], errors='coerce').fillna(0.0)
+    radar['physics_delta'] = pd.to_numeric(radar['physics_delta'], errors='coerce').fillna(0.0)
+    radar = radar[radar['hr_probability'] >= max(0.03, discord_min_prob * 0.7)]
+
+    top_keys = set(zip(top_prob['batter_name'].astype(str), top_prob['pitcher_name'].astype(str)))
+    radar = radar[
+        ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
+    ]
+    physics_delta_series = pd.to_numeric(radar.get('physics_delta', 0.0), errors='coerce').fillna(0.0)
+    radar['physics_delta'] = physics_delta_series
+    radar['physics_delta_abs'] = physics_delta_series.abs()
+    radar = radar.sort_values(
+        by=['physics_delta_abs', 'hr_probability'],
+        ascending=[False, False]
+    ).head(discord_radar_n).reset_index(drop=True)
 
     def _annotate_time_windows(df):
         if df is None or df.empty:
