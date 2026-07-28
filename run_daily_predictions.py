@@ -17,6 +17,7 @@ if sys.platform == 'win32':
 import argparse
 import atexit
 import subprocess
+import re
 from datetime import datetime
 from pathlib import Path
 from itertools import combinations
@@ -1720,9 +1721,120 @@ HR_PROP_MARKET_KEY_CANDIDATES = [
     'batter_home_runs_alternate',
 ]
 
+SPORTSGAMEODDS_BASE_URL = 'https://api.sportsgameodds.com/v2'
+SPORTSGAMEODDS_DEFAULT_LEAGUE = 'MLB'
+
 # Cooldown guard for invalid Odds API key spam.
 _ODDS_API_INVALID_KEY_UNTIL_TS = 0.0
 _ODDS_API_INVALID_KEY_LAST_LOG_TS = 0.0
+
+
+def _odds_provider_name():
+    raw = str(os.getenv('ODDS_API_PROVIDER', 'sportsgameodds') or '').strip().lower()
+    if raw in {'sgo', 'sportsgameodds', 'sportsgameodds_v2', 'sports_game_odds'}:
+        return 'sportsgameodds'
+    if raw in {'theoddsapi', 'the-odds-api', 'oddsapi'}:
+        return 'theoddsapi'
+    return 'sportsgameodds'
+
+
+def _decimal_to_american(decimal_odds):
+    try:
+        d = float(decimal_odds)
+        if not np.isfinite(d) or d <= 1.0:
+            return None
+        if d >= 2.0:
+            return int(round((d - 1.0) * 100.0))
+        return int(round(-100.0 / (d - 1.0)))
+    except Exception:
+        return None
+
+
+def _extract_american_odds_value(value):
+    """Extract American odds from flexible provider payload shapes."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            f = float(value)
+            if not np.isfinite(f):
+                return None
+            # American odds are usually outside (-100, 100) and not zero.
+            if f == 0:
+                return None
+            if abs(f) >= 100:
+                return int(round(f))
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+        s = value.strip().replace(',', '')
+        if not s:
+            return None
+        try:
+            f = float(s)
+            if abs(f) >= 100 and f != 0:
+                return int(round(f))
+            if f > 1.0:
+                return _decimal_to_american(f)
+        except Exception:
+            return None
+
+    if isinstance(value, dict):
+        # Common explicit American fields.
+        for k in [
+            'american', 'americanOdds', 'oddsAmerican', 'priceAmerican',
+            'line', 'price', 'value', 'odds'
+        ]:
+            if k in value:
+                out = _extract_american_odds_value(value.get(k))
+                if out is not None:
+                    return out
+
+        # Decimal fallback fields.
+        for k in ['decimal', 'oddsDecimal', 'priceDecimal']:
+            if k in value:
+                out = _decimal_to_american(value.get(k))
+                if out is not None:
+                    return out
+
+    return None
+
+
+def _normalize_book_key(raw_book):
+    bk = str(raw_book or '').strip().lower()
+    if not bk:
+        return 'unknown_book'
+    return bk.replace(' ', '_')
+
+
+def _normalize_sgo_player_name(raw_entity):
+    txt = str(raw_entity or '').strip()
+    if not txt:
+        return ''
+    txt = txt.replace('_', ' ').replace('-', ' ')
+    txt = ' '.join(tok for tok in txt.split() if tok)
+    if not txt:
+        return ''
+    low = txt.lower()
+    if low in {'home', 'away', 'all', 'game', 'team', 'teams'}:
+        return ''
+    # Strip common SGO suffixes like "_1_MLB" if they survive normalization.
+    txt = re.sub(r'\s+\d+\s+mlb$', '', txt, flags=re.IGNORECASE)
+    return txt
+
+
+def _parse_sgo_event_start_time(event_obj):
+    for key in ['startTime', 'startDate', 'startsAt', 'commence_time', 'commenceTime']:
+        raw = str((event_obj or {}).get(key, '')).strip()
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except Exception:
+            continue
+    return None
 
 
 def _get_hr_prop_market_key_candidates():
@@ -1789,6 +1901,216 @@ def _parse_odds_event_commence_time(event_obj):
         return datetime.fromisoformat(ts.replace('Z', '+00:00'))
     except Exception:
         return None
+
+
+def _filter_current_slate_sgo_events(events_payload):
+    """Keep only current slate events from Sportsgameodds payload."""
+    events_payload = list(events_payload or [])
+    if not events_payload:
+        return []
+
+    today_local = datetime.today().date()
+    allowed_dates = {today_local, (today_local + timedelta(days=1))}
+    kept = []
+    stale_count = 0
+    unknown_count = 0
+    outside_count = 0
+
+    for ev in events_payload:
+        dt = _parse_sgo_event_start_time(ev)
+        if dt is None:
+            unknown_count += 1
+            continue
+        d = dt.date()
+        if d < today_local:
+            stale_count += 1
+            continue
+        if d not in allowed_dates:
+            outside_count += 1
+            continue
+        kept.append(ev)
+
+    strict = str(os.getenv('ODDS_ENFORCE_CURRENT_SLATE', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    print(
+        f"SGO event filter: kept={len(kept)}/{len(events_payload)} "
+        f"(stale={stale_count}, unknown_time={unknown_count}, outside_window={outside_count}, strict={strict})"
+    )
+    if not kept and unknown_count > 0 and stale_count == 0 and outside_count == 0:
+        # Some SGO payload shapes omit explicit event time fields at top level.
+        # In that case keep all events and rely on odds market filters.
+        return events_payload
+    if strict and stale_count > 0:
+        raise RuntimeError(
+            f"Stale SGO events detected ({stale_count}); aborting odds ingest because ODDS_ENFORCE_CURRENT_SLATE=true"
+        )
+
+    return kept
+
+
+def _is_hr_market_sgo(odd_id, odd_obj):
+    odd_id_l = str(odd_id or '').lower()
+    stat_id_l = str((odd_obj or {}).get('statID') or (odd_obj or {}).get('statId') or '').lower()
+    text = f"{odd_id_l} {stat_id_l}"
+    # Target player anytime home-runs markets and exclude first-HR race props.
+    if 'firsthomerun' in text or 'first_home_run' in text:
+        return False
+    return ('batting_homeruns' in text) or ('batting_homerun' in text)
+
+
+def _extract_player_from_sgo_odd_id(odd_id):
+    """Extract player token from oddID like batting_homeRuns-ALEC_BOHM_1_MLB-game-yn-yes."""
+    s = str(odd_id or '').strip()
+    if '-' not in s:
+        return ''
+    parts = s.split('-')
+    if len(parts) < 2:
+        return ''
+    token = parts[1].strip()
+    token = re.sub(r'_\d+_MLB$', '', token, flags=re.IGNORECASE)
+    token = token.replace('_', ' ')
+    return _normalize_sgo_player_name(token)
+
+
+def _extract_hr_prop_player_book_odds_from_sgo(events_payload):
+    """Extract {player_name: {book_key: american_odds}} from Sportsgameodds events payload."""
+    out = {}
+
+    def _merge_price(player_name, book_key, price):
+        if not player_name or not book_key or price is None:
+            return
+        if player_name not in out:
+            out[player_name] = {}
+
+        existing = out[player_name].get(book_key)
+        if existing is None:
+            out[player_name][book_key] = price
+            return
+
+        # Prefer bettor-friendlier payout for the same book.
+        try:
+            existing_dec = (1 + (existing / 100.0)) if existing > 0 else (1 + (100.0 / abs(existing)))
+            new_dec = (1 + (price / 100.0)) if price > 0 else (1 + (100.0 / abs(price)))
+            if new_dec > existing_dec:
+                out[player_name][book_key] = price
+        except Exception:
+            pass
+
+    for ev in events_payload or []:
+        odds_blob = ev.get('odds', {})
+        if not isinstance(odds_blob, dict):
+            continue
+
+        for odd_id, odd_obj in odds_blob.items():
+            if not isinstance(odd_obj, dict):
+                continue
+            if not _is_hr_market_sgo(odd_id, odd_obj):
+                continue
+
+            side = str(odd_obj.get('sideID') or odd_obj.get('sideId') or '').lower()
+            if side in {'under', 'no'}:
+                continue
+
+            entity = (
+                odd_obj.get('statEntityID') or odd_obj.get('statEntityId') or odd_obj.get('playerName')
+                or odd_obj.get('participantID') or odd_obj.get('name')
+            )
+            player_name = _normalize_sgo_player_name(entity)
+            if not player_name:
+                player_name = _extract_player_from_sgo_odd_id(odd_id)
+            if not player_name:
+                continue
+
+            by_book = odd_obj.get('byBookmaker')
+            if by_book is None:
+                by_book = odd_obj.get('bySportsbook')
+            if by_book is None:
+                by_book = odd_obj.get('sportsbooks')
+
+            if isinstance(by_book, dict):
+                for bk, quote in by_book.items():
+                    price = _extract_american_odds_value(quote)
+                    if price is None:
+                        continue
+                    _merge_price(player_name, _normalize_book_key(bk), price)
+            elif isinstance(by_book, list):
+                for row in by_book:
+                    if not isinstance(row, dict):
+                        continue
+                    bk = row.get('bookmakerID') or row.get('bookmakerId') or row.get('bookID') or row.get('book')
+                    price = _extract_american_odds_value(row)
+                    if price is None:
+                        continue
+                    _merge_price(player_name, _normalize_book_key(bk), price)
+
+    return out
+
+
+def _fetch_hr_props_raw_from_sportsgameodds(api_key):
+    """Fetch MLB HR props from Sportsgameodds v2 /events."""
+    if _odds_invalid_key_cooldown_active():
+        return {}
+
+    if requests is None:
+        return {}
+
+    headers = {'x-api-key': str(api_key or '').strip()}
+    params = {
+        'leagueID': str(os.getenv('SPORTSGAMEODDS_LEAGUE_ID', SPORTSGAMEODDS_DEFAULT_LEAGUE)).strip() or 'MLB',
+        'oddsAvailable': 'true',
+        'limit': str(max(25, int(float(os.getenv('SPORTSGAMEODDS_LIMIT', '250'))))),
+    }
+    max_pages = max(1, int(float(os.getenv('SPORTSGAMEODDS_MAX_PAGES', '3'))))
+    all_events = []
+    cursor = None
+
+    for _ in range(max_pages):
+        call_params = dict(params)
+        if cursor:
+            call_params['cursor'] = cursor
+
+        try:
+            resp = requests.get(f"{SPORTSGAMEODDS_BASE_URL}/events", headers=headers, params=call_params, timeout=12)
+        except Exception as e:
+            print(f"Sportsgameodds fetch failed: {e}")
+            break
+
+        if resp.status_code != 200:
+            body = (getattr(resp, 'text', '') or '')[:220]
+            if _odds_api_invalid_key(resp.status_code, body):
+                _set_odds_invalid_key_cooldown(reason_text=body)
+                return {}
+            print(f"Sportsgameodds returned {resp.status_code}: {body}")
+            break
+
+        payload = resp.json() or {}
+        if isinstance(payload, dict) and payload.get('success') is False:
+            err = str(payload.get('error', 'unknown_error'))
+            if 'api key' in err.lower() or 'invalid' in err.lower():
+                _set_odds_invalid_key_cooldown(reason_text=err)
+                return {}
+            print(f"Sportsgameodds error: {err[:180]}")
+            break
+
+        batch = payload.get('data') if isinstance(payload, dict) else payload
+        batch = list(batch or [])
+        all_events.extend(batch)
+
+        next_cursor = payload.get('nextCursor') if isinstance(payload, dict) else None
+        if not next_cursor:
+            break
+        cursor = str(next_cursor)
+
+    if not all_events:
+        return {}
+
+    filtered = _filter_current_slate_sgo_events(all_events)
+    parsed = _extract_hr_prop_player_book_odds_from_sgo(filtered)
+    if parsed:
+        n_pairs = sum(len(v) for v in parsed.values())
+        print(f"Sportsgameodds HR props: {n_pairs} book-player pairs across {len(parsed)} players")
+    else:
+        print("Sportsgameodds returned no recognized HR prop outcomes in current slate.")
+    return parsed
 
 
 def _filter_current_slate_odds_events(events_payload, source_label='odds'):
@@ -2009,9 +2331,14 @@ def _build_devigged_probs_from_raw_books(player_all_odds):
 
 
 def fetch_hr_prop_odds():
-    """Fetch live HR prop lines from The Odds API. Returns {player_name: devigged_prob}.
-    Set ODDS_API_KEY in .env to enable real market edge calculation."""
+    """Fetch live HR prop lines and return {player_name: devigged_prob}.
+
+    Provider is selected by ODDS_API_PROVIDER:
+    - sportsgameodds (default)
+    - theoddsapi
+    """
     api_key = os.getenv('ODDS_API_KEY')
+    provider = _odds_provider_name()
     if not api_key:
         if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
             raw_free = load_free_odds_sources()
@@ -2027,7 +2354,10 @@ def fetch_hr_prop_odds():
                 return build_devigged_probs_from_books(raw_free)
         return {}
     try:
-        player_all_odds = _fetch_hr_props_raw_from_odds_api(api_key)
+        if provider == 'theoddsapi':
+            player_all_odds = _fetch_hr_props_raw_from_odds_api(api_key)
+        else:
+            player_all_odds = _fetch_hr_props_raw_from_sportsgameodds(api_key)
         if not player_all_odds:
             if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
                 raw_free = load_free_odds_sources()
@@ -2037,9 +2367,12 @@ def fetch_hr_prop_odds():
                     return probs
             return {}
 
-        return _build_devigged_probs_from_raw_books(player_all_odds)
+        probs = _build_devigged_probs_from_raw_books(player_all_odds)
+        if probs:
+            print(f"Odds provider active: {provider} ({len(probs)} players with devigged prices)")
+        return probs
     except Exception as e:
-        print(f"Odds API fetch failed: {e}")
+        print(f"Odds fetch failed ({provider}): {e}")
         if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
             raw_free = load_free_odds_sources()
             if raw_free:
@@ -2053,6 +2386,7 @@ def fetch_hr_prop_odds_raw():
     """Fetch HR prop lines from ALL sportsbooks. Returns {player: {book_key: american_odds}}.
     Used for RLM monitoring and per-book line movement tracking."""
     api_key = os.getenv('ODDS_API_KEY')
+    provider = _odds_provider_name()
     if not api_key:
         if load_free_odds_sources is not None:
             return load_free_odds_sources()
@@ -2062,14 +2396,17 @@ def fetch_hr_prop_odds_raw():
             return load_free_odds_sources()
         return {}
     try:
-        raw = _fetch_hr_props_raw_from_odds_api(api_key)
+        if provider == 'theoddsapi':
+            raw = _fetch_hr_props_raw_from_odds_api(api_key)
+        else:
+            raw = _fetch_hr_props_raw_from_sportsgameodds(api_key)
         if not raw:
             if load_free_odds_sources is not None:
                 return load_free_odds_sources()
             return {}
         return raw
     except Exception as e:
-        print(f"Odds raw fetch failed: {e}")
+        print(f"Odds raw fetch failed ({provider}): {e}")
         if load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
@@ -2117,6 +2454,9 @@ def fetch_totals_market_pressure():
     """
     api_key = os.getenv('ODDS_API_KEY')
     if not api_key:
+        return {}
+    if _odds_provider_name() != 'theoddsapi':
+        # Totals pressure path is The-Odds-API-specific schema.
         return {}
     try:
         url = (
@@ -2955,14 +3295,66 @@ def calculate_confidence_interval(prob, sample_size=100):
         return (prob * 0.8, prob * 1.2)
 
 
+def validate_model_dataflow(train_df, live_df, required_features=None):
+    """Validate that training and live frames carry the expected data columns for inference."""
+    issues = []
+    required_features = required_features or []
+
+    if train_df is None:
+        issues.append("Training dataframe is None")
+    elif hasattr(train_df, 'columns'):
+        missing_train = [col for col in required_features if col not in train_df.columns]
+        if missing_train:
+            issues.append(f"Training missing feature columns: {', '.join(missing_train)}")
+        if 'is_hr' not in train_df.columns:
+            issues.append("Training dataframe missing target column 'is_hr'")
+
+    if live_df is None:
+        issues.append("Live dataframe is None")
+    elif hasattr(live_df, 'columns'):
+        missing_live = [col for col in required_features if col not in live_df.columns]
+        if missing_live:
+            issues.append(f"Live missing feature columns: {', '.join(missing_live)}")
+
+    if hasattr(train_df, 'columns') and hasattr(live_df, 'columns'):
+        for key in ['batter', 'pitcher']:
+            if key in train_df.columns and key in live_df.columns:
+                train_ids = pd.to_numeric(train_df[key], errors='coerce')
+                live_ids = pd.to_numeric(live_df[key], errors='coerce')
+                if live_ids.isna().any() and not train_ids.isna().all():
+                    issues.append(f"Live dataframe contains missing {key} IDs")
+
+    return issues
+
+
 def get_batter_consistency(df, batter_id):
     """IMPROVEMENT #8: Volatility-Weighted Features
     Returns consistency score (0-1): higher = more consistent"""
     try:
-        batter_data = df[df['batter'] == batter_id]
-        if len(batter_data) < 10:
+        batter_data = df[df['batter'] == batter_id].copy()
+        if batter_data.empty or len(batter_data) < 10:
             return 0.5
+
+        if 'is_hr' not in batter_data.columns:
+            if 'events' in batter_data.columns:
+                batter_data['is_hr'] = batter_data['events'].fillna('').str.lower().eq('home_run').astype(int)
+            elif 'event' in batter_data.columns:
+                batter_data['is_hr'] = batter_data['event'].fillna('').str.lower().eq('home_run').astype(int)
+            else:
+                return 0.5
+
+        if 'game_pk' not in batter_data.columns:
+            return 0.5
+
+        batter_data['game_pk'] = pd.to_numeric(batter_data['game_pk'], errors='coerce')
+        batter_data = batter_data.dropna(subset=['game_pk'])
+        if batter_data.empty:
+            return 0.5
+
         game_hr_rates = batter_data.groupby('game_pk')['is_hr'].mean()
+        if len(game_hr_rates) < 2:
+            return 0.5
+
         std_dev = game_hr_rates.std()
         mean_hr = game_hr_rates.mean()
         if mean_hr > 0:
@@ -2970,7 +3362,7 @@ def get_batter_consistency(df, batter_id):
             consistency = 1.0 / (1.0 + cv)
             return max(0.0, min(1.0, consistency))
         return 0.5
-    except:
+    except Exception:
         return 0.5
 
 
@@ -3523,6 +3915,16 @@ def generate_daily_predictions():
             train_df[weather_col] = default_val
         else:
             train_df[weather_col] = train_df[weather_col].fillna(default_val)
+
+    dataflow_issues = validate_model_dataflow(
+        train_df,
+        live_df=None,
+        required_features=features_train,
+    )
+    if dataflow_issues:
+        print("⚠️ Dataflow validation warnings:")
+        for issue in dataflow_issues:
+            print(f"  - {issue}")
     
     # Feature list for LIVE PREDICTIONS (includes calculated multipliers)
     features_live = features_train + [
@@ -4216,6 +4618,31 @@ def generate_daily_predictions():
                     continue
         return best_book, best_odds
 
+    def _match_raw_book_lines(bname):
+        if not market_odds_raw:
+            return {}
+        bname_lower = str(bname).lower().strip()
+        matched_books = {}
+        for key, book_map in market_odds_raw.items():
+            key_lower = str(key).lower().strip()
+            if not (bname_lower in key_lower or key_lower in bname_lower or bname_lower.split()[-1] in key_lower):
+                continue
+            for bk, odds in (book_map or {}).items():
+                try:
+                    o = float(odds)
+                    if np.isfinite(o):
+                        cur = matched_books.get(str(bk))
+                        if cur is None:
+                            matched_books[str(bk)] = o
+                        else:
+                            cur_dec = (1 + (cur / 100.0)) if cur > 0 else (1 + (100.0 / abs(cur)))
+                            new_dec = (1 + (o / 100.0)) if o > 0 else (1 + (100.0 / abs(o)))
+                            if new_dec > cur_dec:
+                                matched_books[str(bk)] = o
+                except Exception:
+                    continue
+        return matched_books
+
     if market_odds or market_odds_raw:
         def _match_odds(bname):
             bname_lower = bname.lower()
@@ -4228,11 +4655,41 @@ def generate_daily_predictions():
         live['market_prob'] = live['batter_name'].apply(_match_odds) if market_odds else np.nan
 
         raw_matches = live['batter_name'].apply(_match_raw_best_line)
+        raw_book_lines = live['batter_name'].apply(_match_raw_book_lines)
         live['best_book'] = raw_matches.apply(lambda x: x[0])
         live['best_market_odds_american'] = raw_matches.apply(lambda x: x[1])
         live['best_market_implied_prob'] = live['best_market_odds_american'].apply(
             lambda x: american_to_implied_prob(x) if pd.notna(x) else np.nan
         )
+        live['matched_book_count'] = raw_book_lines.apply(lambda d: int(len(d)) if isinstance(d, dict) else 0)
+
+        def _book_dispersion(d):
+            if not isinstance(d, dict) or not d:
+                return 0.0
+            probs = [american_to_implied_prob(v) for v in d.values()]
+            probs = [p for p in probs if p is not None and np.isfinite(p)]
+            if len(probs) < 2:
+                return 0.0
+            return float(max(probs) - min(probs))
+
+        def _arbitrage_value_pct(d):
+            if not isinstance(d, dict) or not d:
+                return 0.0
+            implied = []
+            for v in d.values():
+                p = american_to_implied_prob(v)
+                if p is not None and np.isfinite(p):
+                    implied.append(float(p))
+            if len(implied) < 2:
+                return 0.0
+            best_implied = float(min(implied))
+            median_implied = float(np.median(implied))
+            if median_implied <= 0:
+                return 0.0
+            return float(max(0.0, ((median_implied - best_implied) / median_implied) * 100.0))
+
+        live['book_prob_dispersion'] = raw_book_lines.apply(_book_dispersion)
+        live['arbitrage_value_pct'] = raw_book_lines.apply(_arbitrage_value_pct)
 
         # Prefer devigged market prob where available, else implied from best line.
         live['market_prob'] = pd.to_numeric(live['market_prob'], errors='coerce')
@@ -4286,9 +4743,21 @@ def generate_daily_predictions():
 
         elite_edge_abs = float(os.getenv('EV_EDGE_TRIGGER_ABS', '0.03'))
         elite_ev_pct = float(os.getenv('EV_TRIGGER_PCT', '10.0'))
+        arb_min_books = max(2, int(float(os.getenv('ARB_MIN_BOOKS', '3'))))
+        arb_min_value_pct = float(os.getenv('ARB_MIN_VALUE_PCT', '3.0'))
         live['elite_ev_signal'] = (
             (live['prob_edge_abs'] >= elite_edge_abs) &
             (live['ev_percent'] >= elite_ev_pct)
+        )
+        live['positive_ev_arbitrage'] = (
+            (live['ev_percent'] > 0) &
+            (live['arbitrage_value_pct'] >= arb_min_value_pct) &
+            (live['matched_book_count'] >= arb_min_books)
+        )
+        live['arbitrage_score'] = (
+            (live['ev_percent'].clip(lower=0.0) * 0.50) +
+            (live['arbitrage_value_pct'].clip(lower=0.0) * 0.35) +
+            (live['prob_edge_abs'].clip(lower=0.0) * 100.0 * 0.15)
         )
         live['release_window_sniper_signal'] = (
             (live.get('line_release_window_flag', 0) == 1) & live['elite_ev_signal']
@@ -4297,7 +4766,8 @@ def generate_daily_predictions():
         # Blend sportsbook value score with observed edge and under-drag regime.
         _sv = 1.0 + live['prob_edge_abs'].clip(lower=0.0, upper=0.12)
         _nrfi = 1.0 + pd.to_numeric(live.get('nrfi_under_drag_score', 0.0), errors='coerce').fillna(0.0) * 0.08
-        live['sportsbook_value_score'] = (_sv * _nrfi).clip(1.0, 1.25)
+        _arb = 1.0 + (live['arbitrage_value_pct'].clip(lower=0.0, upper=12.0) / 100.0) * 0.55
+        live['sportsbook_value_score'] = (_sv * _nrfi * _arb).clip(1.0, 1.35)
         
         # Filter for +EV opportunities (profitable bets only)
         live['is_positive_ev'] = live['ev_percent'] > 0
@@ -4340,6 +4810,11 @@ def generate_daily_predictions():
         live['fair_odds_american'] = live['pred_hr_prob'].apply(prob_to_fair_american)
         live['prob_edge_abs'] = 0.0
         live['elite_ev_signal'] = False
+        live['matched_book_count'] = 0
+        live['book_prob_dispersion'] = 0.0
+        live['arbitrage_value_pct'] = 0.0
+        live['positive_ev_arbitrage'] = False
+        live['arbitrage_score'] = 0.0
         live['release_window_sniper_signal'] = False
 
     physics_output_defaults = {
@@ -4379,7 +4854,17 @@ def generate_daily_predictions():
         'primary_weapon_vulnerable_pitch_count': 0.0,
         'bullpen_exposure_multiplier': 1.0,
         'lineup_protection_woba_proxy': 0.10,
-        'context_multiplier': 1.0
+        'context_multiplier': 1.0,
+        'ballistic_hr_proxy_prob': 0.0,
+        'ballistic_carry_distance_ft': 0.0,
+        'ballistic_barrier_distance_ft': 370.0,
+        'ballistic_carry_gap_ft': 0.0,
+        'ballistic_multiplier': 1.0,
+        'arbitrage_value_pct': 0.0,
+        'book_prob_dispersion': 0.0,
+        'matched_book_count': 0,
+        'positive_ev_arbitrage': 0,
+        'arbitrage_score': 0.0,
     }
     for _col, _default in physics_output_defaults.items():
         if _col not in live.columns:
@@ -4401,12 +4886,16 @@ def generate_daily_predictions():
                                     'stacked_boost_multiplier_final',
                                     'best_book', 'best_market_odds_american', 'best_market_implied_prob',
                                     'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
+                                    'arbitrage_value_pct', 'book_prob_dispersion', 'matched_book_count',
+                                    'positive_ev_arbitrage', 'arbitrage_score',
                                     'release_window_sniper_signal', 'line_release_window_flag', 'nrfi_under_drag_score',
                                     'physics_hr_prob', 'physics_per_pa_hr_prob', 'density_altitude_ft',
                                     'air_density_kg_m3', 'drag_multiplier', 'pitch_micro_matchup_score',
                                     'pitch_arsenal_matchup_score', 'vaa_attack_angle_score', 'umpire_catcher_cascade', 'umpire_zone_drift_score',
                                     'umpire_hotzone_overlap', 'fatigue_index', 'circadian_disruption_index', 'visual_fatigue_modifier',
                                     'travel_distance_miles', 'rest_day_count',
+                                    'ballistic_hr_proxy_prob', 'ballistic_carry_distance_ft',
+                                    'ballistic_barrier_distance_ft', 'ballistic_carry_gap_ft', 'ballistic_multiplier',
                                     'spin_decay_rpm', 'spin_decay_flag', 'release_pos_x_std_15', 'release_pos_z_std_15',
                                     'release_extension_decay_ft', 'spin_velocity_ratio_decay', 'primary_weapon_vulnerable_pitch_count',
                                     'bullpen_exposure_multiplier',
@@ -4525,6 +5014,16 @@ def generate_daily_predictions():
             elite_view = elite_view.sort_values('ev_percent', ascending=False).head(10)
             print("\nElite +EV Discrepancy Signals:")
             print(elite_view.to_string(index=False))
+
+    if 'positive_ev_arbitrage' in live.columns:
+        arb = live[live['positive_ev_arbitrage'] == True].copy()
+        if not arb.empty:
+            arb_view = arb[[
+                'batter_name', 'pitcher_name', 'best_book', 'best_market_odds_american',
+                'ev_percent', 'arbitrage_value_pct', 'matched_book_count', 'arbitrage_score'
+            ]].sort_values(['arbitrage_score', 'ev_percent'], ascending=[False, False]).head(10)
+            print("\nTop Positive EV Arbitrage Signals:")
+            print(arb_view.to_string(index=False))
 
     if {'circadian_disruption_index', 'visual_fatigue_modifier'}.issubset(set(live.columns)):
         circadian_view = live[['batter_name', 'pitcher_name', 'circadian_disruption_index', 'visual_fatigue_modifier', 'travel_distance_miles', 'rest_day_count', 'pred_hr_prob']].copy()

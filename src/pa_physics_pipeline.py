@@ -25,7 +25,11 @@ try:
 except Exception:  # pragma: no cover - fallback only used when requests missing
     requests = None
 
-from src.physics_ballistics import DensityAltitudeCalculator
+from src.physics_ballistics import (
+    DensityAltitudeCalculator,
+    EnvironmentalConditions,
+    simulate_home_run_probability,
+)
 from src.stadium_coordinates import STADIUM_COORDINATES
 
 TEAM_SCHEDULE_CACHE: Dict[str, Dict[str, float]] = {}
@@ -934,9 +938,60 @@ def simulate_plate_appearance_probability(
         _safe_float(wind_map.get("wind_vector_multiplier_cf"), 1.0),
     )
 
+    # Explicit 3D trajectory/carry simulation using ballistics module.
+    batter_hand = str(row.get("batter_hand", "R") or "R").upper()
+    if batter_hand == "L":
+        target_field = "rf"
+    elif batter_hand == "S":
+        target_field = "cf"
+    else:
+        target_field = "lf"
+
+    ev_mph = _bounded(_safe_float(row.get("bat_avg_exit_velocity"), 88.0), 72.0, 116.0)
+    la_deg = _bounded(_safe_float(row.get("bat_avg_launch_angle"), 12.0), -5.0, 45.0)
+    est_spin_rpm = _safe_int(_bounded(2050.0 + ((ev_mph - 90.0) * 32.0) + ((la_deg - 12.0) * 14.0), 1400.0, 3400.0), 2200)
+    est_spin_axis = 180.0
+    est_pitch_vaa = _safe_float(micro.get("estimated_pitcher_vaa"), -5.5)
+    est_attack_angle = _safe_float(micro.get("estimated_batter_attack_angle"), 12.0)
+
+    env_conditions = EnvironmentalConditions(
+        temperature_f=_safe_float(env.get("temperature_f"), 70.0),
+        barometric_pressure_inHg=_safe_float(env.get("pressure_inhg"), 29.92),
+        altitude_ft=_safe_int(env.get("altitude_ft"), 500),
+        humidity_pct=_safe_float(env.get("humidity_pct"), 50.0),
+        wind_speed_mph=_safe_float(env.get("wind_speed_mph"), 5.0),
+        wind_direction_deg=_safe_float(env.get("wind_direction_deg"), 0.0),
+        roof_status=str(env.get("roof_status", "open") or "open"),
+    )
+    home_team_key = TEAM_ABBR_TO_STADIUM_KEY.get(str(row.get("home_team", "")), "")
+    ballistic = simulate_home_run_probability(
+        batter_exit_velocity_mph=ev_mph,
+        batter_launch_angle_deg=la_deg,
+        batter_spin_rate_rpm=est_spin_rpm,
+        batter_spin_axis_deg=est_spin_axis,
+        pitcher_vaa_deg=est_pitch_vaa,
+        batter_attack_angle_deg=est_attack_angle,
+        environmental_conditions=env_conditions,
+        stadium_name=home_team_key or str(row.get("home_team", "")),
+        target_field=target_field,
+    )
+
+    ballistic_hr_prob = _safe_float(ballistic.get("home_run_probability"), 0.12)
+    ballistic_carry_ft = _safe_float(ballistic.get("carry_distance_ft"), 360.0)
+    ballistic_barrier_ft = _safe_float(ballistic.get("barrier_distance_ft"), 370.0)
+    carry_gap_ft = ballistic_carry_ft - ballistic_barrier_ft
+    ballistic_multiplier = _bounded(
+        1.0
+        + ((ballistic_hr_prob - 0.18) * 0.45)
+        + (_bounded(carry_gap_ft, -45.0, 70.0) / 420.0),
+        0.84,
+        1.24,
+    )
+
     context_mult = (
         _safe_float(env.get("drag_multiplier"), 1.0)
         * wind_boost
+        * ballistic_multiplier
         * _safe_float(micro.get("pitch_micro_matchup_score"), 1.0)
         * _safe_float(micro.get("pitch_arsenal_matchup_score"), 1.0)
         * _safe_float(micro.get("vaa_attack_angle_score"), 1.0)
@@ -986,6 +1041,12 @@ def simulate_plate_appearance_probability(
         "primary_weapon_vulnerable_pitch_count": _safe_float(spin_decay.get("primary_weapon_vulnerable_pitch_count"), 0.0),
         "bullpen_exposure_multiplier": bullpen_exposure_multiplier,
         "context_multiplier": _bounded(context_mult, 0.65, 1.55),
+        "ballistic_hr_proxy_prob": ballistic_hr_prob,
+        "ballistic_carry_distance_ft": ballistic_carry_ft,
+        "ballistic_barrier_distance_ft": ballistic_barrier_ft,
+        "ballistic_carry_gap_ft": carry_gap_ft,
+        "ballistic_multiplier": ballistic_multiplier,
+        "ballistic_target_field": target_field,
     }
 
 
