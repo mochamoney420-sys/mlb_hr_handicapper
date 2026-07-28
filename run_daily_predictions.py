@@ -3461,7 +3461,7 @@ def apply_time_decay_weight(date_val, reference_date, half_life_days=14):
 
 def _prepare_discord_rankings(live_df):
     """Prepare a ranking frame for Discord output while preserving reliability labels."""
-    if live_df is None or live_df.empty:
+    if live_df is None:
         return pd.DataFrame()
 
     work = live_df.copy()
@@ -3469,6 +3469,26 @@ def _prepare_discord_rankings(live_df):
         work['model_reliability'] = work['model_reliability'].fillna('MEDIUM').astype(str).str.upper()
     else:
         work['model_reliability'] = 'MEDIUM'
+
+    if work.empty:
+        work['physics_delta'] = []
+        work['hr_probability'] = []
+        work['ev_pct'] = []
+        return work
+
+    if 'physics_delta' not in work.columns:
+        if {'physics_hr_prob', 'base_model_prob'}.issubset(set(work.columns)):
+            work['physics_delta'] = (
+                pd.to_numeric(work['physics_hr_prob'], errors='coerce').fillna(0.0)
+                - pd.to_numeric(work['base_model_prob'], errors='coerce').fillna(0.0)
+            )
+        elif 'pred_hr_prob' in work.columns and 'base_model_prob' in work.columns:
+            work['physics_delta'] = (
+                pd.to_numeric(work['pred_hr_prob'], errors='coerce').fillna(0.0)
+                - pd.to_numeric(work['base_model_prob'], errors='coerce').fillna(0.0)
+            )
+        else:
+            work['physics_delta'] = 0.0
 
     rename_map = {'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'}
     if 'model_reliability' not in work.columns:
@@ -5155,6 +5175,8 @@ def generate_daily_predictions():
                 'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta'
             ]]
         ).copy()
+        if 'physics_delta' not in radar.columns:
+            radar['physics_delta'] = 0.0
         radar['hr_probability'] = pd.to_numeric(radar['hr_probability'], errors='coerce').fillna(0.0)
         radar['physics_delta'] = pd.to_numeric(radar['physics_delta'], errors='coerce').fillna(0.0)
         radar = radar[radar['hr_probability'] >= max(0.03, discord_min_prob * 0.7)]
@@ -5163,7 +5185,11 @@ def generate_daily_predictions():
         radar = radar[
             ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
         ]
-        radar['physics_delta_abs'] = radar['physics_delta'].abs()
+        if 'physics_delta' not in radar.columns:
+            radar['physics_delta'] = 0.0
+        physics_delta_series = pd.to_numeric(radar.get('physics_delta', 0.0), errors='coerce').fillna(0.0)
+        radar['physics_delta'] = physics_delta_series
+        radar['physics_delta_abs'] = physics_delta_series.abs()
         radar = radar.sort_values(
             by=['physics_delta_abs', 'hr_probability'],
             ascending=[False, False]

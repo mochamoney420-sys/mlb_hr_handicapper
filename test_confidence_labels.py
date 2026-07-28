@@ -85,6 +85,25 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertIn("model_reliability", rankings.columns)
         self.assertEqual(rankings["model_reliability"].iloc[0], "HIGH")
 
+    def test_prepare_discord_rankings_creates_physics_delta_when_missing(self):
+        live_df = pd.DataFrame(
+            {
+                "batter_name": ["A"],
+                "pitcher_name": ["B"],
+                "pred_hr_prob": [0.18],
+                "edge_pct": [5.0],
+                "kelly_fraction": [0.1],
+                "ev_percent": [2.0],
+                "game_time": ["7:00 PM"],
+                "base_model_prob": [0.10],
+            }
+        )
+
+        rankings = _prepare_discord_rankings(live_df)
+
+        self.assertIn("physics_delta", rankings.columns)
+        self.assertAlmostEqual(rankings["physics_delta"].iloc[0], 0.08)
+
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
             {
