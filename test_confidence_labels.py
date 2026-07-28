@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
-from run_daily_predictions import get_batter_consistency, validate_model_dataflow
+import run_daily_predictions as rdp
+from run_daily_predictions import estimate_model_reliability, get_batter_consistency, validate_model_dataflow
 
 
 class ConfidenceLabelTests(unittest.TestCase):
@@ -30,6 +32,14 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertGreater(batter_one_consistency, batter_two_consistency)
         self.assertGreaterEqual(batter_one_consistency, 0.45)
         self.assertLess(batter_two_consistency, 0.45)
+
+    def test_fetch_historical_weather_returns_none_on_interrupt(self):
+        with patch.object(rdp.requests, "get", side_effect=KeyboardInterrupt):
+            self.assertIsNone(rdp._fetch_historical_weather_for_team_date("SEA", "2026-07-27"))
+
+    def test_estimate_model_reliability_uses_medium_for_reasonable_signal(self):
+        label = estimate_model_reliability(0.12, 0.6, 15)
+        self.assertEqual(label, "MEDIUM")
 
 
 if __name__ == "__main__":

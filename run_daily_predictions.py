@@ -410,6 +410,8 @@ def _fetch_historical_weather_for_team_date(team_abbr, date_str):
             'precipitation': _pick('precipitation_sum', 0.0),
             'pressure': _pick('pressure_msl_mean', 1013.25),
         }
+    except KeyboardInterrupt:
+        return None
     except Exception:
         return None
 
@@ -3385,11 +3387,20 @@ def estimate_model_reliability(pred_prob, consistency_score, sample_size):
     try:
         if pred_prob < 0.05 or pred_prob > 0.95:
             return 'LOW'
-        if consistency_score < 0.4 or sample_size < 20:
+
+        if sample_size < 8:
             return 'LOW'
-        if consistency_score > 0.7 and sample_size > 50 and 0.15 < pred_prob < 0.85:
+
+        if consistency_score < 0.25:
+            return 'LOW'
+
+        if consistency_score > 0.7 and sample_size > 25 and 0.12 < pred_prob < 0.88:
             return 'HIGH'
-        return 'MEDIUM'
+
+        if sample_size >= 12 and consistency_score >= 0.45:
+            return 'MEDIUM'
+
+        return 'LOW'
     except:
         return 'MEDIUM'
 
