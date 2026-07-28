@@ -3459,6 +3459,23 @@ def apply_time_decay_weight(date_val, reference_date, half_life_days=14):
         return 1.0
 
 
+def _prepare_discord_rankings(live_df):
+    """Prepare a ranking frame for Discord output while preserving reliability labels."""
+    if live_df is None or live_df.empty:
+        return pd.DataFrame()
+
+    work = live_df.copy()
+    if 'model_reliability' in work.columns:
+        work['model_reliability'] = work['model_reliability'].fillna('MEDIUM').astype(str).str.upper()
+    else:
+        work['model_reliability'] = 'MEDIUM'
+
+    rename_map = {'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'}
+    if 'model_reliability' not in work.columns:
+        work['model_reliability'] = 'MEDIUM'
+    return work.rename(columns=rename_map)
+
+
 def estimate_model_reliability(pred_prob, consistency_score, sample_size):
     """IMPROVEMENT #4: Confidence/Reliability Level
     Returns: 'HIGH', 'MEDIUM', or 'LOW' confidence"""
@@ -5107,8 +5124,9 @@ def generate_daily_predictions():
             return float(default)
 
     # Sort and present elite values
-    rankings = live[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time']].rename(
-        columns={'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'})
+    rankings = _prepare_discord_rankings(
+        live[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability']]
+    )
 
     discord_top_prob_n = max(10, _env_int('DISCORD_TOP_PROB_COUNT', 30))
     discord_top_ev_n = max(3, _env_int('DISCORD_TOP_EV_COUNT', 12))
@@ -5131,10 +5149,12 @@ def generate_daily_predictions():
                 pd.to_numeric(live.get('physics_hr_prob', 0.0), errors='coerce').fillna(0.0)
                 - pd.to_numeric(live.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
             )
-        radar = live[[
-            'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
-            'kelly_fraction', 'ev_percent', 'game_time', 'physics_delta'
-        ]].rename(columns={'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'}).copy()
+        radar = _prepare_discord_rankings(
+            live[[
+                'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
+                'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta'
+            ]]
+        ).copy()
         radar['hr_probability'] = pd.to_numeric(radar['hr_probability'], errors='coerce').fillna(0.0)
         radar['physics_delta'] = pd.to_numeric(radar['physics_delta'], errors='coerce').fillna(0.0)
         radar = radar[radar['hr_probability'] >= max(0.03, discord_min_prob * 0.7)]
@@ -5259,8 +5279,9 @@ def generate_daily_predictions():
     if 'is_positive_ev' in live.columns:
         positive_ev = live[live['is_positive_ev'] == True].copy()
         if not positive_ev.empty:
-            top_ev = positive_ev[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time']].rename(
-                columns={'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'})
+            top_ev = _prepare_discord_rankings(
+                positive_ev[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability']]
+            )
             top_ev = top_ev.sort_values(by='ev_pct', ascending=False).head(discord_top_ev_n).reset_index(drop=True)
             print(f"\n✅ +EV PREMIUM PICKS (Expected Value > 0%):")
             print(top_ev.to_string(index=False))

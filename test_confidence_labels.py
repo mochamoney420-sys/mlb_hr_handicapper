@@ -12,6 +12,7 @@ from run_daily_predictions import (
     estimate_model_reliability,
     get_batter_consistency,
     validate_model_dataflow,
+    _prepare_discord_rankings,
 )
 
 
@@ -64,6 +65,25 @@ class ConfidenceLabelTests(unittest.TestCase):
         train_df = pd.DataFrame({"batter": [1], "pitcher": [2], "is_hr": [0]})
         issues = validate_model_dataflow(train_df, None, required_features=["bat_pa_count"])
         self.assertFalse(any("Live dataframe is None" in issue for issue in issues))
+
+    def test_prepare_discord_rankings_preserves_model_reliability(self):
+        live_df = pd.DataFrame(
+            {
+                "batter_name": ["A"],
+                "pitcher_name": ["B"],
+                "pred_hr_prob": [0.15],
+                "edge_pct": [5.0],
+                "kelly_fraction": [0.1],
+                "ev_percent": [2.0],
+                "game_time": ["7:00 PM"],
+                "model_reliability": ["HIGH"],
+            }
+        )
+
+        rankings = _prepare_discord_rankings(live_df)
+
+        self.assertIn("model_reliability", rankings.columns)
+        self.assertEqual(rankings["model_reliability"].iloc[0], "HIGH")
 
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
