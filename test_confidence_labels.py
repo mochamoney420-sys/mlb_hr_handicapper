@@ -129,6 +129,13 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertIn("physics_delta", finalized.columns)
         self.assertIn("physics_delta_abs", finalized.columns)
 
+    def test_select_thresholded_candidates_returns_empty_when_no_rows_meet_threshold(self):
+        pool = pd.DataFrame({"batter_name": ["A", "B"], "hr_probability": [0.02, 0.03]})
+
+        selected = rdp._select_thresholded_candidates(pool, min_prob=0.05, max_rows=5)
+
+        self.assertTrue(selected.empty)
+
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
             {

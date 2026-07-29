@@ -3503,6 +3503,22 @@ def _finalize_discord_radar_frame(rankings_df):
     return work
 
 
+def _select_thresholded_candidates(rankings_df, min_prob, max_rows):
+    """Return only rows that meet the requested probability threshold."""
+    if rankings_df is None or rankings_df.empty:
+        return pd.DataFrame()
+
+    work = rankings_df.copy()
+    if 'hr_probability' not in work.columns:
+        return pd.DataFrame(columns=work.columns)
+
+    work['hr_probability'] = _coerce_numeric_column(work, 'hr_probability', default=0.0)
+    qualified = work[work['hr_probability'] >= min_prob].copy()
+    if qualified.empty:
+        return pd.DataFrame(columns=work.columns)
+    return qualified.head(max_rows).reset_index(drop=True)
+
+
 def _prepare_discord_rankings(live_df):
     """Prepare a ranking frame for Discord output while preserving reliability labels."""
     if live_df is None:
@@ -5202,9 +5218,9 @@ def generate_daily_predictions():
 
     # Top probabilities for reporting/Discord delivery.
     prob_pool = rankings.sort_values(by='hr_probability', ascending=False).reset_index(drop=True)
-    top_prob = prob_pool[prob_pool['hr_probability'] >= discord_min_prob].head(discord_top_prob_n).copy()
+    top_prob = _select_thresholded_candidates(prob_pool, discord_min_prob, discord_top_prob_n)
     if top_prob.empty:
-        top_prob = prob_pool.head(discord_top_prob_n).copy()
+        print(f"No predictions met the minimum Discord confidence threshold ({discord_min_prob * 100:.0f}%).")
 
     if 'physics_delta' not in live.columns:
         live['physics_delta'] = 0.0
