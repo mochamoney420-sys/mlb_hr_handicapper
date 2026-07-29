@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pandas as pd
@@ -149,6 +151,27 @@ class ConfidenceLabelTests(unittest.TestCase):
         )
 
         self.assertTrue(any("No qualifying picks met" in line for line in lines))
+
+    def test_send_morning_learning_summary_uses_repo_data_dir_for_reports(self):
+        with TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            report_path = data_dir / "hr_learning_report_2026-07-29.json"
+            report_path.write_text(
+                '{"total_hrs_analyzed": 4, "accurate_predictions": 0, "missed_predictions": 4, "key_findings": ["test finding"]}',
+                encoding="utf-8",
+            )
+            eval_path = data_dir / "evaluation_2026-07-28.csv"
+            eval_path.write_text("brier_error\n0.12\n", encoding="utf-8")
+
+            with patch.object(rdp, "_repo_data_dir", return_value=data_dir):
+                with patch.object(rdp, "send_discord_webhook", return_value=True) as mock_send:
+                    result = rdp.send_morning_learning_summary(missed_count=4)
+
+            self.assertTrue(result)
+            content = mock_send.call_args.kwargs["content"]
+            self.assertIn("Yesterday reviewed: 4 HRs | Predicted: 0 | Missed: 4", content)
+            self.assertIn("Evaluation: 1 predictions scored", content)
+            self.assertIn("test finding", content)
 
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(

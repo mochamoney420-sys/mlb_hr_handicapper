@@ -1213,6 +1213,15 @@ def run_model_self_check(days_lookback=30):
         return False
 
 
+def _repo_data_dir():
+    """Return the repository data directory regardless of the current working directory."""
+    repo_root = Path(__file__).resolve().parent
+    candidate = repo_root / 'data'
+    if candidate.exists():
+        return candidate
+    return Path('data')
+
+
 def send_morning_learning_summary(
     learning_result=None,
     missed_count=0,
@@ -1222,7 +1231,8 @@ def send_morning_learning_summary(
 ):
     """Send a once-per-day Discord summary of what the model learned and changed."""
     today_str = datetime.today().strftime('%Y-%m-%d')
-    marker = Path('data') / f'morning_learning_summary_sent_{today_str}.txt'
+    data_dir = _repo_data_dir()
+    marker = data_dir / f'morning_learning_summary_sent_{today_str}.txt'
 
     if marker.exists() and os.getenv('FORCE_MORNING_LEARNING_SUMMARY', 'false').lower() != 'true':
         return False
@@ -1233,7 +1243,7 @@ def send_morning_learning_summary(
 
     # Fallback: if in-memory insights are missing, try today's saved learning report.
     if not insights:
-        report_path = Path('data') / f"hr_learning_report_{today_str}.json"
+        report_path = data_dir / f"hr_learning_report_{today_str}.json"
         if report_path.exists():
             try:
                 loaded = _json.loads(report_path.read_text(encoding='utf-8'))
@@ -1242,7 +1252,7 @@ def send_morning_learning_summary(
             except Exception:
                 pass
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-    eval_file = Path('data') / f'evaluation_{yesterday_str}.csv'
+    eval_file = data_dir / f'evaluation_{yesterday_str}.csv'
     eval_brier = None
     eval_rows = 0
     if eval_file.exists():
@@ -1255,7 +1265,7 @@ def send_morning_learning_summary(
             pass
 
     if not insights:
-        yesterday_eval_path = Path('data') / f"evaluation_{(datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')}.csv"
+        yesterday_eval_path = data_dir / f"evaluation_{(datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')}.csv"
         if yesterday_eval_path.exists():
             try:
                 from analyze_hr_patterns import build_learning_insights_from_evaluation
@@ -1319,7 +1329,7 @@ def send_morning_learning_summary(
 
     sent = send_discord_webhook(content="\n".join(lines))
     if sent:
-        Path('data').mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
         marker.write_text(datetime.now().isoformat(), encoding='utf-8')
     return sent
 
