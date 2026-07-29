@@ -3491,6 +3491,18 @@ def _ensure_discord_radar_columns(rankings_df):
     return work
 
 
+def _finalize_discord_radar_frame(rankings_df):
+    """Normalize radar-style rankings so sort operations always have the expected columns."""
+    if rankings_df is None:
+        return pd.DataFrame()
+
+    work = _ensure_discord_radar_columns(rankings_df).copy()
+    work['hr_probability'] = _coerce_numeric_column(work, 'hr_probability', default=0.0)
+    work['physics_delta'] = _coerce_numeric_column(work, 'physics_delta', default=0.0)
+    work['physics_delta_abs'] = work['physics_delta'].abs()
+    return work
+
+
 def _prepare_discord_rankings(live_df):
     """Prepare a ranking frame for Discord output while preserving reliability labels."""
     if live_df is None:
@@ -5203,18 +5215,15 @@ def generate_daily_predictions():
             'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta'
         ]]
     ).copy()
-    radar = _ensure_discord_radar_columns(radar)
-    radar['hr_probability'] = pd.to_numeric(radar['hr_probability'], errors='coerce').fillna(0.0)
-    radar['physics_delta'] = pd.to_numeric(radar['physics_delta'], errors='coerce').fillna(0.0)
+    radar = _finalize_discord_radar_frame(radar)
     radar = radar[radar['hr_probability'] >= max(0.03, discord_min_prob * 0.7)]
 
     top_keys = set(zip(top_prob['batter_name'].astype(str), top_prob['pitcher_name'].astype(str)))
     radar = radar[
         ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
     ]
-    physics_delta_series = _coerce_numeric_column(radar, 'physics_delta', default=0.0)
-    radar['physics_delta'] = physics_delta_series
-    radar['physics_delta_abs'] = physics_delta_series.abs()
+    radar['physics_delta'] = _coerce_numeric_column(radar, 'physics_delta', default=0.0)
+    radar['physics_delta_abs'] = radar['physics_delta'].abs()
     radar = radar.sort_values(
         by=['physics_delta_abs', 'hr_probability'],
         ascending=[False, False]

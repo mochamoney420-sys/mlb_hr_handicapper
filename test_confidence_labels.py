@@ -120,6 +120,15 @@ class ConfidenceLabelTests(unittest.TestCase):
 
         self.assertEqual(series.iloc[0], 0.0)
 
+    def test_finalize_discord_radar_frame_adds_required_columns(self):
+        radar = pd.DataFrame({"batter_name": ["A"]})
+
+        finalized = rdp._finalize_discord_radar_frame(radar)
+
+        self.assertIn("hr_probability", finalized.columns)
+        self.assertIn("physics_delta", finalized.columns)
+        self.assertIn("physics_delta_abs", finalized.columns)
+
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
             {
