@@ -136,6 +136,20 @@ class ConfidenceLabelTests(unittest.TestCase):
 
         self.assertTrue(selected.empty)
 
+    def test_build_discord_snapshot_summary_reports_no_qualifying_picks(self):
+        lines = rdp._build_discord_snapshot_summary(
+            "2026-07-29",
+            pd.DataFrame({"batter_name": ["A"]}),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            0.06,
+            2,
+            6,
+        )
+
+        self.assertTrue(any("No qualifying picks met" in line for line in lines))
+
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
             {

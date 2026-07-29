@@ -3519,6 +3519,21 @@ def _select_thresholded_candidates(rankings_df, min_prob, max_rows):
     return qualified.head(max_rows).reset_index(drop=True)
 
 
+def _build_discord_snapshot_summary(target_date, rankings, top_prob, radar, top_ev, discord_min_prob, discord_window_1_hours, discord_window_2_hours):
+    """Build a single Discord summary that matches the actual pick tables being sent."""
+    lines = [f"⚾ MLB HR MODEL SNAPSHOT ({target_date})", f"Candidates ranked: {len(rankings)}"]
+
+    if top_prob.empty and radar.empty and top_ev.empty:
+        lines.append(f"No qualifying picks met the minimum confidence threshold ({discord_min_prob * 100:.0f}%).")
+    else:
+        lines.append(f"Most Likely Homers: {len(top_prob)} candidates ≥{discord_min_prob * 100:.0f}% confidence")
+        lines.append(f"Delivered radar picks: {len(radar)}")
+        lines.append(f"Delivered +EV picks: {len(top_ev)}")
+
+    lines.append(f"Time windows: <= {discord_window_1_hours}h, <= {discord_window_2_hours}h, later")
+    return lines
+
+
 def _prepare_discord_rankings(live_df):
     """Prepare a ranking frame for Discord output while preserving reliability labels."""
     if live_df is None:
@@ -5420,14 +5435,16 @@ def generate_daily_predictions():
 
         return True
 
-    summary_lines = [
-        f"\u26be MLB HR MODEL SNAPSHOT ({target_date})",
-        f"Candidates ranked: {len(rankings)}",
-        f"Most Likely Homers: {len(top_prob)} candidates ≥{discord_min_prob*100:.0f}% confidence",
-        f"Delivered radar picks: {len(radar)}",
-        f"Delivered +EV picks: {len(top_ev)}",
-        f"Time windows: <= {discord_window_1_hours}h, <= {discord_window_2_hours}h, later",
-    ]
+    summary_lines = _build_discord_snapshot_summary(
+        target_date,
+        rankings,
+        top_prob,
+        radar,
+        top_ev,
+        discord_min_prob,
+        discord_window_1_hours,
+        discord_window_2_hours,
+    )
     if not send_discord_webhook(content="\n".join(summary_lines)):
         print("Failed to transmit Discord summary after trying configured candidates.")
 
