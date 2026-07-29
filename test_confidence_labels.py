@@ -87,6 +87,26 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertIn("model_reliability", rankings.columns)
         self.assertEqual(rankings["model_reliability"].iloc[0], "HIGH")
 
+    def test_apply_expert_signal_boosts_increases_prob_for_favorable_matchup(self):
+        live_df = pd.DataFrame(
+            {
+                "has_platoon_advantage": [1],
+                "platoon_advantage_multiplier": [1.18],
+                "bat_barrel_rate": [0.16],
+                "bat_hard_hit_rate": [0.46],
+                "bat_avg_exit_velocity": [95.0],
+                "pitch_hr_per_9": [2.1],
+                "pitch_hr_allowed_rate": [0.06],
+                "park_factor": [110.0],
+                "temp": [85.0],
+                "wind_out_component": [8.0],
+            }
+        )
+
+        boosted = rdp.apply_expert_signal_boosts(live_df, [0.08])
+
+        self.assertGreater(boosted[0], 0.08)
+
     def test_prepare_discord_rankings_creates_physics_delta_when_missing(self):
         live_df = pd.DataFrame(
             {

@@ -3906,6 +3906,76 @@ def compute_pitcher_intent_fear_factor(statcast_df, elite_batters):
         return {}
 
 
+def apply_expert_signal_boosts(live_df, base_probs):
+    """Boost probabilities using matchup, contact-quality, and environment signals."""
+    if live_df is None:
+        return np.asarray(base_probs, dtype=float)
+
+    probs = np.asarray(base_probs, dtype=float).reshape(-1)
+    if len(probs) != len(live_df):
+        probs = np.resize(probs, len(live_df))
+
+    if len(live_df) == 0:
+        return probs
+
+    def _series_or_default(column, default):
+        if column in live_df.columns:
+            return pd.to_numeric(live_df[column], errors='coerce').fillna(default).astype(float)
+        return pd.Series([default] * len(live_df), index=live_df.index, dtype=float)
+
+    platoon = _series_or_default('has_platoon_advantage', 0.0)
+    platoon_mult = _series_or_default('platoon_advantage_multiplier', 1.0)
+    barrel_rate = _series_or_default('bat_barrel_rate', 0.0)
+    hard_hit_rate = _series_or_default('bat_hard_hit_rate', 0.0)
+    exit_velo = _series_or_default('bat_avg_exit_velocity', 88.0)
+    pitch_hr9 = _series_or_default('pitch_hr_per_9', 1.1)
+    pitch_hr_allowed = _series_or_default('pitch_hr_allowed_rate', 0.04)
+    park_factor = _series_or_default('park_factor', 100.0)
+    temp = _series_or_default('temp', 72.0)
+    wind_out = _series_or_default('wind_out_component', 0.0)
+    weather_extremes = _series_or_default('weather_extremes_multiplier', 1.0)
+    density_altitude = _series_or_default('density_altitude_factor', 1.0)
+    porch_bonus = _series_or_default('porch_advantage_bonus', 1.0)
+    elite_flag = _series_or_default('is_elite_power_batter', 0.0)
+
+    platoon_score = np.clip(((platoon_mult - 1.0) / 0.25) + (platoon * 0.35), 0.0, 1.0)
+    contact_score = np.clip(
+        ((barrel_rate - 0.08) / 0.10) * 0.45
+        + ((hard_hit_rate - 0.35) / 0.25) * 0.35
+        + ((exit_velo - 88.0) / 12.0) * 0.20,
+        0.0,
+        1.0,
+    )
+    pitcher_score = np.clip(
+        ((pitch_hr9 - 1.1) / 1.2) * 0.55
+        + ((pitch_hr_allowed - 0.04) / 0.03) * 0.45,
+        0.0,
+        1.0,
+    )
+    park_weather_score = np.clip(
+        ((park_factor - 100.0) / 20.0) * 0.35
+        + ((temp - 72.0) / 18.0) * 0.25
+        + (wind_out / 10.0) * 0.20
+        + ((weather_extremes - 1.0) / 0.20) * 0.10
+        + ((density_altitude - 1.0) / 0.25) * 0.10,
+        0.0,
+        1.0,
+    )
+    porch_score = np.clip((porch_bonus - 1.0) / 0.15, 0.0, 1.0)
+
+    signal_multiplier = (
+        1.0
+        + (platoon_score * 0.10)
+        + (contact_score * 0.09)
+        + (pitcher_score * 0.08)
+        + (park_weather_score * 0.06)
+        + (porch_score * 0.04)
+        + (elite_flag * 0.03)
+    )
+
+    return np.clip(probs * signal_multiplier, 0.0, 1.0)
+
+
 def run_adversarial_debate_layer(live_df, rounds=5000):
     """Dual-agent adversarial layer (Optimist vs Pessimist/Sportsbook)."""
     if live_df is None or live_df.empty:
@@ -4670,6 +4740,10 @@ def generate_daily_predictions():
     # Apply combined boosts
     combined_boosts = pitcher_form_boosts * batter_streak_boosts * park_adjustments
     base_model_probs = np.clip(base_model_probs * combined_boosts, 0.0, 1.0)
+
+    # Expert-style matchup and environment boosts for stronger signal separation.
+    expert_boosted_probs = apply_expert_signal_boosts(live, base_model_probs)
+    base_model_probs = np.clip(expert_boosted_probs, 0.0, 1.0)
     
     elite_enhancements_applied = (pitcher_form_boosts != 1.0).sum() + (batter_streak_boosts != 1.0).sum()
     print(f"✅ Elite enhancements applied: {elite_enhancements_applied} matchups boosted/adjusted")
