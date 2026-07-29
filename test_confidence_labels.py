@@ -113,6 +113,13 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertIn("physics_delta", ensured.columns)
         self.assertEqual(ensured["hr_probability"].iloc[0], 0.0)
 
+    def test_coerce_numeric_column_returns_default_series_when_missing(self):
+        radar = pd.DataFrame({"batter_name": ["A"]})
+
+        series = rdp._coerce_numeric_column(radar, "physics_delta", default=0.0)
+
+        self.assertEqual(series.iloc[0], 0.0)
+
     def test_build_feedback_weight_series_uses_game_pk_fallback_when_ids_missing(self):
         train_df = pd.DataFrame(
             {

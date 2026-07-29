@@ -3459,6 +3459,17 @@ def apply_time_decay_weight(date_val, reference_date, half_life_days=14):
         return 1.0
 
 
+def _coerce_numeric_column(frame, column_name, default=0.0):
+    """Return a numeric Series for a column, creating a default series when needed."""
+    if frame is None:
+        return pd.Series([default], dtype=float)
+
+    if column_name in frame.columns:
+        return pd.to_numeric(frame[column_name], errors='coerce').fillna(default)
+
+    return pd.Series([default] * len(frame), index=frame.index, dtype=float)
+
+
 def _ensure_discord_radar_columns(rankings_df):
     """Ensure ranking output always has the columns required for Discord sorting."""
     if rankings_df is None:
@@ -5201,7 +5212,7 @@ def generate_daily_predictions():
     radar = radar[
         ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
     ]
-    physics_delta_series = pd.to_numeric(radar.get('physics_delta', 0.0), errors='coerce').fillna(0.0)
+    physics_delta_series = _coerce_numeric_column(radar, 'physics_delta', default=0.0)
     radar['physics_delta'] = physics_delta_series
     radar['physics_delta_abs'] = physics_delta_series.abs()
     radar = radar.sort_values(
