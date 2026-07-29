@@ -5222,6 +5222,8 @@ def generate_daily_predictions():
     radar = radar[
         ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
     ]
+    radar = pd.DataFrame(radar).copy()
+    radar['hr_probability'] = _coerce_numeric_column(radar, 'hr_probability', default=0.0)
     radar['physics_delta'] = _coerce_numeric_column(radar, 'physics_delta', default=0.0)
     radar['physics_delta_abs'] = radar['physics_delta'].abs()
     radar = radar.sort_values(
