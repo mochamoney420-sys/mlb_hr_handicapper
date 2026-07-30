@@ -63,6 +63,13 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertLess(adjusted["pred_hr_prob"].iloc[0], 0.20)
         self.assertAlmostEqual(adjusted["pred_hr_prob"].sum(), 0.1, places=3)
 
+    def test_build_devigged_probs_from_raw_books_normalizes_vig(self):
+        raw = {"A": {"draftkings": -110, "fanduel": -120, "betmgm": 100}}
+        adjusted = rdp._build_devigged_probs_from_raw_books(raw)
+        self.assertIn("A", adjusted)
+        self.assertGreaterEqual(adjusted["A"], 0.30)
+        self.assertLessEqual(adjusted["A"], 0.35)
+
     def test_validate_model_dataflow_does_not_flag_missing_live_df_when_not_ready(self):
         train_df = pd.DataFrame({"batter": [1], "pitcher": [2], "is_hr": [0]})
         issues = validate_model_dataflow(train_df, None, required_features=["bat_pa_count"])

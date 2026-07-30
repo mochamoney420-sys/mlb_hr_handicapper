@@ -2351,21 +2351,32 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
 
 
 def _build_devigged_probs_from_raw_books(player_all_odds):
-    """Build consensus devigged probabilities from per-book American odds."""
+    """Build consensus no-vig probabilities from per-book American odds."""
     player_probs = {}
     for name, book_odds in (player_all_odds or {}).items():
-        weighted_probs = []
+        implied_probs = []
         for bk, odds in (book_odds or {}).items():
             try:
                 odds = float(odds)
                 raw_implied = abs(odds) / (abs(odds) + 100) if odds < 0 else 100 / (odds + 100)
-                devigged = raw_implied * 0.952
-                weight = 2 if bk in SHARP_BOOKS else 1
-                weighted_probs.extend([devigged] * weight)
+                if raw_implied > 0 and np.isfinite(raw_implied):
+                    implied_probs.append(float(raw_implied))
             except Exception:
                 continue
-        if weighted_probs:
-            player_probs[name] = round(sum(weighted_probs) / len(weighted_probs), 4)
+        if not implied_probs:
+            continue
+
+        # Normalize the implied probabilities so the market overround is removed.
+        # The true no-vig probability is the normalized share of the implied market.
+        total_implied = sum(implied_probs)
+        if total_implied <= 0:
+            continue
+        no_vig = [p / total_implied for p in implied_probs]
+        if len(no_vig) == 1:
+            final_prob = no_vig[0]
+        else:
+            final_prob = float(np.mean(no_vig))
+        player_probs[name] = round(float(np.clip(final_prob, 0.0, 1.0)), 4)
     return player_probs
 
 
@@ -4906,10 +4917,12 @@ def generate_daily_predictions():
     probs = np.clip(probs * pd.to_numeric(live.get('adversarial_multiplier', 1.0), errors='coerce').fillna(1.0).values, 0.0, 1.0)
 
     # Cap stacked post-model boosts so one row cannot dominate the card from layered multipliers.
+    # The earlier cap was too conservative for rare-event bets, so we now allow a stronger
+    # top-end lift for the most favorable matchups while keeping the rest of the slate sane.
     stacked_multiplier_cap = np.where(
         base_model_probs >= 0.35,
-        1.18,
-        np.where(base_model_probs >= 0.20, 1.28, 1.42)
+        1.28,
+        np.where(base_model_probs >= 0.20, 1.40, 1.60)
     )
     safe_base = np.clip(base_model_probs, 1e-6, 1.0)
     observed_multiplier = probs / safe_base
@@ -4989,7 +5002,7 @@ def generate_daily_predictions():
 
     # Reliability-aware hard ceilings to prevent unsupported top-end inflation.
     rel_upper = live['model_reliability'].astype(str).str.upper()
-    rel_cap = np.where(rel_upper == 'HIGH', 0.62, np.where(rel_upper == 'MEDIUM', 0.52, 0.42))
+    rel_cap = np.where(rel_upper == 'HIGH', 0.70, np.where(rel_upper == 'MEDIUM', 0.60, 0.50))
     live['reliability_prob_cap'] = rel_cap
     live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), rel_cap)
     
@@ -5135,21 +5148,19 @@ def generate_daily_predictions():
         # PROFESSIONAL UPGRADE 3: Advanced EV+ Filtering & True Expected Value
         # =====================================================================
         def calculate_row_ev(row):
-            """Calculate true EV for this specific batter using market odds."""
-            model_p = row['pred_hr_prob']
+            """Calculate a conservative EV estimate using the market's implied probability."""
+            model_p = float(row['pred_hr_prob'])
             market_p = row.get('market_prob', None)
-            
+
             if market_p is None or pd.isna(market_p) or market_p <= 0 or market_p >= 1:
                 return 0.0, 0.0
-            
-            # Decimal odds from implied probability
-            decimal_odds = 1 / market_p
-            
-            # EV = (Model Prob × Decimal Odds - 1) - (1 - Model Prob) × (Overhead/Vig)
-            # Simplified: EV = Model Prob × Decimal Odds - 1
-            ev_value = model_p * decimal_odds - 1
-            ev_percent = ev_value * 100
-            
+
+            # Convert the market probability into a fair-odds-style decimal price.
+            # For a true +EV bet, the model's probability must exceed the market's implied probability.
+            decimal_odds = 1.0 / market_p
+            ev_value = model_p * decimal_odds - 1.0
+            ev_percent = ev_value * 100.0
+
             return ev_value, ev_percent
         
         live[['ev_value', 'ev_percent']] = live.apply(
@@ -5158,6 +5169,7 @@ def generate_daily_predictions():
 
         live['fair_odds_american'] = live['pred_hr_prob'].apply(prob_to_fair_american)
         live['prob_edge_abs'] = (live['pred_hr_prob'] - live['market_prob']).fillna(0.0)
+        live['market_edge_pct'] = ((live['pred_hr_prob'] - live['market_prob']) / live['market_prob'] * 100.0).fillna(0.0)
 
         elite_edge_abs = float(os.getenv('EV_EDGE_TRIGGER_ABS', '0.03'))
         elite_ev_pct = float(os.getenv('EV_TRIGGER_PCT', '10.0'))
@@ -5165,7 +5177,8 @@ def generate_daily_predictions():
         arb_min_value_pct = float(os.getenv('ARB_MIN_VALUE_PCT', '3.0'))
         live['elite_ev_signal'] = (
             (live['prob_edge_abs'] >= elite_edge_abs) &
-            (live['ev_percent'] >= elite_ev_pct)
+            (live['ev_percent'] >= elite_ev_pct) &
+            (live['market_edge_pct'] >= 0.0)
         )
         live['positive_ev_arbitrage'] = (
             (live['ev_percent'] > 0) &
@@ -5188,7 +5201,7 @@ def generate_daily_predictions():
         live['sportsbook_value_score'] = (_sv * _nrfi * _arb).clip(1.0, 1.35)
         
         # Filter for +EV opportunities (profitable bets only)
-        live['is_positive_ev'] = live['ev_percent'] > 0
+        live['is_positive_ev'] = (live['ev_percent'] > 0) & (live['market_prob'].notna())
         
         # Recalculate edge % using real market probability
         live['edge_pct'] = live.apply(
