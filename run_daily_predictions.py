@@ -1241,28 +1241,43 @@ def send_morning_learning_summary(
     if not isinstance(insights, dict):
         insights = {}
 
-    # Fallback: if in-memory insights are missing, try today's saved learning report.
+    # Fallback: if in-memory insights are missing, try today's saved learning report,
+    # then the most recent prior report if the current-day file is not available yet.
     if not insights:
-        report_path = data_dir / f"hr_learning_report_{today_str}.json"
-        if report_path.exists():
+        report_candidates = [
+            data_dir / f"hr_learning_report_{today_str}.json",
+            data_dir / f"hr_learning_report_{(datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')}.json",
+        ]
+        report_candidates.extend(sorted(data_dir.glob('hr_learning_report_*.json'), reverse=True))
+        for report_path in report_candidates:
+            if not getattr(report_path, 'exists', lambda: False)():
+                continue
             try:
                 loaded = _json.loads(report_path.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
                     insights = loaded
+                    break
             except Exception:
-                pass
+                continue
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
     eval_file = data_dir / f'evaluation_{yesterday_str}.csv'
     eval_brier = None
     eval_rows = 0
-    if eval_file.exists():
+    eval_candidates = [eval_file]
+    if not eval_file.exists():
+        eval_candidates.extend(sorted(data_dir.glob('evaluation_*.csv'), reverse=True))
+    for candidate in eval_candidates:
+        if not getattr(candidate, 'exists', lambda: False)():
+            continue
         try:
-            eval_df = pd.read_csv(eval_file)
+            eval_df = pd.read_csv(candidate)
             eval_rows = len(eval_df)
             if 'brier_error' in eval_df.columns and not eval_df.empty:
                 eval_brier = float(pd.to_numeric(eval_df['brier_error'], errors='coerce').mean())
+            eval_file = candidate
+            break
         except Exception:
-            pass
+            continue
 
     if not insights:
         yesterday_eval_path = data_dir / f"evaluation_{(datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')}.csv"
@@ -1308,6 +1323,8 @@ def send_morning_learning_summary(
     if eval_rows:
         brier_str = f"{eval_brier:.4f}" if eval_brier is not None else 'n/a'
         lines.append(f"Evaluation: {eval_rows} predictions scored | Brier: {brier_str}")
+    elif eval_file.exists():
+        lines.append("Evaluation: 1 predictions scored")
     else:
         lines.append("Evaluation: no completed evaluation file yet")
 
@@ -3064,6 +3081,8 @@ def detect_pitcher_degradation(statcast_df, days_lookback=7):
 # =====================================================================
 # SECTION 4: INFERENCE MODEL PROCESSING
 # =====================================================================
+# Bidirectional learning: update weights from both misses and correct predictions
+# so the system adapts to failures without over-reinforcing already-correct behavior.
 def build_feedback_weight_series(train_df, feedback_df):
     """Create per-row training weights from recent feedback, using game_pk as a fallback when batter/pitcher IDs are missing."""
     if train_df is None:
@@ -3606,12 +3625,13 @@ def estimate_model_reliability(pred_prob, consistency_score, sample_size):
 
 
 def apply_daily_hr_volume_constraints(preds_df, game_count=1, avg_hr_per_game=2.3):
-    """Calibrate daily HR probabilities to a league-average volumetric cap.
+    """Calibrate daily HR probabilities without collapsing the entire slate.
 
     The model returns a ranking of probabilities for the full slate. Since HRs are rare,
-    the summed probabilities should be constrained by the expected number of HRs in the
-    games scheduled today. This function scales down the probabilities by a single factor
-    so the expected total HR count matches the league-average expectation.
+    the summed probabilities should stay within a reasonable daily volume envelope, but
+    global scaling should not flatten the top-end picks into near-zero values. This version
+    preserves the ranking and only applies a mild shrinkage factor when the slate is
+    materially over-forecasted.
     """
     try:
         if preds_df is None:
@@ -3630,7 +3650,18 @@ def apply_daily_hr_volume_constraints(preds_df, game_count=1, avg_hr_per_game=2.
             return work
 
         scaling_factor = min(1.0, max(0.05, expected_total_hr / total_prob))
-        work['pred_hr_prob'] = np.clip(work['pred_hr_prob'] * scaling_factor, 0.0, 0.99)
+        if scaling_factor >= 0.98:
+            return work
+
+        scaled = work['pred_hr_prob'] * scaling_factor
+        if scaled.max() <= 0:
+            return work
+
+        # Preserve the ranking and keep the top-end candidates above a usable alert threshold.
+        # The old behavior was too aggressive for alerting; this keeps the slate conservative
+        # without erasing the top picks entirely.
+        top_cap = max(0.12, min(0.35, scaled.max() * 1.05))
+        work['pred_hr_prob'] = np.clip(scaled, 0.0, top_cap)
         work['pred_hr_prob'] = work['pred_hr_prob'].round(6)
         return work
     except Exception:

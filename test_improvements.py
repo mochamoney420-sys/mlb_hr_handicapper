@@ -6,6 +6,9 @@ from pathlib import Path
 
 print("Testing improvements...\n")
 
+REPO_ROOT = Path(__file__).resolve().parent
+TARGET_FILE = REPO_ROOT / "run_daily_predictions.py"
+
 # Test 1: error_tracking module
 print("1️⃣  Testing error_tracking.py...")
 try:
@@ -21,8 +24,7 @@ except Exception as e:
 print("\n2️⃣  Testing bidirectional learning updates...")
 try:
     import inspect
-    with open('run_daily_predictions.py') as f:
-        content = f.read()
+    content = TARGET_FILE.read_text(encoding='utf-8', errors='ignore')
     
     if 'correct_confident' in content:
         print("   ✅ Found 'correct_confident' (high-confidence correct predictions)")
