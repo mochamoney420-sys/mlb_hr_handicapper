@@ -9,6 +9,7 @@ import run_daily_predictions as rdp
 from analyze_hr_patterns import build_learning_insights_from_evaluation
 from run_daily_predictions import (
     apply_daily_hr_volume_constraints,
+    apply_monotonic_prob_calibration,
     apply_poisson_hr_filter,
     build_feedback_weight_series,
     estimate_model_reliability,
@@ -62,6 +63,14 @@ class ConfidenceLabelTests(unittest.TestCase):
         adjusted = apply_daily_hr_volume_constraints(df, game_count=1, avg_hr_per_game=0.1)
         self.assertLess(adjusted["pred_hr_prob"].iloc[0], 0.20)
         self.assertAlmostEqual(adjusted["pred_hr_prob"].sum(), 0.1, places=3)
+
+    def test_apply_monotonic_prob_calibration_lifts_top_end_without_reordering(self):
+        df = pd.DataFrame({"pred_hr_prob": [0.01, 0.02, 0.08, 0.15]})
+        adjusted = apply_monotonic_prob_calibration(df, gamma=1.28, cap=0.70)
+
+        self.assertGreater(adjusted["pred_hr_prob"].iloc[3], 0.15)
+        self.assertGreater(adjusted["pred_hr_prob"].iloc[2], adjusted["pred_hr_prob"].iloc[1])
+        self.assertEqual(adjusted["pred_hr_prob"].rank().tolist(), [1.0, 2.0, 3.0, 4.0])
 
     def test_build_devigged_probs_from_raw_books_normalizes_vig(self):
         raw = {"A": {"draftkings": -110, "fanduel": -120, "betmgm": 100}}

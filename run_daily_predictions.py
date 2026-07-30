@@ -3732,6 +3732,43 @@ def apply_poisson_hr_filter(preds_df, k=5, p_threshold=0.05, min_game_prob=0.20)
         return preds_df
 
 
+def apply_monotonic_prob_calibration(preds_df, gamma=1.28, cap=0.70):
+    """Lift the upper tail of probabilities without changing their ordering.
+
+    This uses a monotonic transform that stretches small probabilities upward in a
+    controlled way, making the strongest candidates more actionable while keeping
+    the full slate from exploding.
+    """
+    try:
+        if preds_df is None:
+            return preds_df
+        work = preds_df.copy()
+        if work.empty:
+            return work
+
+        probs = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+        if probs.empty:
+            return work
+
+        calibrated = probs.copy()
+        positive_mask = calibrated > 0.0
+        if positive_mask.any():
+            calibrated[positive_mask] = np.clip(
+                1.0 - np.power(1.0 - calibrated[positive_mask], gamma),
+                0.0,
+                cap,
+            )
+
+        # Keep the highest end from running away too far while preserving relative ranking.
+        if (calibrated > 0.12).any():
+            calibrated = np.clip(calibrated, 0.0, max(cap, 0.12 + 0.58 * (calibrated.max() - 0.12)))
+
+        work['pred_hr_prob'] = calibrated.round(6)
+        return work
+    except Exception:
+        return preds_df
+
+
 def run_post_mortem_backpropagation(days_lookback=7):
     """Closed-loop post-mortem layer that rewrites adaptive coefficients.
 
@@ -4962,6 +4999,7 @@ def generate_daily_predictions():
         avg_hr_per_game=2.3,
     )
     live = apply_poisson_hr_filter(live, k=5, p_threshold=0.05, min_game_prob=0.20)
+    live = apply_monotonic_prob_calibration(live, gamma=1.28, cap=0.70)
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     
     # =====================================================================
@@ -5354,10 +5392,11 @@ def generate_daily_predictions():
     discord_top_prob_n = max(10, _env_int('DISCORD_TOP_PROB_COUNT', 30))
     discord_top_ev_n = max(3, _env_int('DISCORD_TOP_EV_COUNT', 12))
     discord_rows_per_message = max(5, _env_int('DISCORD_ROWS_PER_MESSAGE', 10))
-    discord_min_prob = _env_float('DISCORD_MIN_PROB', 0.06)
+    discord_min_prob = _env_float('DISCORD_MIN_PROB', 0.020)
     discord_radar_n = max(8, _env_int('DISCORD_RADAR_COUNT', 20))
     discord_window_1_hours = max(1, _env_int('DISCORD_WINDOW_1_HOURS', 2))
     discord_window_2_hours = max(discord_window_1_hours + 1, _env_int('DISCORD_WINDOW_2_HOURS', 6))
+    print(f"Discord threshold resolved: {discord_min_prob * 100:.1f}%")
 
     # Top probabilities for reporting/Discord delivery.
     prob_pool = rankings.sort_values(by='hr_probability', ascending=False).reset_index(drop=True)
@@ -5375,7 +5414,7 @@ def generate_daily_predictions():
         ]]
     ).copy()
     radar = _finalize_discord_radar_frame(radar)
-    radar = radar[radar['hr_probability'] >= max(0.03, discord_min_prob * 0.7)]
+    radar = radar[radar['hr_probability'] >= max(0.010, discord_min_prob * 0.7)]
 
     top_keys = set(zip(top_prob['batter_name'].astype(str), top_prob['pitcher_name'].astype(str)))
     radar = radar[
