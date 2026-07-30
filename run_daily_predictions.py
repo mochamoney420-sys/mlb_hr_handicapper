@@ -6564,6 +6564,7 @@ def monitor_live_home_runs():
         heartbeat_enabled = str(os.getenv('LIVE_HEARTBEAT_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
         heartbeat_minutes = max(1, _safe_int(os.getenv('LIVE_HEARTBEAT_MINUTES', '10'), 10) or 10)
         heartbeat_every_seconds = heartbeat_minutes * 60
+        heartbeat_force_on_no_games = str(os.getenv('LIVE_HEARTBEAT_FORCE_ON_NO_GAMES', 'true')).strip().lower() not in {'0', 'false', 'no'}
         backfill_every_seconds = max(30, _safe_int(os.getenv('LIVE_HR_BACKFILL_SECONDS', '60'), 60) or 60)
         last_heartbeat_ts = 0.0
         last_backfill_ts = 0.0
@@ -6794,7 +6795,12 @@ def monitor_live_home_runs():
                 if detected_this_loop > 0 and detected_this_loop > sent_this_loop:
                     print(f"⚠️  HR detection gap: {detected_this_loop} detected but {sent_this_loop} sent Discord alerts")
 
-                if heartbeat_enabled and in_progress_games > 0 and (now_ts - last_heartbeat_ts) >= heartbeat_every_seconds:
+                should_emit_heartbeat = (
+                    heartbeat_enabled
+                    and (now_ts - last_heartbeat_ts) >= heartbeat_every_seconds
+                    and (heartbeat_force_on_no_games or in_progress_games > 0)
+                )
+                if should_emit_heartbeat:
                     hb_lines = [
                         "💓 **LIVE MONITOR HEARTBEAT**",
                         f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')}",
