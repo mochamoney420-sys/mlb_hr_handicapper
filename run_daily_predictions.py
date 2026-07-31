@@ -18,6 +18,7 @@ import argparse
 import atexit
 import subprocess
 import re
+import json
 from datetime import datetime
 from pathlib import Path
 from itertools import combinations
@@ -1766,6 +1767,8 @@ SPORTSGAMEODDS_DEFAULT_LEAGUE = 'MLB'
 # Cooldown guard for invalid Odds API key spam.
 _ODDS_API_INVALID_KEY_UNTIL_TS = 0.0
 _ODDS_API_INVALID_KEY_LAST_LOG_TS = 0.0
+_ODDS_API_RATE_LIMIT_UNTIL_TS = 0.0
+_ODDS_API_RATE_LIMIT_LAST_LOG_TS = 0.0
 
 
 def _odds_provider_name():
@@ -1931,6 +1934,60 @@ def _set_odds_invalid_key_cooldown(reason_text=''):
         )
 
 
+def _rate_limit_cooldown_active():
+    try:
+        return time.time() < float(_ODDS_API_RATE_LIMIT_UNTIL_TS)
+    except Exception:
+        return False
+
+
+def _set_rate_limit_cooldown(reason_text='', retry_after=None):
+    global _ODDS_API_RATE_LIMIT_UNTIL_TS, _ODDS_API_RATE_LIMIT_LAST_LOG_TS
+    now_ts = time.time()
+    try:
+        retry_after = float(retry_after) if retry_after is not None else None
+    except Exception:
+        retry_after = None
+    if retry_after is not None and retry_after > 0:
+        cooldown_seconds = max(30, int(round(retry_after)))
+    else:
+        cooldown_seconds = max(30, int(str(os.getenv('ODDS_API_RATE_LIMIT_COOLDOWN_SECONDS', '120')).strip() or '120'))
+    _ODDS_API_RATE_LIMIT_UNTIL_TS = now_ts + cooldown_seconds
+    if (now_ts - float(_ODDS_API_RATE_LIMIT_LAST_LOG_TS)) >= cooldown_seconds:
+        _ODDS_API_RATE_LIMIT_LAST_LOG_TS = now_ts
+        print(
+            "Odds provider rate-limited; backing off for "
+            f"{int(round(cooldown_seconds))}s. {str(reason_text)[:140]}"
+        )
+
+
+def _parse_retry_after_seconds(resp):
+    try:
+        retry_after = resp.headers.get('Retry-After') or resp.headers.get('retry-after')
+        if not retry_after:
+            return None
+        try:
+            return max(1, int(float(retry_after)))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _get_odds_http_response(resp, timeout_seconds, *, url, provider, headers=None, params=None):
+    if _rate_limit_cooldown_active():
+        return None, None, 'rate_limited'
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=timeout_seconds)
+    except Exception as e:
+        return None, e, 'request_error'
+    if response.status_code == 429:
+        retry_after = _parse_retry_after_seconds(response)
+        _set_rate_limit_cooldown(reason_text=(getattr(response, 'text', '') or '')[:140], retry_after=retry_after)
+        return response, None, 'rate_limited'
+    return response, None, 'ok'
+
+
 def _parse_odds_event_commence_time(event_obj):
     """Parse Odds API commence_time into a datetime, or None if unavailable."""
     try:
@@ -2086,7 +2143,7 @@ def _extract_hr_prop_player_book_odds_from_sgo(events_payload):
 
 def _fetch_hr_props_raw_from_sportsgameodds(api_key):
     """Fetch MLB HR props from Sportsgameodds v2 /events."""
-    if _odds_invalid_key_cooldown_active():
+    if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
         return {}
 
     if requests is None:
@@ -2108,7 +2165,19 @@ def _fetch_hr_props_raw_from_sportsgameodds(api_key):
             call_params['cursor'] = cursor
 
         try:
-            resp = requests.get(f"{SPORTSGAMEODDS_BASE_URL}/events", headers=headers, params=call_params, timeout=12)
+            resp, exc, status = _get_odds_http_response(
+                None,
+                12,
+                url=f"{SPORTSGAMEODDS_BASE_URL}/events",
+                provider='sportsgameodds',
+                headers=headers,
+                params=call_params,
+            )
+            if status != 'ok':
+                if status == 'rate_limited':
+                    break
+                print(f"Sportsgameodds fetch failed: {exc}")
+                break
         except Exception as e:
             print(f"Sportsgameodds fetch failed: {e}")
             break
@@ -2233,7 +2302,7 @@ def _extract_hr_prop_player_book_odds(games_payload, market_keys=None):
 
 def _fetch_hr_props_raw_from_odds_api(api_key):
     """Fetch HR props from The Odds API with fallback to event-level endpoint."""
-    if _odds_invalid_key_cooldown_active():
+    if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
         return {}
 
     market_keys = _get_hr_prop_market_key_candidates()
@@ -2257,7 +2326,17 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
             f"&oddsFormat=american&dateFormat=iso"
         )
         try:
-            resp = requests.get(top_url, timeout=10)
+            resp, exc, status = _get_odds_http_response(
+                None,
+                10,
+                url=top_url,
+                provider='theoddsapi',
+            )
+            if status != 'ok':
+                if status == 'rate_limited':
+                    return aggregated
+                print(f"Odds API top-level fetch failed ({market_key}): {exc}")
+                continue
             if resp.status_code == 200:
                 top_payload = _filter_current_slate_odds_events(resp.json(), source_label='top-level')
                 parsed = _extract_hr_prop_player_book_odds(top_payload, market_keys=[market_key])
@@ -2283,7 +2362,17 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
         # Fallback: event-level props endpoint (works for some plan/market combinations).
         try:
             events_url = f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events?apiKey={api_key}&dateFormat=iso"
-            events_resp = requests.get(events_url, timeout=10)
+            events_resp, exc, status = _get_odds_http_response(
+                None,
+                10,
+                url=events_url,
+                provider='theoddsapi',
+            )
+            if status != 'ok':
+                if status == 'rate_limited':
+                    return aggregated
+                print(f"Odds API events list failed: {exc}")
+                continue
             if events_resp.status_code != 200:
                 body = (getattr(events_resp, 'text', '') or '')[:220]
                 if _odds_api_invalid_key(events_resp.status_code, body):
@@ -2310,7 +2399,16 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
                     f"?apiKey={api_key}&regions=us,us2&markets={market_key}"
                     f"&oddsFormat=american&dateFormat=iso"
                 )
-                ev_resp = requests.get(ev_url, timeout=10)
+                ev_resp, exc, status = _get_odds_http_response(
+                    None,
+                    10,
+                    url=ev_url,
+                    provider='theoddsapi',
+                )
+                if status != 'ok':
+                    if status == 'rate_limited':
+                        return aggregated
+                    continue
                 if ev_resp.status_code != 200:
                     body = (getattr(ev_resp, 'text', '') or '')[:220]
                     if _odds_api_invalid_market(ev_resp.status_code, body):
@@ -2348,6 +2446,45 @@ def _fetch_hr_props_raw_from_odds_api(api_key):
         )
 
     return aggregated
+
+
+def _get_odds_cache_path():
+    configured = str(os.getenv('ODDS_CACHE_FILE', '') or '').strip()
+    if configured:
+        return Path(configured)
+    return Path('data') / 'latest_hr_prop_odds_cache.json'
+
+
+def _load_cached_hr_prop_odds_payload(cache_path=None):
+    """Return cached odds payload and age in seconds, if available."""
+    path = Path(cache_path or _get_odds_cache_path())
+    if not path.exists():
+        return None, None
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(payload, dict) and 'raw' in payload:
+            raw = payload.get('raw')
+            timestamp = payload.get('timestamp')
+            try:
+                ts = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00'))
+                age_seconds = (datetime.now(ts.tzinfo) - ts).total_seconds()
+            except Exception:
+                age_seconds = None
+            return raw, age_seconds
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _save_cached_hr_prop_odds_payload(payload, cache_path=None):
+    """Persist odds payload to disk for fallback use."""
+    path = Path(cache_path or _get_odds_cache_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        'timestamp': datetime.now().isoformat(),
+        'raw': payload,
+    }
+    path.write_text(json.dumps(record, indent=2), encoding='utf-8')
 
 
 def _build_devigged_probs_from_raw_books(player_all_odds):
@@ -2397,7 +2534,7 @@ def fetch_hr_prop_odds():
                 print(f"Free source odds: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
                 return probs
         return {}
-    if _odds_invalid_key_cooldown_active():
+    if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
         if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
             raw_free = load_free_odds_sources()
             if raw_free:
@@ -2409,6 +2546,12 @@ def fetch_hr_prop_odds():
         else:
             player_all_odds = _fetch_hr_props_raw_from_sportsgameodds(api_key)
         if not player_all_odds:
+            cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
+            if cached_raw:
+                print(f"Using cached odds payload ({cached_age} seconds old)")
+                probs = _build_devigged_probs_from_raw_books(cached_raw)
+                if probs:
+                    return probs
             if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
                 raw_free = load_free_odds_sources()
                 if raw_free:
@@ -2417,6 +2560,7 @@ def fetch_hr_prop_odds():
                     return probs
             return {}
 
+        _save_cached_hr_prop_odds_payload(player_all_odds)
         probs = _build_devigged_probs_from_raw_books(player_all_odds)
         if probs:
             print(f"Odds provider active: {provider} ({len(probs)} players with devigged prices)")
@@ -2451,9 +2595,14 @@ def fetch_hr_prop_odds_raw():
         else:
             raw = _fetch_hr_props_raw_from_sportsgameodds(api_key)
         if not raw:
+            cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
+            if cached_raw:
+                print(f"Using cached raw odds payload ({cached_age} seconds old)")
+                return cached_raw
             if load_free_odds_sources is not None:
                 return load_free_odds_sources()
             return {}
+        _save_cached_hr_prop_odds_payload(raw)
         return raw
     except Exception as e:
         print(f"Odds raw fetch failed ({provider}): {e}")
@@ -3732,7 +3881,7 @@ def apply_poisson_hr_filter(preds_df, k=5, p_threshold=0.05, min_game_prob=0.20)
         return preds_df
 
 
-def apply_monotonic_prob_calibration(preds_df, gamma=1.28, cap=0.70):
+def apply_monotonic_prob_calibration(preds_df, gamma=1.55, cap=0.14, top_signal_boost=0.015):
     """Lift the upper tail of probabilities without changing their ordering.
 
     This uses a monotonic transform that stretches small probabilities upward in a
@@ -3753,15 +3902,14 @@ def apply_monotonic_prob_calibration(preds_df, gamma=1.28, cap=0.70):
         calibrated = probs.copy()
         positive_mask = calibrated > 0.0
         if positive_mask.any():
-            calibrated[positive_mask] = np.clip(
-                1.0 - np.power(1.0 - calibrated[positive_mask], gamma),
-                0.0,
-                cap,
-            )
+            base_vals = 1.0 - np.power(1.0 - calibrated[positive_mask], gamma)
+            calibrated[positive_mask] = np.clip(base_vals, 0.0, cap)
 
-        # Keep the highest end from running away too far while preserving relative ranking.
-        if (calibrated > 0.12).any():
-            calibrated = np.clip(calibrated, 0.0, max(cap, 0.12 + 0.58 * (calibrated.max() - 0.12)))
+            if top_signal_boost > 0:
+                max_prob = max(float(probs[positive_mask].max()), 1e-6)
+                signal_scale = np.clip((probs[positive_mask] / max_prob), 0.0, 1.0)
+                boost = top_signal_boost * signal_scale
+                calibrated[positive_mask] = np.clip(calibrated[positive_mask] + boost, 0.0, cap)
 
         work['pred_hr_prob'] = calibrated.round(6)
         return work
@@ -4999,7 +5147,7 @@ def generate_daily_predictions():
         avg_hr_per_game=2.3,
     )
     live = apply_poisson_hr_filter(live, k=5, p_threshold=0.05, min_game_prob=0.20)
-    live = apply_monotonic_prob_calibration(live, gamma=1.28, cap=0.70)
+    live = apply_monotonic_prob_calibration(live, gamma=1.55, cap=0.14, top_signal_boost=0.015)
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     
     # =====================================================================

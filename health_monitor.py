@@ -8,10 +8,14 @@ import os
 import sys
 import json
 import subprocess
-import psutil
 from datetime import datetime, timedelta
 from pathlib import Path
 import time
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - exercised when dependency is missing
+    psutil = None
 
 # Load environment
 env_file = Path(__file__).parent / '.vscode' / '.env'
@@ -67,6 +71,9 @@ def log_recovery(message):
 
 def find_process_by_script(script_name):
     """Find Python process running specific script."""
+    if psutil is None:
+        return None
+
     target_script = script_name.replace('/', '\\')
     try:
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -77,7 +84,7 @@ def find_process_by_script(script_name):
                         return proc
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-    except:
+    except Exception:
         pass
     return None
 

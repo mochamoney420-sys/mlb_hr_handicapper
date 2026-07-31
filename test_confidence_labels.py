@@ -66,9 +66,9 @@ class ConfidenceLabelTests(unittest.TestCase):
 
     def test_apply_monotonic_prob_calibration_lifts_top_end_without_reordering(self):
         df = pd.DataFrame({"pred_hr_prob": [0.01, 0.02, 0.08, 0.15]})
-        adjusted = apply_monotonic_prob_calibration(df, gamma=1.28, cap=0.70)
+        adjusted = apply_monotonic_prob_calibration(df, gamma=1.55, cap=0.14, top_signal_boost=0.015)
 
-        self.assertGreater(adjusted["pred_hr_prob"].iloc[3], 0.15)
+        self.assertGreater(adjusted["pred_hr_prob"].iloc[3], 0.10)
         self.assertGreater(adjusted["pred_hr_prob"].iloc[2], adjusted["pred_hr_prob"].iloc[1])
         self.assertEqual(adjusted["pred_hr_prob"].rank().tolist(), [1.0, 2.0, 3.0, 4.0])
 

@@ -11,3 +11,5 @@
 [2026-07-21T09:19:37.853547] ❌ Predictions failed: Traceback (most recent call last):
   File "C:\Users\bobby\mlb_hr_handicapper\run_daily_predictions.py", line 860, in generate_daily_predictions
     learning_result = analyze_yesterdays_hrs_and_learn()
+[2026-07-31T11:06:52.347320] Triggering daily predictions pipeline...
+[2026-07-31T11:15:35.010324] ✅ Daily predictions completed successfully
