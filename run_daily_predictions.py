@@ -1775,6 +1775,7 @@ _ODDS_API_INVALID_KEY_UNTIL_TS = 0.0
 _ODDS_API_INVALID_KEY_LAST_LOG_TS = 0.0
 _ODDS_API_RATE_LIMIT_UNTIL_TS = 0.0
 _ODDS_API_RATE_LIMIT_LAST_LOG_TS = 0.0
+_ODDS_API_REQUEST_HISTORY = []
 
 
 def _odds_provider_name():
@@ -1980,9 +1981,42 @@ def _parse_retry_after_seconds(resp):
         return None
 
 
+def _compute_odds_request_wait_seconds(history, *, max_per_minute=500, now_ts=None):
+    """Return how long to wait before the next odds request to stay under a per-minute cap."""
+    if not history:
+        return 0.0
+
+    now_ts = now_ts if now_ts is not None else time.time()
+    window_seconds = 60.0
+    trimmed = [ts for ts in history if now_ts - float(ts) <= window_seconds]
+    if len(trimmed) < max_per_minute:
+        return 0.0
+
+    oldest = min(trimmed)
+    wait_for_reset = window_seconds - (now_ts - float(oldest))
+    return max(0.0, wait_for_reset + 0.1)
+
+
+def _throttle_odds_requests(*, max_per_minute=None, now_ts=None):
+    """Pause briefly when the odds provider request history is approaching the minute cap."""
+    global _ODDS_API_REQUEST_HISTORY
+    if max_per_minute is None:
+        max_per_minute = max(1, int(str(os.getenv('ODDS_API_MAX_PER_MINUTE', '500')).strip() or '500'))
+
+    now_ts = now_ts if now_ts is not None else time.time()
+    _ODDS_API_REQUEST_HISTORY = [ts for ts in _ODDS_API_REQUEST_HISTORY if now_ts - float(ts) <= 60.0]
+    wait_seconds = _compute_odds_request_wait_seconds(_ODDS_API_REQUEST_HISTORY, max_per_minute=max_per_minute, now_ts=now_ts)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+        now_ts = time.time()
+        _ODDS_API_REQUEST_HISTORY = [ts for ts in _ODDS_API_REQUEST_HISTORY if now_ts - float(ts) <= 60.0]
+    _ODDS_API_REQUEST_HISTORY.append(time.time())
+
+
 def _get_odds_http_response(resp, timeout_seconds, *, url, provider, headers=None, params=None):
     if _rate_limit_cooldown_active():
         return None, None, 'rate_limited'
+    _throttle_odds_requests()
     try:
         response = requests.get(url, headers=headers, params=params, timeout=timeout_seconds)
     except Exception as e:
@@ -2532,20 +2566,28 @@ def fetch_hr_prop_odds():
     """
     api_key = os.getenv('ODDS_API_KEY')
     provider = _odds_provider_name()
-    if not api_key:
+    use_free_fallback = str(os.getenv('ODDS_USE_FREE_FALLBACK', 'true')).strip().lower() not in {'0', 'false', 'no'}
+
+    def _try_free_fallback(label=''):
         if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
             raw_free = load_free_odds_sources()
             if raw_free:
                 probs = build_devigged_probs_from_books(raw_free)
-                print(f"Free source odds: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
+                if label:
+                    print(f"{label}: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
+                else:
+                    print(f"Free source odds fallback: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
                 return probs
         return {}
+
+    if not api_key:
+        return _try_free_fallback('Free source odds')
+
     if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
-        if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
-            raw_free = load_free_odds_sources()
-            if raw_free:
-                return build_devigged_probs_from_books(raw_free)
+        if use_free_fallback:
+            return _try_free_fallback('Rate-limit fallback')
         return {}
+
     try:
         if provider == 'theoddsapi':
             player_all_odds = _fetch_hr_props_raw_from_odds_api(api_key)
@@ -2558,12 +2600,8 @@ def fetch_hr_prop_odds():
                 probs = _build_devigged_probs_from_raw_books(cached_raw)
                 if probs:
                     return probs
-            if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
-                raw_free = load_free_odds_sources()
-                if raw_free:
-                    probs = build_devigged_probs_from_books(raw_free)
-                    print(f"Free source odds fallback: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
-                    return probs
+            if use_free_fallback:
+                return _try_free_fallback('Provider returned no odds')
             return {}
 
         _save_cached_hr_prop_odds_payload(player_all_odds)
@@ -2573,12 +2611,8 @@ def fetch_hr_prop_odds():
         return probs
     except Exception as e:
         print(f"Odds fetch failed ({provider}): {e}")
-        if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
-            raw_free = load_free_odds_sources()
-            if raw_free:
-                probs = build_devigged_probs_from_books(raw_free)
-                print(f"Free source odds fallback: {sum(len(v) for v in raw_free.values())} book-player pairs across {len(probs)} players")
-                return probs
+        if use_free_fallback:
+            return _try_free_fallback('Provider error fallback')
         return {}
 
 
@@ -2587,12 +2621,14 @@ def fetch_hr_prop_odds_raw():
     Used for RLM monitoring and per-book line movement tracking."""
     api_key = os.getenv('ODDS_API_KEY')
     provider = _odds_provider_name()
+    use_free_fallback = str(os.getenv('ODDS_USE_FREE_FALLBACK', 'true')).strip().lower() not in {'0', 'false', 'no'}
+
     if not api_key:
         if load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
-    if _odds_invalid_key_cooldown_active():
-        if load_free_odds_sources is not None:
+    if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
+        if use_free_fallback and load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
     try:
@@ -2612,7 +2648,7 @@ def fetch_hr_prop_odds_raw():
         return raw
     except Exception as e:
         print(f"Odds raw fetch failed ({provider}): {e}")
-        if load_free_odds_sources is not None:
+        if use_free_fallback and load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
 
