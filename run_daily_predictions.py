@@ -147,6 +147,12 @@ except ImportError:
     apply_physics_pipeline_to_live = None
 
 try:
+    from src.advanced_math import calculate_platoon_cluster_prob
+except ImportError:
+    print("Warning: advanced_math module not available")
+    calculate_platoon_cluster_prob = None
+
+try:
     from src.free_odds_sources import (
         load_free_odds_sources,
         build_devigged_probs_from_books,
@@ -3881,7 +3887,7 @@ def apply_poisson_hr_filter(preds_df, k=5, p_threshold=0.05, min_game_prob=0.20)
         return preds_df
 
 
-def apply_monotonic_prob_calibration(preds_df, gamma=1.55, cap=0.14, top_signal_boost=0.015):
+def apply_monotonic_prob_calibration(preds_df, gamma=1.35, cap=0.18, top_signal_boost=0.025):
     """Lift the upper tail of probabilities without changing their ordering.
 
     This uses a monotonic transform that stretches small probabilities upward in a
@@ -4131,6 +4137,73 @@ def compute_pitcher_intent_fear_factor(statcast_df, elite_batters):
         return fear
     except Exception:
         return {}
+
+
+def build_cluster_matchup_probabilities(live_df, cluster_df=None):
+    """Build a cluster-based matchup probability column for live rows."""
+    if live_df is None:
+        return pd.DataFrame()
+
+    out = live_df.copy()
+    if calculate_platoon_cluster_prob is None:
+        out['cluster_platoon_prob'] = 0.0
+        return out
+
+    if cluster_df is None or (isinstance(cluster_df, pd.DataFrame) and cluster_df.empty):
+        cluster_df = pd.DataFrame([
+            {'batter_id': None, 'pitcher_id': None, 'batter_hand': 'R', 'pitcher_hand': 'R', 'pa': 65000, 'hr': 1950},
+            {'batter_id': None, 'pitcher_id': None, 'batter_hand': 'R', 'pitcher_hand': 'L', 'pa': 76000, 'hr': 2500},
+            {'batter_id': None, 'pitcher_id': None, 'batter_hand': 'L', 'pitcher_hand': 'R', 'pa': 58000, 'hr': 1900},
+            {'batter_id': None, 'pitcher_id': None, 'batter_hand': 'L', 'pitcher_hand': 'L', 'pa': 72000, 'hr': 2300},
+        ])
+
+    def _normalise_hand(value):
+        if pd.isna(value):
+            return None
+        hand = str(value).strip().upper()
+        return hand if hand in {'L', 'R'} else None
+
+    def _wind_direction(row):
+        explicit = str(row.get('wind_direction', '') or '').strip().lower()
+        if explicit:
+            return explicit
+        try:
+            wind_out = float(row.get('wind_out_component', 0.0) or 0.0)
+        except Exception:
+            wind_out = 0.0
+        return 'outward' if wind_out > 0 else 'neutral'
+
+    probs = []
+    for _, row in out.iterrows():
+        batter_hand = _normalise_hand(row.get('stand', row.get('batter_hand', None)))
+        pitcher_hand = _normalise_hand(row.get('p_throws', row.get('pitcher_hand', None)))
+        if batter_hand is None or pitcher_hand is None:
+            probs.append(0.0)
+            continue
+
+        try:
+            batter_id = row.get('batter', None)
+            pitcher_id = row.get('pitcher', None)
+            prob = calculate_platoon_cluster_prob(
+                cluster_df,
+                batter_id=int(float(batter_id)) if pd.notna(batter_id) else None,
+                pitcher_id=int(float(pitcher_id)) if pd.notna(pitcher_id) else None,
+                batter_hand=batter_hand,
+                pitcher_hand=pitcher_hand,
+                league_hr_pa=0.031,
+                min_pa=100,
+                projected_pa=float(row.get('projected_pas', 4.1) or 4.1),
+                park_factor_hr=max(float(row.get('park_factor', 100.0) or 100.0) / 100.0, 0.5),
+                temperature=float(row.get('temp', 72.0) or 72.0),
+                wind_speed=float(row.get('wind_speed', row.get('wind_out_component', 0.0)) or 0.0),
+                wind_direction=_wind_direction(row),
+            )
+            probs.append(float(np.clip(prob or 0.0, 0.0, 1.0)))
+        except Exception:
+            probs.append(0.0)
+
+    out['cluster_platoon_prob'] = probs
+    return out
 
 
 def apply_expert_signal_boosts(live_df, base_probs):
@@ -4968,6 +5041,11 @@ def generate_daily_predictions():
     combined_boosts = pitcher_form_boosts * batter_streak_boosts * park_adjustments
     base_model_probs = np.clip(base_model_probs * combined_boosts, 0.0, 1.0)
 
+    live = build_cluster_matchup_probabilities(live)
+    cluster_probs = pd.to_numeric(live.get('cluster_platoon_prob', 0.0), errors='coerce').fillna(0.0).values
+    cluster_blend = np.clip((base_model_probs * 0.88) + (cluster_probs * 0.12), 0.0, 1.0)
+    base_model_probs = np.clip(cluster_blend, 0.0, 1.0)
+
     # Expert-style matchup and environment boosts for stronger signal separation.
     expert_boosted_probs = apply_expert_signal_boosts(live, base_model_probs)
     base_model_probs = np.clip(expert_boosted_probs, 0.0, 1.0)
@@ -5104,10 +5182,11 @@ def generate_daily_predictions():
     # Cap stacked post-model boosts so one row cannot dominate the card from layered multipliers.
     # The earlier cap was too conservative for rare-event bets, so we now allow a stronger
     # top-end lift for the most favorable matchups while keeping the rest of the slate sane.
+    # This is intentionally a bit looser so that plausible HR candidates are not suppressed.
     stacked_multiplier_cap = np.where(
         base_model_probs >= 0.35,
-        1.28,
-        np.where(base_model_probs >= 0.20, 1.40, 1.60)
+        1.32,
+        np.where(base_model_probs >= 0.20, 1.48, 1.70)
     )
     safe_base = np.clip(base_model_probs, 1e-6, 1.0)
     observed_multiplier = probs / safe_base
@@ -5144,10 +5223,10 @@ def generate_daily_predictions():
     live = apply_daily_hr_volume_constraints(
         live,
         game_count=max(1, int(len(live.get('game_pk').dropna().unique()) // 9)) if 'game_pk' in live.columns else 1,
-        avg_hr_per_game=2.3,
+        avg_hr_per_game=2.5,
     )
-    live = apply_poisson_hr_filter(live, k=5, p_threshold=0.05, min_game_prob=0.20)
-    live = apply_monotonic_prob_calibration(live, gamma=1.55, cap=0.14, top_signal_boost=0.015)
+    live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
+    live = apply_monotonic_prob_calibration(live, gamma=1.35, cap=0.18, top_signal_boost=0.025)
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     
     # =====================================================================
@@ -5188,7 +5267,7 @@ def generate_daily_predictions():
 
     # Reliability-aware hard ceilings to prevent unsupported top-end inflation.
     rel_upper = live['model_reliability'].astype(str).str.upper()
-    rel_cap = np.where(rel_upper == 'HIGH', 0.70, np.where(rel_upper == 'MEDIUM', 0.60, 0.50))
+    rel_cap = np.where(rel_upper == 'HIGH', 0.74, np.where(rel_upper == 'MEDIUM', 0.64, 0.54))
     live['reliability_prob_cap'] = rel_cap
     live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), rel_cap)
     
@@ -5540,7 +5619,7 @@ def generate_daily_predictions():
     discord_top_prob_n = max(10, _env_int('DISCORD_TOP_PROB_COUNT', 30))
     discord_top_ev_n = max(3, _env_int('DISCORD_TOP_EV_COUNT', 12))
     discord_rows_per_message = max(5, _env_int('DISCORD_ROWS_PER_MESSAGE', 10))
-    discord_min_prob = _env_float('DISCORD_MIN_PROB', 0.020)
+    discord_min_prob = _env_float('DISCORD_MIN_PROB', 0.015)
     discord_radar_n = max(8, _env_int('DISCORD_RADAR_COUNT', 20))
     discord_window_1_hours = max(1, _env_int('DISCORD_WINDOW_1_HOURS', 2))
     discord_window_2_hours = max(discord_window_1_hours + 1, _env_int('DISCORD_WINDOW_2_HOURS', 6))

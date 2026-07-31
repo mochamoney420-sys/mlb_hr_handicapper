@@ -72,6 +72,12 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertGreater(adjusted["pred_hr_prob"].iloc[2], adjusted["pred_hr_prob"].iloc[1])
         self.assertEqual(adjusted["pred_hr_prob"].rank().tolist(), [1.0, 2.0, 3.0, 4.0])
 
+    def test_apply_monotonic_prob_calibration_uses_looser_defaults(self):
+        df = pd.DataFrame({"pred_hr_prob": [0.15]})
+        adjusted = apply_monotonic_prob_calibration(df)
+
+        self.assertGreater(adjusted["pred_hr_prob"].iloc[0], 0.16)
+
     def test_build_devigged_probs_from_raw_books_normalizes_vig(self):
         raw = {"A": {"draftkings": -110, "fanduel": -120, "betmgm": 100}}
         adjusted = rdp._build_devigged_probs_from_raw_books(raw)
