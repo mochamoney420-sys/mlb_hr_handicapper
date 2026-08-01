@@ -5780,11 +5780,28 @@ def generate_daily_predictions():
         'positive_ev_arbitrage': 0,
         'arbitrage_score': 0.0,
     }
+    def _coerce_numeric_column(value, default, index):
+        try:
+            if isinstance(value, pd.DataFrame):
+                if value.shape[1] == 1:
+                    value = value.iloc[:, 0]
+                else:
+                    value = value.iloc[:, 0]
+            elif isinstance(value, pd.Series):
+                pass
+            elif np.isscalar(value):
+                return pd.Series([default] * len(index), index=index, dtype=float)
+            else:
+                value = pd.Series(value, index=index, dtype=object)
+            return pd.to_numeric(value, errors='coerce').fillna(default)
+        except Exception:
+            return pd.Series([default] * len(index), index=index, dtype=float)
+
     for _col, _default in physics_output_defaults.items():
         if _col not in live.columns:
             live[_col] = _default
         else:
-            live[_col] = pd.to_numeric(live[_col], errors='coerce').fillna(_default)
+            live[_col] = _coerce_numeric_column(live.get(_col), _default, live.index)
 
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
                                     'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
