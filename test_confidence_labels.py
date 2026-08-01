@@ -148,6 +148,26 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertIn("physics_delta", rankings.columns)
         self.assertAlmostEqual(rankings["physics_delta"].iloc[0], 0.08)
 
+    def test_prepare_discord_rankings_builds_portfolio_action_score(self):
+        live_df = pd.DataFrame(
+            {
+                "batter_name": ["A", "B"],
+                "pitcher_name": ["X", "Y"],
+                "pred_hr_prob": [0.18, 0.22],
+                "edge_pct": [5.0, 12.0],
+                "kelly_fraction": [0.02, 0.08],
+                "ev_percent": [2.0, 8.0],
+                "game_time": ["7:00 PM", "8:00 PM"],
+                "specific_day_upside_score": [0.2, 0.7],
+                "market_prob": [0.16, 0.18],
+            }
+        )
+
+        rankings = _prepare_discord_rankings(live_df)
+
+        self.assertIn("portfolio_action_score", rankings.columns)
+        self.assertGreater(rankings["portfolio_action_score"].iloc[1], rankings["portfolio_action_score"].iloc[0])
+
     def test_ensure_discord_radar_columns_adds_prob_and_physics_defaults(self):
         radar = pd.DataFrame({"batter_name": ["A"]})
 

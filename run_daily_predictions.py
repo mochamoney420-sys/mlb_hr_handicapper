@@ -1780,6 +1780,8 @@ _ODDS_API_REQUEST_HISTORY = []
 
 def _odds_provider_name():
     raw = str(os.getenv('ODDS_API_PROVIDER', 'sportsgameodds') or '').strip().lower()
+    if raw in {'auto', 'automatic', 'fallback'}:
+        return 'auto'
     if raw in {'sgo', 'sportsgameodds', 'sportsgameodds_v2', 'sports_game_odds'}:
         return 'sportsgameodds'
     if raw in {'theoddsapi', 'the-odds-api', 'oddsapi'}:
@@ -2548,10 +2550,10 @@ def _build_devigged_probs_from_raw_books(player_all_odds):
         total_implied = sum(implied_probs)
         if total_implied <= 0:
             continue
-        no_vig = [p / total_implied for p in implied_probs]
-        if len(no_vig) == 1:
-            final_prob = no_vig[0]
+        if len(implied_probs) == 1:
+            final_prob = float(implied_probs[0])
         else:
+            no_vig = [p / total_implied for p in implied_probs]
             final_prob = float(np.mean(no_vig))
         player_probs[name] = round(float(np.clip(final_prob, 0.0, 1.0)), 4)
     return player_probs
@@ -2603,27 +2605,42 @@ def fetch_hr_prop_odds():
             return _try_free_fallback('Rate-limit fallback')
         return {}
 
-    try:
-        if provider == 'theoddsapi':
-            player_all_odds = _fetch_hr_props_raw_from_odds_api(api_key)
-        else:
-            player_all_odds = _fetch_hr_props_raw_from_sportsgameodds(api_key)
-        if not player_all_odds:
-            cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
-            if cached_raw:
-                print(f"Using cached odds payload ({cached_age} seconds old)")
-                probs = _build_devigged_probs_from_raw_books(cached_raw)
-                if probs:
-                    return probs
-            if use_free_fallback:
-                return _try_free_fallback('Provider returned no odds')
-            return {}
+    def _try_provider(provider_name):
+        if provider_name == 'theoddsapi':
+            return _fetch_hr_props_raw_from_odds_api(api_key)
+        if provider_name == 'sportsgameodds':
+            return _fetch_hr_props_raw_from_sportsgameodds(api_key)
+        return {}
 
-        _save_cached_hr_prop_odds_payload(player_all_odds)
-        probs = _build_devigged_probs_from_raw_books(player_all_odds)
-        if probs:
-            print(f"Odds provider active: {provider} ({len(probs)} players with devigged prices)")
-        return probs
+    try:
+        candidates = []
+        if provider in {'auto', 'fallback'}:
+            candidates = ['sportsgameodds', 'theoddsapi']
+        else:
+            candidates = [provider]
+
+        last_empty = None
+        for candidate in candidates:
+            player_all_odds = _try_provider(candidate)
+            if player_all_odds:
+                _save_cached_hr_prop_odds_payload(player_all_odds)
+                probs = _build_devigged_probs_from_raw_books(player_all_odds)
+                if probs:
+                    print(f"Odds provider active: {candidate} ({len(probs)} players with devigged prices)")
+                    return probs
+                last_empty = candidate
+            else:
+                last_empty = candidate
+
+        cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
+        if cached_raw:
+            print(f"Using cached odds payload ({cached_age} seconds old)")
+            probs = _build_devigged_probs_from_raw_books(cached_raw)
+            if probs:
+                return probs
+        if use_free_fallback:
+            return _try_free_fallback(f'Provider fallback after {last_empty or provider}')
+        return {}
     except Exception as e:
         print(f"Odds fetch failed ({provider}): {e}")
         if use_free_fallback:
@@ -3809,6 +3826,7 @@ def _prepare_discord_rankings(live_df):
         work['physics_delta'] = []
         work['hr_probability'] = []
         work['ev_pct'] = []
+        work['portfolio_action_score'] = []
         return work
 
     if 'physics_delta' not in work.columns:
@@ -3824,6 +3842,29 @@ def _prepare_discord_rankings(live_df):
             )
         else:
             work['physics_delta'] = 0.0
+
+    pred_prob = _coerce_numeric_column(work, 'pred_hr_prob', default=0.0)
+    if 'hr_probability' in work.columns and 'pred_hr_prob' not in work.columns:
+        pred_prob = _coerce_numeric_column(work, 'hr_probability', default=0.0)
+
+    edge_pct = _coerce_numeric_column(work, 'edge_pct', default=0.0)
+    ev_pct = _coerce_numeric_column(work, 'ev_percent', default=0.0)
+    if 'ev_pct' in work.columns and 'ev_percent' not in work.columns:
+        ev_pct = _coerce_numeric_column(work, 'ev_pct', default=0.0)
+
+    kelly = _coerce_numeric_column(work, 'kelly_fraction', default=0.0)
+    upside = _coerce_numeric_column(work, 'specific_day_upside_score', default=0.0)
+    market_prob = _coerce_numeric_column(work, 'market_prob', default=np.nan)
+    prob_edge_abs = (pred_prob - market_prob).fillna(0.0) if 'market_prob' in work.columns else pred_prob * 0.0
+
+    work['portfolio_action_score'] = (
+        (pred_prob * 100.0) * 0.45
+        + (edge_pct * 0.55)
+        + (ev_pct * 0.35)
+        + (kelly * 100.0 * 0.20)
+        + (upside * 100.0 * 0.20)
+        + (prob_edge_abs * 100.0 * 0.25)
+    )
 
     rename_map = {'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'}
     if 'model_reliability' not in work.columns:
@@ -4465,22 +4506,28 @@ def apply_expert_signal_boosts(live_df, base_probs):
     )
     porch_score = np.clip((porch_bonus - 1.0) / 0.15, 0.0, 1.0)
 
-    signal_multiplier = (
-        1.0
-        + (platoon_score * 0.10)
-        + (contact_score * 0.09)
-        + (pitcher_score * 0.08)
-        + (park_weather_score * 0.06)
-        + (porch_score * 0.04)
-        + (elite_flag * 0.03)
-        + (split_adv * 0.08)
-        + (flyball_target * 0.07)
-        + (hot_streak * 0.06)
-        + (arsenal_vuln * 0.05)
-        + (game_total_ctx * 0.04)
+    specific_day_upside_score = np.clip(
+        (platoon_score * 0.20)
+        + (contact_score * 0.18)
+        + (pitcher_score * 0.16)
+        + (park_weather_score * 0.12)
+        + (porch_score * 0.08)
+        + (elite_flag * 0.06)
+        + (split_adv * 0.14)
+        + (flyball_target * 0.12)
+        + (hot_streak * 0.10)
+        + (arsenal_vuln * 0.10)
+        + (game_total_ctx * 0.08),
+        0.0,
+        1.0,
     )
+    signal_multiplier = 1.0 + specific_day_upside_score
+    upside_boost_multiplier = np.clip(1.0 + specific_day_upside_score, 0.0, 1.6)
 
-    return np.clip(probs * signal_multiplier, 0.0, 1.0)
+    live_df['specific_day_upside_score'] = specific_day_upside_score
+    live_df['upside_boost_multiplier'] = upside_boost_multiplier
+
+    return np.clip(probs * upside_boost_multiplier, 0.0, 1.0)
 
 
 def run_adversarial_debate_layer(live_df, rounds=5000):
@@ -5296,6 +5343,9 @@ def generate_daily_predictions():
     # Expert-style matchup and environment boosts for stronger signal separation.
     expert_boosted_probs = apply_expert_signal_boosts(live, base_model_probs)
     base_model_probs = np.clip(expert_boosted_probs, 0.0, 1.0)
+    if 'specific_day_upside_score' in live.columns:
+        live['specific_day_upside_score'] = pd.to_numeric(live['specific_day_upside_score'], errors='coerce').fillna(0.0)
+        live['upside_boost_multiplier'] = pd.to_numeric(live['upside_boost_multiplier'], errors='coerce').fillna(1.0)
     
     elite_enhancements_applied = (pitcher_form_boosts != 1.0).sum() + (batter_streak_boosts != 1.0).sum()
     print(f"✅ Elite enhancements applied: {elite_enhancements_applied} matchups boosted/adjusted")
@@ -5908,7 +5958,10 @@ def generate_daily_predictions():
     print(f"Discord threshold resolved: {discord_min_prob * 100:.1f}%")
 
     # Top probabilities for reporting/Discord delivery.
-    prob_pool = rankings.sort_values(by='hr_probability', ascending=False).reset_index(drop=True)
+    prob_pool = rankings.sort_values(
+        by=['portfolio_action_score', 'hr_probability', 'ev_pct', 'kelly_fraction'],
+        ascending=[False, False, False, False]
+    ).reset_index(drop=True)
     top_prob = _select_thresholded_candidates(prob_pool, discord_min_prob, discord_top_prob_n)
     if top_prob.empty:
         print(f"No predictions met the minimum Discord confidence threshold ({discord_min_prob * 100:.0f}%).")
@@ -5934,8 +5987,8 @@ def generate_daily_predictions():
     radar['physics_delta'] = _coerce_numeric_column(radar, 'physics_delta', default=0.0)
     radar['physics_delta_abs'] = radar['physics_delta'].abs()
     radar = radar.sort_values(
-        by=['physics_delta_abs', 'hr_probability'],
-        ascending=[False, False]
+        by=['portfolio_action_score', 'physics_delta_abs', 'hr_probability', 'ev_pct'],
+        ascending=[False, False, False, False]
     ).head(discord_radar_n).reset_index(drop=True)
 
     def _annotate_time_windows(df):
@@ -6051,7 +6104,10 @@ def generate_daily_predictions():
             top_ev = _prepare_discord_rankings(
                 positive_ev[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability']]
             )
-            top_ev = top_ev.sort_values(by='ev_pct', ascending=False).head(discord_top_ev_n).reset_index(drop=True)
+            top_ev = top_ev.sort_values(
+                by=['portfolio_action_score', 'ev_pct', 'kelly_fraction', 'hr_probability'],
+                ascending=[False, False, False, False]
+            ).head(discord_top_ev_n).reset_index(drop=True)
             print(f"\n✅ +EV PREMIUM PICKS (Expected Value > 0%):")
             print(top_ev.to_string(index=False))
     top_ev = _annotate_time_windows(top_ev)

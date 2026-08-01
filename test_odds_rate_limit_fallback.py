@@ -29,8 +29,18 @@ class OddsFallbackTests(unittest.TestCase):
                  patch.object(rdp, '_load_cached_hr_prop_odds_payload', return_value=({'Player A': {'draftkings': -110}}, 42)):
                 probs = rdp.fetch_hr_prop_odds()
 
-        self.assertEqual(probs, {'Player A': 1.0})
+        self.assertEqual(probs, {'Player A': 0.5238})
+    def test_fetch_hr_prop_odds_retries_alternate_provider(self):
+        with patch.dict(os.environ, {'ODDS_API_KEY': 'dummy-key', 'ODDS_USE_FREE_FALLBACK': 'true', 'ODDS_PREFER_FREE_SOURCES': 'true', 'ODDS_API_PROVIDER': 'auto'}, clear=False):
+            with patch.object(rdp, '_odds_invalid_key_cooldown_active', return_value=False), \
+                 patch.object(rdp, '_rate_limit_cooldown_active', return_value=False), \
+                 patch.object(rdp, 'load_free_odds_sources', return_value={}), \
+                 patch.object(rdp, '_fetch_hr_props_raw_from_sportsgameodds', return_value={}), \
+                 patch.object(rdp, '_fetch_hr_props_raw_from_odds_api', return_value={'Player A': {'draftkings': -110}}), \
+                 patch.object(rdp, 'build_devigged_probs_from_books', return_value={'Player A': 0.5238}):
+                probs = rdp.fetch_hr_prop_odds()
 
+        self.assertEqual(probs, {'Player A': 0.5238})
 
 if __name__ == '__main__':
     unittest.main()
