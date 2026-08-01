@@ -2560,6 +2560,10 @@ def _build_devigged_probs_from_raw_books(player_all_odds):
 def fetch_hr_prop_odds():
     """Fetch live HR prop lines and return {player_name: devigged_prob}.
 
+    The base model should primarily rely on free sources such as Baseball Savant,
+    Statcast, and local snapshots. The paid odds API is treated as an optional
+    overlay for live market odds rather than a prerequisite for model generation.
+
     Provider is selected by ODDS_API_PROVIDER:
     - sportsgameodds (default)
     - theoddsapi
@@ -2567,6 +2571,7 @@ def fetch_hr_prop_odds():
     api_key = os.getenv('ODDS_API_KEY')
     provider = _odds_provider_name()
     use_free_fallback = str(os.getenv('ODDS_USE_FREE_FALLBACK', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    prefer_free_sources = str(os.getenv('ODDS_PREFER_FREE_SOURCES', 'true')).strip().lower() not in {'0', 'false', 'no'}
 
     def _try_free_fallback(label=''):
         if load_free_odds_sources is not None and build_devigged_probs_from_books is not None:
@@ -2580,10 +2585,20 @@ def fetch_hr_prop_odds():
                 return probs
         return {}
 
+    free_probs = _try_free_fallback('Free source odds') if prefer_free_sources else {}
+    if free_probs:
+        return free_probs
+
     if not api_key:
-        return _try_free_fallback('Free source odds')
+        return free_probs
 
     if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
+        cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
+        if cached_raw:
+            print(f"Using cached odds payload during cooldown ({cached_age} seconds old)")
+            probs = _build_devigged_probs_from_raw_books(cached_raw)
+            if probs:
+                return probs
         if use_free_fallback:
             return _try_free_fallback('Rate-limit fallback')
         return {}
@@ -2618,16 +2633,30 @@ def fetch_hr_prop_odds():
 
 def fetch_hr_prop_odds_raw():
     """Fetch HR prop lines from ALL sportsbooks. Returns {player: {book_key: american_odds}}.
-    Used for RLM monitoring and per-book line movement tracking."""
+    Used for RLM monitoring and per-book line movement tracking.
+
+    Free-source odds are preferred first. The paid odds API is used only as an
+    overlay when the free sources are absent or stale.
+    """
     api_key = os.getenv('ODDS_API_KEY')
     provider = _odds_provider_name()
     use_free_fallback = str(os.getenv('ODDS_USE_FREE_FALLBACK', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    prefer_free_sources = str(os.getenv('ODDS_PREFER_FREE_SOURCES', 'true')).strip().lower() not in {'0', 'false', 'no'}
+
+    if prefer_free_sources and load_free_odds_sources is not None:
+        raw_free = load_free_odds_sources()
+        if raw_free:
+            return raw_free
 
     if not api_key:
         if load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
     if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
+        cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
+        if cached_raw:
+            print(f"Using cached raw odds payload during cooldown ({cached_age} seconds old)")
+            return cached_raw
         if use_free_fallback and load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
@@ -5780,10 +5809,20 @@ def generate_daily_predictions():
         'positive_ev_arbitrage': 0,
         'arbitrage_score': 0.0,
     }
-    def _coerce_numeric_column(value, default, index):
+    def _coerce_numeric_column(value, column_or_default, index=None, default=None):
         try:
+            if index is None:
+                index = pd.RangeIndex(0, 1)
+            if default is None and isinstance(column_or_default, (int, float, np.number)):
+                default = float(column_or_default)
+                column_or_default = None
+            elif default is None:
+                default = 0.0
+
             if isinstance(value, pd.DataFrame):
-                if value.shape[1] == 1:
+                if isinstance(column_or_default, str) and column_or_default in value.columns:
+                    value = value[column_or_default]
+                elif value.shape[1] == 1:
                     value = value.iloc[:, 0]
                 else:
                     value = value.iloc[:, 0]
@@ -5793,7 +5832,15 @@ def generate_daily_predictions():
                 return pd.Series([default] * len(index), index=index, dtype=float)
             else:
                 value = pd.Series(value, index=index, dtype=object)
-            return pd.to_numeric(value, errors='coerce').fillna(default)
+
+            coerced = pd.to_numeric(value, errors='coerce').fillna(default)
+            if hasattr(coerced, 'index') and len(coerced.index) != len(index):
+                coerced = coerced.reset_index(drop=True)
+            if isinstance(coerced, pd.Series):
+                if index is not None and len(coerced) != len(index):
+                    coerced = pd.Series(coerced.tolist()[:len(index)], index=index, dtype=float)
+                return coerced.astype(float)
+            return pd.Series([default] * len(index), index=index, dtype=float)
         except Exception:
             return pd.Series([default] * len(index), index=index, dtype=float)
 
