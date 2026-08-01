@@ -3811,6 +3811,16 @@ def _build_discord_snapshot_summary(target_date, rankings, top_prob, radar, top_
     return lines
 
 
+def _confidence_grade_emoji(confidence):
+    """Return a distinct emoji marker for each confidence tier."""
+    confidence = str(confidence or '').upper()
+    if confidence == 'HIGH':
+        return '🔵'
+    if confidence == 'MEDIUM':
+        return '🟠'
+    return '🟣'
+
+
 def _prepare_discord_rankings(live_df):
     """Prepare a ranking frame for Discord output while preserving reliability labels."""
     if live_df is None:
@@ -6139,7 +6149,7 @@ def generate_daily_predictions():
             
             # IMPROVEMENT #10: Add confidence emoji icon
             confidence = str(row.get('model_reliability', 'MEDIUM')).upper()
-            conf_emoji = '🔴' if confidence == 'HIGH' else '🟡' if confidence == 'MEDIUM' else '🟢'
+            conf_emoji = _confidence_grade_emoji(confidence)
             
             table_rows.append(
                 f"| {str(row['batter_name'])[:12]:<12} | {str(row['pitcher_name'])[:12]:<12} | {gtime:<8} | {win:<10} | {pct:<6} | {conf_emoji} | {edge:<7} | {ev_str:<7} | {kelly:<6} |"
@@ -6160,7 +6170,7 @@ def generate_daily_predictions():
                 f"|{'-'*14}|{'-'*14}|{'-'*10}|{'-'*12}|{'-'*8}|{'-'*6}|{'-'*9}|{'-'*9}|{'-'*8}|\n"
                 f"{table_str}\n"
                 "```\n"
-                "Legend: 🔴=HIGH confidence  🟡=MEDIUM confidence  🟢=LOW confidence"
+                "Legend: �=HIGH confidence  🟠=MEDIUM confidence  🟣=LOW confidence"
             )
             if not send_discord_webhook(content=message_content):
                 return False

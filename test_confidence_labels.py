@@ -109,6 +109,11 @@ class ConfidenceLabelTests(unittest.TestCase):
         self.assertIn("model_reliability", rankings.columns)
         self.assertEqual(rankings["model_reliability"].iloc[0], "HIGH")
 
+    def test_confidence_grade_emoji_uses_distinct_colors(self):
+        self.assertEqual(rdp._confidence_grade_emoji("HIGH"), "🔵")
+        self.assertEqual(rdp._confidence_grade_emoji("MEDIUM"), "🟠")
+        self.assertEqual(rdp._confidence_grade_emoji("LOW"), "🟣")
+
     def test_apply_expert_signal_boosts_increases_prob_for_favorable_matchup(self):
         live_df = pd.DataFrame(
             {
