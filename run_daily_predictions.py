@@ -4175,6 +4175,138 @@ def compute_pitcher_intent_fear_factor(statcast_df, elite_batters):
         return {}
 
 
+def build_matchup_weather_features(df):
+    """Construct a compact set of matchup and weather features from available columns."""
+    if df is None:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    def _safe_num(series, default):
+        if isinstance(series, (pd.Series, pd.Index, np.ndarray, list, tuple)):
+            return pd.to_numeric(series, errors='coerce').fillna(default)
+        return pd.Series([default] * len(out), index=out.index, dtype=float)
+
+    bat_barrel = _safe_num(out.get('bat_barrel_rate', 0.08), 0.08)
+    bat_ev = _safe_num(out.get('bat_avg_exit_velocity', 88.0), 88.0)
+    bat_pull = _safe_num(out.get('bat_pull_rate', 0.38), 0.38)
+    bat_launch = _safe_num(out.get('bat_avg_launch_angle', 12.0), 12.0)
+    bat_hr_fb = _safe_num(out.get('bat_hr_fb_rate', 0.12), 0.12)
+    pitch_velo = _safe_num(out.get('pitch_avg_velocity', 92.0), 92.0)
+    pitch_days = _safe_num(out.get('pitch_days_since_last_start', 5.0), 5.0)
+    pitch_hr_allowed = _safe_num(out.get('pitch_hr_allowed_rate', 0.04), 0.04)
+    pitch_hr_fb_allowed = _safe_num(out.get('pitch_hr_fb_allowed_rate', 0.12), 0.12)
+    pitch_fb_allowed = _safe_num(out.get('pitch_fb_allowed_rate', 0.35), 0.35)
+    temp = _safe_num(out.get('temp', 72.0), 72.0)
+    wind_out = _safe_num(out.get('wind_out_component', 0.0), 0.0)
+    pressure = _safe_num(out.get('pressure', 1013.25), 1013.25)
+    humidity = _safe_num(out.get('humidity', 50.0), 50.0)
+    lineup_slot = _safe_num(out.get('batting_order_slot', 5.0), 5.0)
+    release_flag = _safe_num(out.get('line_release_window_flag', 0.0), 0.0)
+
+    ppci = (
+        1.0
+        + ((bat_barrel - 0.08) / 0.08) * 0.20
+        + ((bat_ev - 88.0) / 12.0) * 0.16
+        + ((bat_hr_fb - 0.12) / 0.08) * 0.14
+        + ((pitch_hr_allowed - 0.04) / 0.03) * 0.18
+        + ((pitch_hr_fb_allowed - 0.12) / 0.08) * 0.12
+        + ((pitch_velo - 92.0) / 12.0) * 0.05
+    )
+    dynamic = (
+        1.0
+        + ((bat_pull - 0.38) / 0.20) * 0.08
+        + ((bat_launch - 12.0) / 16.0) * 0.07
+        + ((pitch_fb_allowed - 0.35) / 0.15) * 0.09
+        + ((pitch_days - 5.0) / 7.0) * 0.04
+    )
+    arsenal = (
+        1.0
+        + ((bat_barrel - 0.08) / 0.08) * 0.11
+        + ((bat_ev - 88.0) / 12.0) * 0.09
+        + ((pitch_hr_allowed - 0.04) / 0.03) * 0.10
+        + ((pitch_velo - 92.0) / 10.0) * 0.04
+    )
+    micro = (
+        1.0
+        + ((temp - 72.0) / 28.0) * 0.06
+        + (wind_out / 8.0) * 0.05
+        + np.maximum(0.0, (1013.25 - pressure) / 15.0) * 0.02
+        + np.maximum(0.0, (humidity - 45.0) / 30.0) * 0.01
+    )
+    lineup_pressure = (
+        1.0
+        + np.clip((6.0 - lineup_slot) / 5.0, 0.0, 1.0) * 0.12
+        + release_flag * 0.08
+        + np.clip((bat_hr_fb - 0.12) / 0.08, 0.0, 1.0) * 0.05
+    )
+    lineup_grab = (
+        1.0
+        + release_flag * 0.10
+        + np.clip((bat_ev - 88.0) / 12.0, 0.0, 1.0) * 0.04
+        + np.clip((pitch_days - 5.0) / 10.0, 0.0, 1.0) * 0.03
+    )
+
+    out['ppci_dominance_score'] = np.clip(ppci, 0.75, 1.55)
+    out['dynamic_matchup_grade'] = np.clip(dynamic, 0.80, 1.35)
+    out['pitch_arsenal_matchup_score'] = np.clip(arsenal, 0.80, 1.28)
+    out['micro_weather_score'] = np.clip(micro, 0.90, 1.45)
+    out['lineup_slot_pressure_score'] = np.clip(lineup_pressure, 0.90, 1.35)
+    out['lineup_grab_window_score'] = np.clip(lineup_grab, 0.95, 1.30)
+
+    # Explicit upside signals inspired by professional hitter's-edge research.
+    split_edge = np.clip((out.get('has_platoon_advantage', 0) * 0.18) + (out.get('platoon_advantage_multiplier', 1.0) - 1.0) * 0.35, 0.0, 1.0)
+    flyball_target = np.clip(
+        ((pitch_hr_fb_allowed - 0.12) / 0.08) * 0.42
+        + ((pitch_fb_allowed - 0.35) / 0.15) * 0.24
+        + ((bat_hr_fb - 0.12) / 0.08) * 0.18
+        + ((bat_pull - 0.38) / 0.20) * 0.16,
+        0.0,
+        1.0,
+    )
+    hot_streak = np.clip(
+        ((bat_barrel - 0.08) / 0.08) * 0.35
+        + ((bat_ev - 88.0) / 12.0) * 0.30
+        + ((bat_hr_fb - 0.12) / 0.08) * 0.20
+        + ((bat_launch - 12.0) / 16.0) * 0.15,
+        0.0,
+        1.0,
+    )
+    arsenal_vuln = np.clip(
+        ((pitch_hr_allowed - 0.04) / 0.03) * 0.30
+        + ((pitch_velo - 92.0) / 12.0) * 0.15
+        + ((pitch_hr_fb_allowed - 0.12) / 0.08) * 0.30
+        + ((pitch_fb_allowed - 0.35) / 0.15) * 0.25,
+        0.0,
+        1.0,
+    )
+    total_context = np.clip(
+        ((temp - 72.0) / 18.0) * 0.25
+        + (wind_out / 10.0) * 0.20
+        + np.maximum(0.0, (1013.25 - pressure) / 12.0) * 0.15
+        + np.maximum(0.0, (humidity - 45.0) / 30.0) * 0.10
+        + np.clip((out.get('park_factor', 100.0) - 100.0) / 20.0, 0.0, 1.0) * 0.30,
+        0.0,
+        1.0,
+    )
+
+    out['split_advantage_score'] = np.clip(split_edge, 0.0, 1.0)
+    out['flyball_pitcher_target_score'] = np.clip(flyball_target, 0.0, 1.0)
+    out['hot_streak_contact_score'] = np.clip(hot_streak, 0.0, 1.0)
+    out['arsenal_vulnerability_score'] = np.clip(arsenal_vuln, 0.0, 1.0)
+    out['game_total_context_score'] = np.clip(total_context, 0.0, 1.0)
+
+    # If the slate provides an actual total, blend it into the context score.
+    if 'game_total' in out.columns:
+        total_val = pd.to_numeric(out['game_total'], errors='coerce').fillna(8.5)
+        out['game_total_context_score'] = np.clip(
+            0.6 * out['game_total_context_score'] + 0.4 * ((total_val - 7.0) / 5.0).clip(0.0, 1.0),
+            0.0,
+            1.0,
+        )
+    return out
+
+
 def build_cluster_matchup_probabilities(live_df, cluster_df=None):
     """Build a cluster-based matchup probability column for live rows."""
     if live_df is None:
@@ -4273,6 +4405,11 @@ def apply_expert_signal_boosts(live_df, base_probs):
     density_altitude = _series_or_default('density_altitude_factor', 1.0)
     porch_bonus = _series_or_default('porch_advantage_bonus', 1.0)
     elite_flag = _series_or_default('is_elite_power_batter', 0.0)
+    split_adv = _series_or_default('split_advantage_score', 0.0)
+    flyball_target = _series_or_default('flyball_pitcher_target_score', 0.0)
+    hot_streak = _series_or_default('hot_streak_contact_score', 0.0)
+    arsenal_vuln = _series_or_default('arsenal_vulnerability_score', 0.0)
+    game_total_ctx = _series_or_default('game_total_context_score', 0.0)
 
     platoon_score = np.clip(((platoon_mult - 1.0) / 0.25) + (platoon * 0.35), 0.0, 1.0)
     contact_score = np.clip(
@@ -4307,6 +4444,11 @@ def apply_expert_signal_boosts(live_df, base_probs):
         + (park_weather_score * 0.06)
         + (porch_score * 0.04)
         + (elite_flag * 0.03)
+        + (split_adv * 0.08)
+        + (flyball_target * 0.07)
+        + (hot_streak * 0.06)
+        + (arsenal_vuln * 0.05)
+        + (game_total_ctx * 0.04)
     )
 
     return np.clip(probs * signal_multiplier, 0.0, 1.0)
@@ -4553,6 +4695,31 @@ def generate_daily_predictions():
     _drop_all = list(set(_b_drop + _p_drop))
     train_df = raw_pa.drop(columns=_drop_all, errors='ignore').merge(b_stats, on='batter', how='inner')
     train_df = train_df.merge(p_stats, on='pitcher', how='inner')
+    train_df = build_matchup_weather_features(train_df)
+
+    professional_default_cols = {
+        'platoon_advantage_multiplier': 1.0,
+        'breaking_pitch_vulnerability': 1.0,
+        'left_on_right_fade_score': 1.0,
+        'reverse_split_anomaly_score': 1.0,
+        'ballpark_park_factor': 1.0,
+        'porch_advantage_bonus': 1.0,
+        'death_valley_penalty': 1.0,
+        'would_be_hr_differential': 0.0,
+        'bullpen_quality_score_home': 50.0,
+        'bullpen_quality_score_away': 50.0,
+        'umpire_strike_zone_impact': 1.0,
+        'density_altitude_factor': 1.0,
+        'weather_extremes_multiplier': 1.0,
+        'sportsbook_value_score': 1.0,
+        'pitcher_fear_factor': 0.0,
+        'is_elite_power_batter': 0,
+    }
+    for col, default in professional_default_cols.items():
+        if col not in train_df.columns:
+            train_df[col] = default
+        else:
+            train_df[col] = pd.to_numeric(train_df[col], errors='coerce').fillna(default)
 
     # Auto-evaluate yesterday's predictions to feed the learning loop
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -4609,6 +4776,20 @@ def generate_daily_predictions():
         # Stadium & Weather Features
         'park_factor', 'temp', 'wind_speed', 'wind_out_component',
         'humidity', 'precipitation', 'pressure',  # NEW: Enhanced weather tracking
+
+        # Matchup & weather edge features
+        'ppci_dominance_score', 'dynamic_matchup_grade', 'pitch_arsenal_matchup_score',
+        'micro_weather_score', 'lineup_slot_pressure_score', 'lineup_grab_window_score',
+        'split_advantage_score', 'flyball_pitcher_target_score', 'hot_streak_contact_score',
+        'arsenal_vulnerability_score', 'game_total_context_score',
+
+        # Professional features used in live scoring and calibration
+        'platoon_advantage_multiplier', 'breaking_pitch_vulnerability',
+        'left_on_right_fade_score', 'reverse_split_anomaly_score',
+        'ballpark_park_factor', 'porch_advantage_bonus', 'death_valley_penalty',
+        'would_be_hr_differential', 'bullpen_quality_score_home', 'bullpen_quality_score_away',
+        'umpire_strike_zone_impact', 'density_altitude_factor', 'weather_extremes_multiplier',
+        'sportsbook_value_score', 'pitcher_fear_factor', 'is_elite_power_batter',
     ]
     
     # Ensure all required weather columns exist in training data
@@ -4791,6 +4972,7 @@ def generate_daily_predictions():
     live['humidity'] = live['humidity'].fillna(50.0)  # League average humidity
     live['precipitation'] = live['precipitation'].fillna(0.0)  # No precip by default
     live['pressure'] = live['pressure'].fillna(1013.25)  # Sea-level standard pressure
+    live = build_matchup_weather_features(live)
     live['bat_hr_fb_rate'] = live['bat_hr_fb_rate'].fillna(0.12)
     live['pitch_hr_fb_allowed_rate'] = live['pitch_hr_fb_allowed_rate'].fillna(0.12)
     live['bat_ev90'] = live['bat_ev90'].fillna(88.0)
