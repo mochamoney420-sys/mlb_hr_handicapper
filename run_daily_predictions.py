@@ -762,6 +762,148 @@ def print_conservative_bet_ready_wagers(date_str=None, top_n=10):
     return shortlist
 
 
+def build_single_straight_market_discrepancies(preds_df, top_n=12):
+    """Build a shortlist where model math materially disagrees with market prices.
+
+    This targets single straight wagers only (one batter prop per row), not parlays.
+    """
+    if preds_df is None or preds_df.empty:
+        return pd.DataFrame()
+
+    work = preds_df.copy()
+
+    def _env_int(name, default):
+        try:
+            return int(float(os.getenv(name, str(default))))
+        except Exception:
+            return int(default)
+
+    def _env_float(name, default):
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return float(default)
+
+    for c in [
+        'pred_hr_prob', 'market_prob', 'best_market_implied_prob', 'prob_edge_abs',
+        'market_edge_pct', 'ev_percent', 'kelly_fraction', 'best_market_odds_american', 'matched_book_count'
+    ]:
+        if c in work.columns:
+            work[c] = pd.to_numeric(work[c], errors='coerce')
+
+    if 'model_reliability' not in work.columns:
+        work['model_reliability'] = 'MEDIUM'
+    else:
+        work['model_reliability'] = work['model_reliability'].fillna('MEDIUM').astype(str).str.upper()
+
+    if 'market_prob' not in work.columns:
+        work['market_prob'] = np.nan
+    if 'best_market_implied_prob' in work.columns:
+        work['market_prob'] = pd.to_numeric(work['market_prob'], errors='coerce').fillna(
+            pd.to_numeric(work['best_market_implied_prob'], errors='coerce')
+        )
+
+    if 'prob_edge_abs' not in work.columns:
+        work['prob_edge_abs'] = (
+            pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+            - pd.to_numeric(work.get('market_prob', np.nan), errors='coerce')
+        ).fillna(0.0)
+
+    if 'market_edge_pct' not in work.columns:
+        mp = pd.to_numeric(work.get('market_prob', np.nan), errors='coerce')
+        work['market_edge_pct'] = (
+            (pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0) - mp) / mp * 100.0
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if 'matched_book_count' not in work.columns:
+        work['matched_book_count'] = 0
+    work['matched_book_count'] = pd.to_numeric(work['matched_book_count'], errors='coerce').fillna(0).astype(int)
+
+    if 'is_positive_ev' in work.columns:
+        work['is_positive_ev_bool'] = work['is_positive_ev'].astype(str).str.lower().eq('true')
+    else:
+        work['is_positive_ev_bool'] = pd.to_numeric(work.get('ev_percent', 0.0), errors='coerce').fillna(0.0) > 0.0
+
+    min_edge_abs = _env_float('STRAIGHT_DISCREPANCY_MIN_EDGE_ABS', 0.03)
+    min_ev_pct = _env_float('STRAIGHT_DISCREPANCY_MIN_EV_PCT', 3.0)
+    min_kelly = _env_float('STRAIGHT_DISCREPANCY_MIN_KELLY', 0.01)
+    min_prob = _env_float('STRAIGHT_DISCREPANCY_MIN_PROB', 0.05)
+    max_prob = _env_float('STRAIGHT_DISCREPANCY_MAX_PROB', 0.45)
+    min_books = _env_int('STRAIGHT_DISCREPANCY_MIN_MATCHED_BOOKS', 1)
+    min_american = _env_int('STRAIGHT_DISCREPANCY_MIN_AMERICAN_ODDS', -300)
+    max_american = _env_int('STRAIGHT_DISCREPANCY_MAX_AMERICAN_ODDS', 5000)
+
+    reliability_ok = work['model_reliability'].isin(['HIGH', 'MEDIUM'])
+    odds_ok = (
+        pd.to_numeric(work.get('best_market_odds_american', np.nan), errors='coerce').notna()
+        & (pd.to_numeric(work.get('best_market_odds_american', np.nan), errors='coerce') >= min_american)
+        & (pd.to_numeric(work.get('best_market_odds_american', np.nan), errors='coerce') <= max_american)
+    )
+
+    shortlist = work[
+        reliability_ok
+        & work['market_prob'].notna()
+        & odds_ok
+        & (pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0) >= min_prob)
+        & (pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0) <= max_prob)
+        & (pd.to_numeric(work.get('prob_edge_abs', 0.0), errors='coerce').fillna(0.0) >= min_edge_abs)
+        & (pd.to_numeric(work.get('ev_percent', 0.0), errors='coerce').fillna(0.0) >= min_ev_pct)
+        & (pd.to_numeric(work.get('kelly_fraction', 0.0), errors='coerce').fillna(0.0) >= min_kelly)
+        & (work['matched_book_count'] >= min_books)
+        & work['is_positive_ev_bool']
+    ].copy()
+
+    if shortlist.empty:
+        return shortlist
+
+    shortlist['wager_type'] = 'single_straight'
+    shortlist['discrepancy_score'] = (
+        shortlist['prob_edge_abs'].clip(lower=0.0) * 100.0 * 0.55
+        + shortlist['ev_percent'].clip(lower=0.0) * 0.30
+        + shortlist['kelly_fraction'].clip(lower=0.0) * 100.0 * 0.15
+    )
+
+    keep_cols = [
+        'wager_type', 'batter_name', 'pitcher_name', 'game_time', 'model_reliability',
+        'pred_hr_prob', 'market_prob', 'prob_edge_abs', 'market_edge_pct',
+        'best_book', 'best_market_odds_american', 'fair_odds_american',
+        'ev_percent', 'kelly_fraction', 'matched_book_count', 'discrepancy_score'
+    ]
+    keep_cols = [c for c in keep_cols if c in shortlist.columns]
+    shortlist = shortlist[keep_cols].sort_values(
+        by=['discrepancy_score', 'ev_percent', 'kelly_fraction'],
+        ascending=[False, False, False]
+    ).head(max(1, int(top_n))).reset_index(drop=True)
+    return shortlist
+
+
+def print_single_straight_market_discrepancies(date_str=None, top_n=12):
+    """Print, persist, and return single straight wagers with strong model-vs-market gaps."""
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    pred_file = Path('data') / f'predictions_{date_str}.csv'
+    if not pred_file.exists():
+        print(f"No discrepancy shortlist: missing predictions file ({pred_file}).")
+        return pd.DataFrame()
+
+    try:
+        preds = pd.read_csv(pred_file)
+    except Exception as exc:
+        print(f"No discrepancy shortlist: failed to read predictions file ({exc}).")
+        return pd.DataFrame()
+
+    shortlist = build_single_straight_market_discrepancies(preds, top_n=top_n)
+    if shortlist.empty:
+        print("No single-straight discrepancy shortlist: no rows passed discrepancy filters.")
+        return shortlist
+
+    out_path = Path('data') / f'straight_market_discrepancies_{date_str}.csv'
+    shortlist.to_csv(out_path, index=False)
+    print("\nSINGLE STRAIGHT MARKET DISCREPANCIES:")
+    print(shortlist.to_string(index=False))
+    print(f"Saved discrepancy shortlist: {out_path}")
+    return shortlist
+
+
 def _candidate_discord_webhooks(explicit_webhook=None):
     """Return normalized webhook candidates in priority order."""
     candidates = [
@@ -6059,6 +6201,7 @@ def generate_daily_predictions():
                                     'stacked_boost_multiplier_raw', 'stacked_boost_multiplier_cap',
                                     'stacked_boost_multiplier_final',
                                     'best_book', 'best_market_odds_american', 'best_market_implied_prob',
+                                    'market_prob', 'market_edge_pct',
                                     'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
                                     'arbitrage_value_pct', 'book_prob_dispersion', 'matched_book_count',
                                     'positive_ev_arbitrage', 'arbitrage_score',
@@ -6263,6 +6406,17 @@ def generate_daily_predictions():
     print(f"\nRadar Coverage: {len(radar)} additional candidates")
     print_discord_payload_diagnostics(top_prob, radar, top_ev)
 
+    discrepancy_top_n = max(3, _env_int('STRAIGHT_DISCREPANCY_TOP_N', 12))
+    straight_discrepancies = build_single_straight_market_discrepancies(live, top_n=discrepancy_top_n)
+    if straight_discrepancies.empty:
+        print("Single-straight discrepancy scan: no rows passed discrepancy filters.")
+    else:
+        discrepancy_path = Path('data') / f"straight_market_discrepancies_{target_date}.csv"
+        straight_discrepancies.to_csv(discrepancy_path, index=False)
+        print("\nSingle Straight Market Discrepancies (Model vs Market):")
+        print(straight_discrepancies.to_string(index=False))
+        print(f"Saved discrepancy shortlist: {discrepancy_path}")
+
     # =====================================================================
     # DISCORD WEBHOOK INTEGRATION
     # =====================================================================
@@ -6337,7 +6491,24 @@ def generate_daily_predictions():
     if not top_ev.empty:
         sent_ev = _post_pick_table_batches(top_ev, f"\u2705 +EV HR Picks (Top {len(top_ev)})")
 
-    if not sent_prob or not sent_ev or not sent_radar:
+    sent_straight = True
+    if not straight_discrepancies.empty:
+        straight_lines = [
+            f"🎯 Single Straight Discrepancies ({target_date})",
+            f"Rows: {len(straight_discrepancies)}",
+        ]
+        for _, row in straight_discrepancies.head(8).iterrows():
+            straight_lines.append(
+                f"- {row.get('batter_name','')} vs {row.get('pitcher_name','')}: "
+                f"model={float(row.get('pred_hr_prob', 0.0))*100:.1f}%, "
+                f"market={float(row.get('market_prob', 0.0))*100:.1f}%, "
+                f"edge={float(row.get('market_edge_pct', 0.0)):+.1f}%, "
+                f"EV={float(row.get('ev_percent', 0.0)):+.1f}%, "
+                f"odds={int(float(row.get('best_market_odds_american', 0))):+d}"
+            )
+        sent_straight = send_discord_webhook(content="\n".join(straight_lines))
+
+    if not sent_prob or not sent_ev or not sent_radar or not sent_straight:
         print("Failed to transmit one or more Discord pick tables after trying configured candidates.")
 
     return live
@@ -7813,6 +7984,7 @@ def main():
     parser.add_argument("--weekly-todo", action="store_true", help="Print prioritized next-week action list from current system status")
     parser.add_argument("--systematic-ev", action="store_true", help="Run full +EV operation (backfill, self-check, predict, weekly todo)")
     parser.add_argument("--bet-ready", action="store_true", help="Print only actionable wagers (+EV with odds and Kelly > 0)")
+    parser.add_argument("--straight-discrepancies", action="store_true", help="Print single straight wagers where model math disagrees with market")
     parser.add_argument("--backfill-days", type=int, default=30, help="Lookback window for self-check/backfill commands")
 
     args = parser.parse_args()
@@ -7842,6 +8014,10 @@ def main():
         print_weekly_todo(days_lookback=max(1, int(args.backfill_days)))
         return
 
+    if args.straight_discrepancies:
+        print_single_straight_market_discrepancies()
+        return
+
     if args.rlm:
         monitor_odds_rlm()
         return
@@ -7865,11 +8041,13 @@ def main():
         generate_daily_predictions()
         print_bet_ready_wagers()
         print_conservative_bet_ready_wagers()
+        print_single_straight_market_discrepancies()
         launch_live_monitor_background()
         return
 
     generate_daily_predictions()
     print_conservative_bet_ready_wagers()
+    print_single_straight_market_discrepancies()
     
     # Pre-game lineup check (2-3 hours before first pitch)
     try:
