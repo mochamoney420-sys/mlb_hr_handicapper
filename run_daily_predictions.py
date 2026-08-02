@@ -6149,7 +6149,14 @@ def generate_daily_predictions():
     def _coerce_numeric_column(value, column_or_default, index=None, default=None):
         try:
             if index is None:
-                index = pd.RangeIndex(0, 1)
+                if isinstance(value, pd.DataFrame):
+                    index = value.index
+                elif isinstance(value, pd.Series):
+                    index = value.index
+                elif hasattr(value, '__len__') and not np.isscalar(value):
+                    index = pd.RangeIndex(0, len(value))
+                else:
+                    index = pd.RangeIndex(0, 1)
             if default is None and isinstance(column_or_default, (int, float, np.number)):
                 default = float(column_or_default)
                 column_or_default = None
