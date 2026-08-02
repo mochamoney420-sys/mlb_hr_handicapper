@@ -19,6 +19,7 @@ import atexit
 import subprocess
 import re
 import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from itertools import combinations
@@ -64,15 +65,31 @@ try:
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import log_loss
+    from sklearn.linear_model import LogisticRegression
 except ImportError:
     RandomForestClassifier = None
     CalibratedClassifierCV = None
     TimeSeriesSplit = None
     log_loss = None
+    LogisticRegression = None
 from datetime import datetime, timedelta
 from pybaseball import statcast
 from threading import Thread
 from queue import Queue
+
+
+def _env_int(name, default):
+    try:
+        return int(float(os.getenv(name, str(default))))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
 
 # =====================================================================
 # TIMEOUT WRAPPER FOR STATCAST API CALLS
@@ -253,6 +270,17 @@ STADIUM_CF_BEARING = {
     'STL': 5,   'TB': 5,    'TEX': 25,  'TOR': 10,  'WSH': 355
 }
 
+RETRACTABLE_ROOF_VENUES = {
+    'Chase Field',
+    'Daikin Park',
+    'T-Mobile Park',
+    'American Family Field',
+    'Rogers Centre',
+    'Marlins Park',
+    'LoanDepot Park',
+    'Globe Life Field',
+}
+
 TEAM_ABBR_TO_STADIUM_KEY = {
     'ARI': 'Diamondbacks', 'ATL': 'Braves', 'BAL': 'Orioles', 'BOS': 'Red Sox', 'CHC': 'Cubs',
     'CWS': 'White Sox', 'CIN': 'Reds', 'CLE': 'Guardians', 'COL': 'Rockies', 'DET': 'Tigers',
@@ -265,6 +293,457 @@ TEAM_ABBR_TO_STADIUM_KEY = {
 # Sportsbook tiers for RLM detection and sharp consensus weighting
 SHARP_BOOKS = {'pinnacle', 'circasports', 'betonlineag', 'betus', 'betrivers', 'pointsbetusn', 'lowvig', 'bookmaker'}
 SQUARE_BOOKS = {'fanduel', 'draftkings', 'betmgm', 'williamhill_us', 'barstool', 'unibet_us', 'mybookieag', 'bovada', 'caesars', 'wynnbet', 'betfred', 'superbook'}
+
+
+def get_lineup_slot_pa_expectation(batting_order_slot):
+    """Expected plate appearances by lineup slot for a typical 9-inning game."""
+    slot_map = {
+        1: 4.75,
+        2: 4.62,
+        3: 4.48,
+        4: 4.34,
+        5: 4.22,
+        6: 4.08,
+        7: 3.95,
+        8: 3.86,
+        9: 3.78,
+    }
+    try:
+        slot = int(batting_order_slot)
+    except Exception:
+        slot = 5
+    return float(slot_map.get(max(1, min(9, slot)), 4.22))
+
+
+def _load_roof_status_overrides():
+    """Optional manual roof-status overrides from env JSON mapping venue -> status."""
+    raw = str(os.getenv('ROOF_STATUS_OVERRIDES_JSON', '') or '').strip()
+    if not raw:
+        return {}
+    try:
+        payload = _json.loads(raw)
+        if isinstance(payload, dict):
+            return {str(k).strip(): str(v).strip().lower() for k, v in payload.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def infer_roof_status(venue_name, raw_game_payload=None, weather=None):
+    """Infer retractable-roof status and whether outdoor weather should be neutralized."""
+    venue = str(venue_name or '').strip()
+    overrides = _load_roof_status_overrides()
+    if venue in overrides:
+        status = overrides[venue]
+        sealed = status in {'closed', 'sealed', 'indoors', 'indoor'}
+        return status, int(sealed)
+
+    if venue not in RETRACTABLE_ROOF_VENUES:
+        return 'open_air', 0
+
+    payload_text = ''
+    if raw_game_payload:
+        try:
+            payload_text = _json.dumps(raw_game_payload).lower()
+        except Exception:
+            payload_text = str(raw_game_payload).lower()
+    if 'roof closed' in payload_text or 'closed roof' in payload_text:
+        return 'closed', 1
+    if 'roof open' in payload_text or 'open roof' in payload_text:
+        return 'open', 0
+
+    weather = weather or {}
+    precip = float(pd.to_numeric(weather.get('precipitation', 0.0), errors='coerce')) if weather is not None else 0.0
+    wind = float(pd.to_numeric(weather.get('wind_speed', 0.0), errors='coerce')) if weather is not None else 0.0
+    temp = float(pd.to_numeric(weather.get('temp', 72.0), errors='coerce')) if weather is not None else 72.0
+
+    if precip >= 0.05 or wind >= 16 or temp <= 48 or temp >= 95:
+        return 'closed_heuristic', 1
+    return 'open_heuristic', 0
+
+
+def bullpen_xfip_degradation_index(home_bullpen_score, away_bullpen_score, is_home_game):
+    """Proxy index for expected bullpen degradation faced by a batter.
+
+    Higher value means the opposing bullpen is weaker/more fatigued, which raises late-game HR risk.
+    """
+    h = float(pd.to_numeric(home_bullpen_score, errors='coerce'))
+    a = float(pd.to_numeric(away_bullpen_score, errors='coerce'))
+    if np.isnan(h):
+        h = 50.0
+    if np.isnan(a):
+        a = 50.0
+
+    opp = a if bool(is_home_game) else h
+    # Convert 0-100 style bullpen quality/fatigue score into a centered degradation signal.
+    # Positive when bullpen profile projects more run environment late.
+    centered = (opp - 50.0) / 50.0
+    return float(np.clip(centered, -1.0, 1.0))
+
+
+def _clv_tracker_path(date_str=None):
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    return Path('data') / f'clv_tracker_{date_str}.csv'
+
+
+def _record_clv_entry(date_str, batter_name, open_odds_american, model_prob, source='live_ev_alert'):
+    path = _clv_tracker_path(date_str)
+    Path('data').mkdir(parents=True, exist_ok=True)
+    row = {
+        'timestamp': datetime.now().isoformat(),
+        'batter_name': str(batter_name or ''),
+        'open_odds_american': _safe_float(open_odds_american, np.nan),
+        'model_prob': _safe_float(model_prob, np.nan),
+        'source': str(source),
+    }
+    df = pd.DataFrame([row])
+    if path.exists():
+        df.to_csv(path, mode='a', header=False, index=False)
+    else:
+        df.to_csv(path, index=False)
+
+
+def _compute_clv_implied_delta(entry_odds, current_odds):
+    e = _safe_float(entry_odds)
+    c = _safe_float(current_odds)
+    if e is None or c is None:
+        return np.nan
+    try:
+        return float(american_to_implied_prob(c) - american_to_implied_prob(e))
+    except Exception:
+        return np.nan
+
+
+def _load_odds_snapshots(date_str=None):
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    snapshot_file = Path('data') / f'odds_snapshots_{date_str}.jsonl'
+    if not snapshot_file.exists():
+        return []
+
+    snapshots = []
+    try:
+        for line in snapshot_file.read_text(encoding='utf-8').splitlines():
+            line = str(line or '').strip()
+            if not line:
+                continue
+            payload = _json.loads(line)
+            ts_raw = payload.get('timestamp')
+            odds_raw = payload.get('odds', {})
+            ts = pd.to_datetime(ts_raw, errors='coerce')
+            if pd.isna(ts) or not isinstance(odds_raw, dict):
+                continue
+            snapshots.append({
+                'timestamp': ts.to_pydatetime() if hasattr(ts, 'to_pydatetime') else ts,
+                'odds': odds_raw,
+            })
+    except Exception:
+        return []
+
+    snapshots.sort(key=lambda x: x.get('timestamp') or datetime.min)
+    return snapshots
+
+
+def _resolve_snapshot_book_map(snapshot_odds, batter_name):
+    norm = _normalize_player_name(batter_name)
+    if not norm:
+        return {}
+
+    direct = snapshot_odds.get(batter_name)
+    if isinstance(direct, dict):
+        return direct
+
+    exact = snapshot_odds.get(norm)
+    if isinstance(exact, dict):
+        return exact
+
+    for k, v in (snapshot_odds or {}).items():
+        if not isinstance(v, dict):
+            continue
+        kn = _normalize_player_name(k)
+        if kn == norm or (kn and (norm in kn or kn in norm)):
+            return v
+    return {}
+
+
+def _infer_close_line_from_snapshots(snapshots, batter_name, game_dt):
+    if not snapshots or game_dt is None:
+        return None, None, None
+
+    lookback_minutes = max(10, _env_int('CLV_CLOSE_LOOKBACK_MINUTES', 90))
+    post_start_minutes = max(1, _env_int('CLV_CLOSE_POSTSTART_MINUTES', 5))
+
+    pre_start = game_dt - timedelta(minutes=lookback_minutes)
+    post_end = game_dt + timedelta(minutes=post_start_minutes)
+
+    pre_candidates = []
+    post_candidates = []
+    for snap in snapshots:
+        ts = snap.get('timestamp')
+        if ts is None or ts < pre_start or ts > post_end:
+            continue
+        book_map = _resolve_snapshot_book_map(snap.get('odds', {}), batter_name)
+        if not book_map:
+            continue
+        book, line = _best_line_from_book_map(book_map)
+        if line is None:
+            continue
+        rec = (ts, book, int(line))
+        if ts <= game_dt:
+            pre_candidates.append(rec)
+        else:
+            post_candidates.append(rec)
+
+    if pre_candidates:
+        ts, book, line = sorted(pre_candidates, key=lambda x: x[0])[-1]
+        return line, book, ts
+    if post_candidates:
+        ts, book, line = sorted(post_candidates, key=lambda x: x[0])[0]
+        return line, book, ts
+    return None, None, None
+
+
+def audit_clv_performance(date_str=None, lookback_days=30):
+    """Audit CLV quality by reconciling entry lines vs pregame close from snapshots."""
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    tracker_path = _clv_tracker_path(date_str)
+    if not tracker_path.exists():
+        print(f"CLV audit skipped: no tracker file for {date_str}.")
+        return pd.DataFrame()
+
+    try:
+        clv_df = pd.read_csv(tracker_path)
+    except Exception as exc:
+        print(f"CLV audit failed to read tracker: {exc}")
+        return pd.DataFrame()
+
+    if clv_df.empty:
+        print(f"CLV audit skipped: tracker file empty for {date_str}.")
+        return pd.DataFrame()
+
+    pred_file = Path('data') / f'predictions_{date_str}.csv'
+    game_time_by_name = {}
+    if pred_file.exists():
+        try:
+            preds = pd.read_csv(pred_file)
+            for _, r in preds.iterrows():
+                nm = _normalize_player_name(r.get('batter_name'))
+                if nm:
+                    game_time_by_name[nm] = r.get('game_time', '')
+        except Exception:
+            pass
+
+    snapshots = _load_odds_snapshots(date_str)
+
+    records = []
+    updates = []
+    for idx, row in clv_df.iterrows():
+        batter_name = str(row.get('batter_name', '')).strip()
+        norm = _normalize_player_name(batter_name)
+        entry = _safe_float(row.get('open_odds_american'))
+        if entry is None:
+            continue
+
+        close_line = _safe_float(row.get('close_odds_american'))
+        close_ts = str(row.get('close_timestamp', '') or '').strip()
+        close_book = str(row.get('close_book', '') or '').strip()
+
+        game_dt = _parse_game_time_for_date(date_str, game_time_by_name.get(norm))
+        if close_line is None and game_dt is not None:
+            inferred_line, inferred_book, inferred_ts = _infer_close_line_from_snapshots(snapshots, batter_name, game_dt)
+            if inferred_line is not None:
+                close_line = float(inferred_line)
+                close_book = str(inferred_book or '')
+                close_ts = inferred_ts.isoformat() if hasattr(inferred_ts, 'isoformat') else str(inferred_ts)
+                updates.append((idx, close_line, close_book, close_ts))
+
+        clv_delta = _compute_clv_implied_delta(entry, close_line)
+        records.append({
+            'date': date_str,
+            'batter_name': batter_name,
+            'entry_timestamp': row.get('timestamp', ''),
+            'entry_odds_american': entry,
+            'close_odds_american': close_line,
+            'close_timestamp': close_ts,
+            'close_book': close_book,
+            'model_prob': _safe_float(row.get('model_prob'), np.nan),
+            'clv_implied_delta': clv_delta,
+            'has_close_line': int(close_line is not None and np.isfinite(close_line)),
+            'source': str(row.get('source', '')),
+        })
+
+    if updates:
+        if 'close_book' not in clv_df.columns:
+            clv_df['close_book'] = ''
+        if 'close_odds_american' not in clv_df.columns:
+            clv_df['close_odds_american'] = np.nan
+        if 'close_clv_implied_delta' not in clv_df.columns:
+            clv_df['close_clv_implied_delta'] = np.nan
+        if 'close_timestamp' not in clv_df.columns:
+            clv_df['close_timestamp'] = ''
+
+        for idx, close_line, close_book, close_ts in updates:
+            clv_df.at[idx, 'close_odds_american'] = close_line
+            clv_df.at[idx, 'close_book'] = close_book
+            clv_df.at[idx, 'close_timestamp'] = close_ts
+            clv_df.at[idx, 'close_clv_implied_delta'] = _compute_clv_implied_delta(
+                clv_df.at[idx, 'open_odds_american'],
+                close_line,
+            )
+        try:
+            clv_df.to_csv(tracker_path, index=False)
+        except Exception:
+            pass
+
+    audit_df = pd.DataFrame(records)
+    if audit_df.empty:
+        print(f"CLV audit found no valid entries for {date_str}.")
+        return audit_df
+
+    Path('data').mkdir(parents=True, exist_ok=True)
+    audit_path = Path('data') / f'clv_audit_{date_str}.csv'
+    audit_df.to_csv(audit_path, index=False)
+
+    valid = audit_df[audit_df['has_close_line'] == 1].copy()
+    coverage = float(len(valid) / max(1, len(audit_df)))
+    avg_delta = float(pd.to_numeric(valid.get('clv_implied_delta', np.nan), errors='coerce').mean()) if not valid.empty else np.nan
+    med_delta = float(pd.to_numeric(valid.get('clv_implied_delta', np.nan), errors='coerce').median()) if not valid.empty else np.nan
+    hit_rate = float((pd.to_numeric(valid.get('clv_implied_delta', np.nan), errors='coerce') > 0).mean()) if not valid.empty else np.nan
+
+    rolling_vals = []
+    cutoff = datetime.today() - timedelta(days=max(1, int(lookback_days)))
+    for fp in sorted(Path('data').glob('clv_audit_*.csv')):
+        try:
+            d = datetime.strptime(fp.stem.replace('clv_audit_', ''), '%Y-%m-%d')
+            if d < cutoff:
+                continue
+            tmp = pd.read_csv(fp)
+            vals = pd.to_numeric(tmp.get('clv_implied_delta', np.nan), errors='coerce').dropna()
+            rolling_vals.extend(vals.tolist())
+        except Exception:
+            continue
+    rolling_30d_avg = float(np.mean(rolling_vals)) if rolling_vals else np.nan
+
+    summary = {
+        'date': date_str,
+        'entries': int(len(audit_df)),
+        'entries_with_close': int(len(valid)),
+        'close_coverage': coverage,
+        'avg_clv_implied_delta': avg_delta,
+        'median_clv_implied_delta': med_delta,
+        'positive_clv_rate': hit_rate,
+        'rolling_lookback_days': int(lookback_days),
+        'rolling_avg_clv_implied_delta': rolling_30d_avg,
+        'updated_at': datetime.now().isoformat(),
+    }
+    summary_path = Path('data') / f'clv_audit_summary_{date_str}.json'
+    try:
+        summary_path.write_text(_json.dumps(summary, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+    print(
+        "CLV AUDIT: "
+        f"entries={summary['entries']}, close_coverage={summary['close_coverage']*100:.1f}%, "
+        f"avg_delta={summary['avg_clv_implied_delta'] if pd.notna(summary['avg_clv_implied_delta']) else float('nan'):.5f}, "
+        f"positive_rate={summary['positive_clv_rate'] if pd.notna(summary['positive_clv_rate']) else float('nan'):.2%}"
+    )
+    print(f"Saved CLV audit: {audit_path}")
+    print(f"Saved CLV summary: {summary_path}")
+
+    return audit_df
+
+
+def _parse_game_time_for_date(date_str, game_time_value):
+    """Best-effort parse of prediction game-time text into a naive datetime."""
+    raw = str(game_time_value or '').strip()
+    if not raw:
+        return None
+
+    candidates = [raw]
+    cleaned = raw.replace('ET', '').replace('EST', '').replace('EDT', '').strip()
+    if cleaned and cleaned != raw:
+        candidates.append(cleaned)
+    if date_str:
+        candidates.append(f"{date_str} {raw}")
+        candidates.append(f"{date_str} {cleaned}")
+
+    for c in candidates:
+        try:
+            ts = pd.to_datetime(c, errors='coerce')
+            if pd.notna(ts):
+                if hasattr(ts, 'to_pydatetime'):
+                    return ts.to_pydatetime()
+                return ts
+        except Exception:
+            continue
+    return None
+
+
+def _update_clv_tracker_snapshot(date_str, latest_best_odds_by_batter, game_time_by_batter=None):
+    """Update current odds and near-first-pitch CLV snapshots for tracked entries."""
+    path = _clv_tracker_path(date_str)
+    if not path.exists():
+        return
+
+    try:
+        clv_df = pd.read_csv(path)
+    except Exception:
+        return
+
+    if clv_df.empty:
+        return
+
+    now_ts = datetime.now()
+    game_time_by_batter = game_time_by_batter or {}
+
+    if 'current_odds_american' not in clv_df.columns:
+        clv_df['current_odds_american'] = np.nan
+    if 'current_clv_implied_delta' not in clv_df.columns:
+        clv_df['current_clv_implied_delta'] = np.nan
+    if 'close_odds_american' not in clv_df.columns:
+        clv_df['close_odds_american'] = np.nan
+    if 'close_clv_implied_delta' not in clv_df.columns:
+        clv_df['close_clv_implied_delta'] = np.nan
+    if 'close_timestamp' not in clv_df.columns:
+        clv_df['close_timestamp'] = ''
+
+    for idx, row in clv_df.iterrows():
+        batter_name = str(row.get('batter_name', '')).strip()
+        norm_name = _normalize_player_name(batter_name)
+        latest_odds = latest_best_odds_by_batter.get(norm_name)
+        if latest_odds is None:
+            continue
+
+        clv_df.at[idx, 'current_odds_american'] = latest_odds
+        clv_df.at[idx, 'current_clv_implied_delta'] = _compute_clv_implied_delta(
+            row.get('open_odds_american'),
+            latest_odds,
+        )
+
+        close_odds = _safe_float(row.get('close_odds_american'))
+        if close_odds is not None:
+            continue
+
+        game_dt = _parse_game_time_for_date(date_str, game_time_by_batter.get(norm_name))
+        if game_dt is None:
+            continue
+
+        # Capture closing-line snapshot exactly at first-pitch minus ~1 minute.
+        # Small grace window handles scheduler jitter and API latency.
+        close_window_start = game_dt - timedelta(minutes=1)
+        close_window_end = game_dt + timedelta(minutes=2)
+        if close_window_start <= now_ts <= close_window_end:
+            clv_df.at[idx, 'close_odds_american'] = latest_odds
+            clv_df.at[idx, 'close_clv_implied_delta'] = _compute_clv_implied_delta(
+                row.get('open_odds_american'),
+                latest_odds,
+            )
+            clv_df.at[idx, 'close_timestamp'] = now_ts.isoformat()
+
+    try:
+        clv_df.to_csv(path, index=False)
+    except Exception:
+        return
 
 # =====================================================================
 # IMPROVEMENT 1-10: ELITE MODEL ENHANCEMENTS
@@ -2877,22 +3356,15 @@ def prob_to_fair_american(prob):
 def is_line_release_window_et(now_utc=None):
     now_utc = now_utc or datetime.utcnow()
     now_et = now_utc - timedelta(hours=4)
-    # Optimal window: 11:30 AM - 1:00 PM EST
-    # Check if between 11:30 AM and 1:00 PM ET (before 14:00 to account for minute precision)
-    hour = now_et.hour
-    minute = now_et.minute
-    
-    # 11:30 AM to 1:00 PM means:
-    # - Hour 11 with minute >= 30, OR
-    # - Hour 12, OR  
-    # - Hour 13 (1 PM) with minute < 60
-    if hour == 11:
-        return minute >= 30
-    elif hour == 12:
-        return True
-    elif hour == 13:
-        return minute < 60
-    return False
+    start_hour = _safe_int(os.getenv('MARKET_RELEASE_START_HOUR_ET', '9'), 9) or 9
+    end_hour = _safe_int(os.getenv('MARKET_RELEASE_END_HOUR_ET', '11'), 11) or 11
+    end_minute = _safe_int(os.getenv('MARKET_RELEASE_END_MINUTE_ET', '0'), 0) or 0
+
+    current_minutes = now_et.hour * 60 + now_et.minute
+    start_minutes = int(start_hour) * 60
+    end_minutes = int(end_hour) * 60 + int(end_minute)
+
+    return start_minutes <= current_minutes <= end_minutes
 
 
 def fetch_totals_market_pressure():
@@ -3155,6 +3627,22 @@ def get_advanced_hr_metrics(days_back=60):
     pa_df['bat_15pa_fb_rate'] = pa_df.groupby('batter')['is_fly'].transform(lambda x: x.shift().rolling(15, min_periods=1).mean())
     pa_df['bat_30pa_fb_rate'] = pa_df.groupby('batter')['is_fly'].transform(lambda x: x.shift().rolling(30, min_periods=1).mean())
 
+    # Rolling Statcast velocity windows: short-form trend vs longer baseline.
+    recent_cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=14)
+    baseline_cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=365)
+    recent_slice = pa_df[pa_df['game_date'] >= recent_cutoff].copy()
+    baseline_slice = pa_df[pa_df['game_date'] >= baseline_cutoff].copy()
+
+    recent_batter = recent_slice.groupby('batter').agg(
+        bat_barrel_rate_14d=('is_barrel', 'mean'),
+        bat_hard_hit_rate_14d=('is_hard_hit', 'mean'),
+    ).reset_index() if not recent_slice.empty else pd.DataFrame(columns=['batter', 'bat_barrel_rate_14d', 'bat_hard_hit_rate_14d'])
+
+    baseline_batter = baseline_slice.groupby('batter').agg(
+        bat_barrel_rate_365d=('is_barrel', 'mean'),
+        bat_hard_hit_rate_365d=('is_hard_hit', 'mean'),
+    ).reset_index() if not baseline_slice.empty else pd.DataFrame(columns=['batter', 'bat_barrel_rate_365d', 'bat_hard_hit_rate_365d'])
+
     pa_df.sort_values(['pitcher', 'game_date', 'at_bat_number'], inplace=True)
     pa_df['pit_15pa_hr_rate'] = pa_df.groupby('pitcher')['is_hr'].transform(lambda x: x.shift().rolling(15, min_periods=1).mean())
     pa_df['pit_30pa_hr_rate'] = pa_df.groupby('pitcher')['is_hr'].transform(lambda x: x.shift().rolling(30, min_periods=1).mean())
@@ -3210,6 +3698,14 @@ def get_advanced_hr_metrics(days_back=60):
     ).reset_index()
     batter_stats['bat_hr_fb_rate'] = batter_stats['bat_total_hr'] / batter_stats['bat_total_fb'].clip(lower=1)
     batter_stats['bat_pull_rate'] = batter_stats['bat_pulled_fly_count'] / batter_stats['bat_total_fb'].clip(lower=1)
+    batter_stats = batter_stats.merge(recent_batter, on='batter', how='left')
+    batter_stats = batter_stats.merge(baseline_batter, on='batter', how='left')
+    batter_stats['bat_barrel_rate_14d'] = pd.to_numeric(batter_stats.get('bat_barrel_rate_14d', np.nan), errors='coerce').fillna(batter_stats['bat_barrel_rate'])
+    batter_stats['bat_hard_hit_rate_14d'] = pd.to_numeric(batter_stats.get('bat_hard_hit_rate_14d', np.nan), errors='coerce').fillna(batter_stats['bat_hard_hit_rate'])
+    batter_stats['bat_barrel_rate_365d'] = pd.to_numeric(batter_stats.get('bat_barrel_rate_365d', np.nan), errors='coerce').fillna(batter_stats['bat_barrel_rate'])
+    batter_stats['bat_hard_hit_rate_365d'] = pd.to_numeric(batter_stats.get('bat_hard_hit_rate_365d', np.nan), errors='coerce').fillna(batter_stats['bat_hard_hit_rate'])
+    batter_stats['bat_barrel_trend_delta'] = (batter_stats['bat_barrel_rate_14d'] - batter_stats['bat_barrel_rate_365d']).clip(-0.25, 0.25)
+    batter_stats['bat_hard_hit_trend_delta'] = (batter_stats['bat_hard_hit_rate_14d'] - batter_stats['bat_hard_hit_rate_365d']).clip(-0.35, 0.35)
     
     # Add wRC+ (Weighted Runs Created+) - normalized to league average of 100
     # wRC+ = 100 * [(HRs * 1.4 + SweetSpot% * 0.8 + AvgEV bonus) / league average]
@@ -3250,6 +3746,23 @@ def get_advanced_hr_metrics(days_back=60):
     pitcher_stats['pitch_fb_allowed_rate'] = pitcher_stats['pitch_total_fb'] / pitcher_stats['pitch_pa_count'].clip(lower=1)
     pitcher_stats['pitch_est_ip'] = pitcher_stats['pitch_pa_count'] / 4.3
     pitcher_stats['pitch_hr_per_9'] = (pitcher_stats['pitch_total_hr'] * 9) / pitcher_stats['pitch_est_ip'].clip(lower=1)
+
+    recent_pitch = recent_slice.groupby('pitcher').agg(
+        pitch_barrel_allowed_14d=('is_barrel', 'mean'),
+        pitch_hard_hit_allowed_14d=('is_hard_hit', 'mean'),
+    ).reset_index() if not recent_slice.empty else pd.DataFrame(columns=['pitcher', 'pitch_barrel_allowed_14d', 'pitch_hard_hit_allowed_14d'])
+    baseline_pitch = baseline_slice.groupby('pitcher').agg(
+        pitch_barrel_allowed_365d=('is_barrel', 'mean'),
+        pitch_hard_hit_allowed_365d=('is_hard_hit', 'mean'),
+    ).reset_index() if not baseline_slice.empty else pd.DataFrame(columns=['pitcher', 'pitch_barrel_allowed_365d', 'pitch_hard_hit_allowed_365d'])
+    pitcher_stats = pitcher_stats.merge(recent_pitch, on='pitcher', how='left')
+    pitcher_stats = pitcher_stats.merge(baseline_pitch, on='pitcher', how='left')
+    pitcher_stats['pitch_barrel_allowed_14d'] = pd.to_numeric(pitcher_stats.get('pitch_barrel_allowed_14d', np.nan), errors='coerce').fillna(pitcher_stats['pitch_barrel_allowed_rate'])
+    pitcher_stats['pitch_hard_hit_allowed_14d'] = pd.to_numeric(pitcher_stats.get('pitch_hard_hit_allowed_14d', np.nan), errors='coerce').fillna(pitcher_stats['pitch_hard_hit_allowed_rate'])
+    pitcher_stats['pitch_barrel_allowed_365d'] = pd.to_numeric(pitcher_stats.get('pitch_barrel_allowed_365d', np.nan), errors='coerce').fillna(pitcher_stats['pitch_barrel_allowed_rate'])
+    pitcher_stats['pitch_hard_hit_allowed_365d'] = pd.to_numeric(pitcher_stats.get('pitch_hard_hit_allowed_365d', np.nan), errors='coerce').fillna(pitcher_stats['pitch_hard_hit_allowed_rate'])
+    pitcher_stats['pitch_barrel_trend_delta'] = (pitcher_stats['pitch_barrel_allowed_14d'] - pitcher_stats['pitch_barrel_allowed_365d']).clip(-0.25, 0.25)
+    pitcher_stats['pitch_hard_hit_trend_delta'] = (pitcher_stats['pitch_hard_hit_allowed_14d'] - pitcher_stats['pitch_hard_hit_allowed_365d']).clip(-0.35, 0.35)
     _last_pit = pa_df.groupby('pitcher')['game_date'].max().reset_index()
     _last_pit['pitch_days_since_last_start'] = (today_date - _last_pit['game_date']).dt.days.clip(0, 30)
     pitcher_stats = pitcher_stats.merge(_last_pit[['pitcher', 'pitch_days_since_last_start']], on='pitcher', how='left')
@@ -3339,6 +3852,11 @@ def get_today_matchups():
                 except Exception:
                     away_team_abbr = ''
 
+            roof_status, roof_sealed = infer_roof_status(venue_name, raw_game_payload=raw_game, weather=weather)
+            if roof_sealed:
+                # Indoors/sealed roof neutralizes outdoor wind effects for carry physics.
+                wind_out_component = 0.0
+
             for team_type in ['home', 'away']:
                 opponent_type = 'away' if team_type == 'home' else 'home'
                 team_info = boxscore.get(team_type, {})
@@ -3367,6 +3885,17 @@ def get_today_matchups():
                     side_key = f'{team_type}_players'
                     fallback_players = fallback_lineups.get(side_key, [])
                     batting_order = [str(p.get('id', '')).replace('ID', '') for p in fallback_players if p.get('is_batter')][:9]
+                if not batting_order:
+                    # Data-availability fail-safe: use available roster player IDs as emergency batting-order proxy.
+                    team_players = team_info.get('players', {}) if isinstance(team_info, dict) else {}
+                    if not team_players and raw_team_info:
+                        team_players = raw_team_info.get('players', {}) or {}
+                    roster_ids = []
+                    for k in (team_players or {}).keys():
+                        sid = str(k).replace('ID', '').strip()
+                        if sid.isdigit():
+                            roster_ids.append(sid)
+                    batting_order = roster_ids[:9]
 
                 seen_batters = set()
                 for order_idx, batter_id in enumerate(batting_order):
@@ -3418,13 +3947,16 @@ def get_today_matchups():
                         'pitcher_hand': p_throws,
                         'has_platoon_advantage': int(b_stands != p_throws),
                         'batting_order_slot': order_idx + 1,
+                        'lineup_pa_expectation': get_lineup_slot_pa_expectation(order_idx + 1),
                         'wind_out_component': wind_out_component,
                         'park_factor': handed_park_factor,
                         'temp': weather['temp'],
                         'wind_speed': weather['wind_speed'],
                         'humidity': weather.get('humidity', 50),
                         'precipitation': weather.get('precipitation', 0),
-                        'pressure': weather.get('pressure', 1013.25)
+                        'pressure': weather.get('pressure', 1013.25),
+                        'roof_status': roof_status,
+                        'roof_sealed': roof_sealed,
                     })
         except Exception as e:
             print(f"Warning: failed to build matchups for game {game_id}: {e}")
@@ -4969,6 +5501,18 @@ def calculate_ev_premium(model_prob, market_prob, market_odds_american=None):
 
 
 def generate_daily_predictions():
+    def _env_int(name, default):
+        try:
+            return int(float(os.getenv(name, str(default))))
+        except Exception:
+            return int(default)
+
+    def _env_float(name, default):
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return float(default)
+
     # =====================================================================
     # PHASE 0: LEARN FROM YESTERDAY'S HOME RUNS (Automatic Pattern Analysis)
     # =====================================================================
@@ -5057,6 +5601,11 @@ def generate_daily_predictions():
         'density_altitude_factor': 1.0,
         'weather_extremes_multiplier': 1.0,
         'sportsbook_value_score': 1.0,
+        'opp_bullpen_xfip_degradation': 0.0,
+        'umpire_strike_to_ball_ratio': 1.0,
+        'umpire_runs_created_per_game': 4.40,
+        'lineup_pa_expectation': 4.22,
+        'roof_sealed': 0,
         'pitcher_fear_factor': 0.0,
         'is_elite_power_batter': 0,
     }
@@ -5105,8 +5654,10 @@ def generate_daily_predictions():
         'bat_15pa_hard_hit_rate', 'bat_30pa_hard_hit_rate',
         'bat_15pa_sweet_spot_rate', 'bat_30pa_sweet_spot_rate',
         'bat_15pa_fb_rate', 'bat_30pa_fb_rate',
+        'bat_barrel_trend_delta', 'bat_hard_hit_trend_delta',
         'bat_wrc_plus',  # NEW: Overall offensive value normalized to league average
         'has_platoon_advantage',
+        'lineup_pa_expectation',
         
         # Pitcher vulnerability features (HR/9, FB%, hard-hit, barrels)
         'pitch_pa_count', 'pitch_hr_allowed_rate', 'pitch_barrel_allowed_rate',
@@ -5117,6 +5668,7 @@ def generate_daily_predictions():
         'pitch_15pa_barrel_allowed_rate', 'pitch_30pa_barrel_allowed_rate',
         'pitch_15pa_hard_hit_allowed_rate', 'pitch_30pa_hard_hit_allowed_rate',
         'pitch_15pa_fb_allowed_rate', 'pitch_30pa_fb_allowed_rate',
+        'pitch_barrel_trend_delta', 'pitch_hard_hit_trend_delta',
         
         # Stadium & Weather Features
         'park_factor', 'temp', 'wind_speed', 'wind_out_component',
@@ -5133,8 +5685,11 @@ def generate_daily_predictions():
         'left_on_right_fade_score', 'reverse_split_anomaly_score',
         'ballpark_park_factor', 'porch_advantage_bonus', 'death_valley_penalty',
         'would_be_hr_differential', 'bullpen_quality_score_home', 'bullpen_quality_score_away',
+        'opp_bullpen_xfip_degradation',
         'umpire_strike_zone_impact', 'density_altitude_factor', 'weather_extremes_multiplier',
+        'umpire_strike_to_ball_ratio', 'umpire_runs_created_per_game',
         'sportsbook_value_score', 'pitcher_fear_factor', 'is_elite_power_batter',
+        'roof_sealed',
     ]
     
     # Ensure all required weather columns exist in training data
@@ -5247,25 +5802,84 @@ def generate_daily_predictions():
     if not base_models:
         raise ImportError("Missing required ML package: install xgboost, lightgbm, or scikit-learn.")
 
+    use_model_level_calibration = str(os.getenv('USE_MODEL_LEVEL_CALIBRATION', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    use_ensemble_platt = str(os.getenv('USE_ENSEMBLE_PLATT_SCALING', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    platt_holdout_fraction = float(np.clip(float(os.getenv('PLATT_HOLDOUT_FRACTION', '0.20')), 0.10, 0.40))
+    platt_min_rows = max(200, int(float(os.getenv('PLATT_MIN_ROWS', '600'))))
+
+    X_model_fit = X_train
+    y_model_fit = y_train
+    sample_weights_model_fit = sample_weights
+    X_platt_holdout = None
+    y_platt_holdout = None
+
+    if use_ensemble_platt and len(X_train) >= platt_min_rows:
+        split_idx = int(len(X_train) * (1.0 - platt_holdout_fraction))
+        split_idx = max(100, min(split_idx, len(X_train) - 100))
+        if split_idx > 0 and split_idx < len(X_train):
+            X_model_fit = X_train.iloc[:split_idx].copy()
+            y_model_fit = y_train.iloc[:split_idx].copy()
+            sample_weights_model_fit = np.asarray(sample_weights)[:split_idx]
+            X_platt_holdout = X_train.iloc[split_idx:].copy()
+            y_platt_holdout = y_train.iloc[split_idx:].copy()
+            print(
+                "Platt holdout split: "
+                f"fit_rows={len(X_model_fit)}, holdout_rows={len(X_platt_holdout)}, "
+                f"holdout_fraction={platt_holdout_fraction:.2f}"
+            )
+
     trained_models = []
     for m in base_models:
-        if CalibratedClassifierCV is not None:
+        if use_model_level_calibration and CalibratedClassifierCV is not None:
             # FIXED: Use 'sigmoid' (Platt scaling) instead of 'isotonic' for rare event calibration
             # Isotonic is too aggressive for HR prediction (rare event with low base rate)
             # Sigmoid preserves probability mass better, avoiding probability collapse
             m = CalibratedClassifierCV(m, cv=cv_splitter, method='sigmoid')
         try:
-            m.fit(X_train, y_train, sample_weight=sample_weights)
-        except TypeError:
-            m.fit(X_train, y_train)
+            m.fit(X_model_fit, y_model_fit, sample_weight=sample_weights_model_fit)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if ('sample_weight' in msg) or ('pipeline.fit does not accept' in msg):
+                m.fit(X_model_fit, y_model_fit)
+            else:
+                raise
         trained_models.append(m)
 
     print(f"Ensemble trained: {', '.join(model_names)} (TimeSeriesSplit CV)")
+
+    platt_scaler = None
+    platt_blend = float(np.clip(float(os.getenv('PLATT_BLEND_WEIGHT', '1.00')), 0.0, 1.0))
+    if use_ensemble_platt and LogisticRegression is not None and X_platt_holdout is not None and len(X_platt_holdout) >= 100:
+        holdout_labels = pd.to_numeric(y_platt_holdout, errors='coerce').fillna(0).astype(int)
+        if holdout_labels.nunique() >= 2:
+            try:
+                holdout_raw = np.mean([
+                    _extract_positive_class_probabilities(m, X_platt_holdout) for m in trained_models
+                ], axis=0)
+                raw_metrics = calculate_probability_metrics(holdout_labels, holdout_raw)
+
+                platt_scaler = LogisticRegression(max_iter=1000, solver='lbfgs')
+                platt_scaler.fit(np.asarray(holdout_raw).reshape(-1, 1), holdout_labels)
+                holdout_platt = platt_scaler.predict_proba(np.asarray(holdout_raw).reshape(-1, 1))[:, 1]
+                platt_metrics = calculate_probability_metrics(holdout_labels, holdout_platt)
+
+                print(
+                    "Ensemble Platt calibration: "
+                    f"raw_brier={raw_metrics['brier_score']:.5f} -> platt_brier={platt_metrics['brier_score']:.5f}, "
+                    f"raw_logloss={raw_metrics['log_loss']:.5f} -> platt_logloss={platt_metrics['log_loss']:.5f}, "
+                    f"blend={platt_blend:.2f}"
+                )
+            except Exception as exc:
+                platt_scaler = None
+                print(f"Ensemble Platt calibration unavailable: {exc}")
+        else:
+            print("Ensemble Platt calibration skipped: holdout has single-class labels.")
+
     try:
         train_probabilities = np.mean([
-            _extract_positive_class_probabilities(m, X_train) for m in trained_models
+            _extract_positive_class_probabilities(m, X_model_fit) for m in trained_models
         ], axis=0)
-        train_metrics = calculate_probability_metrics(y_train, train_probabilities)
+        train_metrics = calculate_probability_metrics(y_model_fit, train_probabilities)
         print(
             "Training probability metrics: "
             f"log_loss={train_metrics['log_loss']:.4f}, brier={train_metrics['brier_score']:.4f}"
@@ -5349,11 +5963,19 @@ def generate_daily_predictions():
     live['pitch_hr_per_9'] = live['pitch_hr_per_9'].fillna(1.10)
     live['wind_out_component'] = live['wind_out_component'].fillna(0.0)
     live['bat_pull_rate'] = live['bat_pull_rate'].fillna(0.38)
+    if 'lineup_pa_expectation' in live.columns:
+        live['lineup_pa_expectation'] = pd.to_numeric(live['lineup_pa_expectation'], errors='coerce').fillna(4.22)
+    else:
+        live['lineup_pa_expectation'] = live.get('batting_order_slot', pd.Series([5] * len(live))).apply(get_lineup_slot_pa_expectation)
     live['game_time'] = live['game_time'].fillna('') if 'game_time' in live.columns else ''
     live['home_team'] = live['home_team'].fillna('') if 'home_team' in live.columns else ''
     live['away_team'] = live['away_team'].fillna('') if 'away_team' in live.columns else ''
     live['batter_hand'] = live['batter_hand'].fillna('R') if 'batter_hand' in live.columns else 'R'
     live['pitcher_hand'] = live['pitcher_hand'].fillna('R') if 'pitcher_hand' in live.columns else 'R'
+    if 'roof_sealed' in live.columns:
+        live['roof_sealed'] = pd.to_numeric(live['roof_sealed'], errors='coerce').fillna(0).astype(int)
+    else:
+        live['roof_sealed'] = 0
     
     # =====================================================================
     # PROFESSIONAL BETTOR FEATURES CALCULATION
@@ -5408,9 +6030,20 @@ def generate_daily_predictions():
                     live.at[idx, 'bullpen_quality_score_away'] = calculate_bullpen_fatigue_score(away_team, datetime.today(), statcast_df)
             except Exception:
                 pass
+
+    live['opp_bullpen_xfip_degradation'] = live.apply(
+        lambda r: bullpen_xfip_degradation_index(
+            r.get('bullpen_quality_score_home', 50.0),
+            r.get('bullpen_quality_score_away', 50.0),
+            bool(r.get('is_home_game', False)),
+        ),
+        axis=1,
+    )
     
     # 3. Umpire Strike Zone Impact
     live['umpire_strike_zone_impact'] = 1.0
+    live['umpire_strike_to_ball_ratio'] = 1.0
+    live['umpire_runs_created_per_game'] = 4.40
     if get_todays_umpires is not None:
         try:
             umpires = get_todays_umpires()
@@ -5418,7 +6051,18 @@ def generate_daily_predictions():
                 game_id = row.get('game_id')
                 if game_id and game_id in umpires:
                     profile = umpires[game_id].get('profile', {})
-                    live.at[idx, 'umpire_strike_zone_impact'] = profile.get('impact', 1.0)
+                    impact = float(profile.get('impact', 1.0) or 1.0)
+                    zone_size = float(profile.get('zone_size', 1.0) or 1.0)
+                    strike_ball_ratio = profile.get('strike_to_ball_ratio')
+                    if strike_ball_ratio is None:
+                        strike_ball_ratio = float(np.clip(1.0 + ((zone_size - 1.0) * 1.2), 0.75, 1.30))
+                    runs_created_pg = profile.get('runs_created_per_game')
+                    if runs_created_pg is None:
+                        runs_created_pg = float(np.clip(4.40 * impact, 3.2, 6.8))
+
+                    live.at[idx, 'umpire_strike_zone_impact'] = impact
+                    live.at[idx, 'umpire_strike_to_ball_ratio'] = float(strike_ball_ratio)
+                    live.at[idx, 'umpire_runs_created_per_game'] = float(runs_created_pg)
         except Exception:
             pass
     
@@ -5534,18 +6178,37 @@ def generate_daily_predictions():
         'ballpark_park_factor', 'porch_advantage_bonus',
         'death_valley_penalty', 'would_be_hr_differential',
         'bullpen_quality_score_home', 'bullpen_quality_score_away',
+        'opp_bullpen_xfip_degradation',
         'umpire_strike_zone_impact', 'density_altitude_factor',
-        'weather_extremes_multiplier', 'sportsbook_value_score'
+        'weather_extremes_multiplier', 'sportsbook_value_score',
+        'umpire_strike_to_ball_ratio', 'umpire_runs_created_per_game',
+        'lineup_pa_expectation', 'roof_sealed'
     ]
     
     for col in professional_features:
         if col not in live.columns:
-            if 'score' in col or 'multiplier' in col or 'impact' in col or 'factor' in col or 'value' in col:
+            if col in {'roof_sealed'}:
+                live[col] = 0
+            elif col in {'umpire_runs_created_per_game'}:
+                live[col] = 4.40
+            elif col in {'lineup_pa_expectation'}:
+                live[col] = 4.22
+            elif col in {'opp_bullpen_xfip_degradation'}:
+                live[col] = 0.0
+            elif 'score' in col or 'multiplier' in col or 'impact' in col or 'factor' in col or 'value' in col or 'ratio' in col:
                 live[col] = 1.0
             else:
                 live[col] = 50.0
         else:
-            if 'score' in col or 'multiplier' in col or 'impact' in col or 'factor' in col or 'value' in col:
+            if col in {'roof_sealed'}:
+                live[col] = pd.to_numeric(live[col], errors='coerce').fillna(0).astype(int)
+            elif col in {'umpire_runs_created_per_game'}:
+                live[col] = pd.to_numeric(live[col], errors='coerce').fillna(4.40)
+            elif col in {'lineup_pa_expectation'}:
+                live[col] = pd.to_numeric(live[col], errors='coerce').fillna(4.22)
+            elif col in {'opp_bullpen_xfip_degradation'}:
+                live[col] = pd.to_numeric(live[col], errors='coerce').fillna(0.0)
+            elif 'score' in col or 'multiplier' in col or 'impact' in col or 'factor' in col or 'value' in col or 'ratio' in col:
                 live[col] = live[col].fillna(1.0)
             else:
                 live[col] = live[col].fillna(50.0)
@@ -5572,6 +6235,17 @@ def generate_daily_predictions():
     X_live = live[features_train]
     all_probs = [_extract_positive_class_probabilities(m, X_live) for m in trained_models]
     probs = sum(all_probs) / len(all_probs)
+
+    if platt_scaler is not None:
+        try:
+            probs_raw = np.asarray(probs).reshape(-1)
+            probs_platt = platt_scaler.predict_proba(probs_raw.reshape(-1, 1))[:, 1]
+            probs = np.clip(((1.0 - platt_blend) * probs_raw) + (platt_blend * probs_platt), 0.0, 1.0)
+            live['ensemble_raw_prob'] = probs_raw
+            live['ensemble_platt_prob'] = probs_platt
+            live['ensemble_platt_blend_weight'] = platt_blend
+        except Exception as exc:
+            print(f"Live Platt scaling skipped: {exc}")
 
     # =====================================================================
     # PROFESSIONAL UPGRADE 1: PA Projection + Monte Carlo Simulation
@@ -5810,7 +6484,15 @@ def generate_daily_predictions():
         avg_hr_per_game=2.5,
     )
     live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
-    live = apply_monotonic_prob_calibration(live, gamma=1.35, cap=0.18, top_signal_boost=0.025)
+    monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.25)
+    monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.35)
+    monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.020)
+    live = apply_monotonic_prob_calibration(
+        live,
+        gamma=monotonic_gamma,
+        cap=monotonic_cap,
+        top_signal_boost=monotonic_boost,
+    )
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     
     # =====================================================================
@@ -6226,18 +6908,6 @@ def generate_daily_predictions():
                                     'confidence_lower_95pct', 'confidence_upper_95pct', 'model_reliability', 'batter_consistency_score',
                                     'model_name', 'prediction_timestamp']])
 
-    def _env_int(name, default):
-        try:
-            return int(float(os.getenv(name, str(default))))
-        except Exception:
-            return int(default)
-
-    def _env_float(name, default):
-        try:
-            return float(os.getenv(name, str(default)))
-        except Exception:
-            return float(default)
-
     # Sort and present elite values
     rankings = _prepare_discord_rankings(
         live[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability']]
@@ -6537,9 +7207,62 @@ def monitor_odds_rlm():
         return
 
     preds = pd.read_csv(pred_file)
-    watch_batters = preds.nlargest(15, 'pred_hr_prob')['batter_name'].tolist()
+    for col in ['pred_hr_prob', 'best_market_odds_american', 'ev_percent', 'kelly_fraction']:
+        if col in preds.columns:
+            preds[col] = pd.to_numeric(preds[col], errors='coerce')
+
+    watch_batters = preds.nlargest(15, 'pred_hr_prob')['batter_name'].dropna().astype(str).tolist()
+    model_prob_by_name = {
+        _normalize_player_name(r.get('batter_name')): float(pd.to_numeric(r.get('pred_hr_prob', 0.0), errors='coerce') or 0.0)
+        for _, r in preds.iterrows()
+        if str(r.get('batter_name', '')).strip()
+    }
+    kelly_by_name = {
+        _normalize_player_name(r.get('batter_name')): float(pd.to_numeric(r.get('kelly_fraction', 0.0), errors='coerce') or 0.0)
+        for _, r in preds.iterrows()
+        if str(r.get('batter_name', '')).strip()
+    }
+    game_time_by_name = {
+        _normalize_player_name(r.get('batter_name')): r.get('game_time', '')
+        for _, r in preds.iterrows()
+        if str(r.get('batter_name', '')).strip()
+    }
+
+    min_alert_odds = _env_int('LIVE_EV_MIN_AMERICAN_ODDS', 300)
+    min_ev_edge_abs = _env_float('LIVE_EV_MIN_EDGE_ABS', 0.02)
+    only_positive_ev = str(os.getenv('LIVE_EV_REQUIRE_POSITIVE_EDGE', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    shadow_enable = str(os.getenv('SHADOW_MODEL_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    shadow_prob_by_name = _load_shadow_model_probability_map(today_str) if shadow_enable else {}
+    shadow_alerted = set()
+    stale_follower_alerted = set()
+    stale_implied_gap = _env_float('FOLLOWER_STALE_MIN_IMPLIED_GAP', 0.015)
+    sharp_move_trigger = _env_float('SHARP_MOVE_TRIGGER_IMPLIED_DELTA', 0.020)
+    rlm_poll_seconds = max(60, _env_int('RLM_POLL_SECONDS', 900))
+    auto_wager_enabled = str(os.getenv('AUTO_WAGER_ENABLED', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    auto_wager_min_kelly = max(0.0, _env_float('AUTO_WAGER_MIN_KELLY', 0.01))
+    auto_wager_min_edge = max(0.0, _env_float('AUTO_WAGER_MIN_EDGE_ABS', min_ev_edge_abs))
+    auto_wager_allow_books = {
+        b.strip().lower() for b in str(os.getenv('AUTO_WAGER_ALLOWED_BOOKS', 'pinnacle,circasports')).split(',') if b.strip()
+    }
+    executed_wager_keys = _load_executed_wager_keys(today_str)
+
     print(f"RLM watcher started — {len(watch_batters)} batters tracked")
     print(f"Watching: {', '.join(watch_batters[:5])}...")
+    print(
+        "Live +EV filters: "
+        f"min_odds={min_alert_odds:+d}, min_edge_abs={min_ev_edge_abs:.3f}, "
+        f"require_model_gt_market={only_positive_ev}"
+    )
+    print(
+        "Monitoring mode: "
+        f"poll={rlm_poll_seconds}s, shadow_model={'on' if shadow_enable else 'off'}, "
+        f"stale_gap={stale_implied_gap:.3f}, sharp_trigger={sharp_move_trigger:.3f}"
+    )
+    print(
+        "Direct execution: "
+        f"enabled={auto_wager_enabled}, min_kelly={auto_wager_min_kelly:.4f}, "
+        f"min_edge_abs={auto_wager_min_edge:.4f}, allow_books={sorted(auto_wager_allow_books)}"
+    )
 
     # Load last snapshot if exists
     prev_odds = {}
@@ -6553,19 +7276,248 @@ def monitor_odds_rlm():
         except Exception:
             pass
 
+    alerted_ev = set()
+
     while True:
         try:
             current_odds = fetch_hr_prop_odds_raw()
             if not current_odds:
                 print(f"[{datetime.now().strftime('%H:%M')}] No odds available yet, retrying in 15 min...")
-                time.sleep(900)
+                time.sleep(rlm_poll_seconds)
                 continue
 
             save_odds_snapshot(current_odds, today_str)
 
+            normalized_current = {
+                _normalize_player_name(name): (name, book_map)
+                for name, book_map in current_odds.items()
+                if isinstance(book_map, dict)
+            }
+
+            def _resolve_books_for_batter(batter_name):
+                norm = _normalize_player_name(batter_name)
+                hit = normalized_current.get(norm)
+                if hit:
+                    return hit[0], hit[1]
+                for n, (orig_name, books) in normalized_current.items():
+                    if not n:
+                        continue
+                    if norm in n or n in norm:
+                        return orig_name, books
+                return None, {}
+
+            ev_candidates = []
+            ev_candidate_names = set()
+            latest_best_odds_by_batter = {}
+            for batter_name in watch_batters:
+                odds_key, books = _resolve_books_for_batter(batter_name)
+                if not books:
+                    continue
+
+                best_book, best_american = _best_line_from_book_map(books)
+                if best_american is None:
+                    continue
+
+                norm = _normalize_player_name(batter_name)
+                latest_best_odds_by_batter[norm] = int(best_american)
+                if int(best_american) < int(min_alert_odds):
+                    continue
+
+                model_prob = float(model_prob_by_name.get(norm, 0.0) or 0.0)
+                try:
+                    market_prob = float(american_to_implied_prob(best_american))
+                except Exception:
+                    continue
+
+                edge_abs = model_prob - market_prob
+                if only_positive_ev and edge_abs <= 0.0:
+                    continue
+                if edge_abs < min_ev_edge_abs:
+                    continue
+
+                ev_candidates.append((batter_name, int(best_american), model_prob, market_prob, edge_abs, odds_key, best_book))
+                ev_candidate_names.add(_normalize_player_name(odds_key or batter_name))
+
+            _update_clv_tracker_snapshot(today_str, latest_best_odds_by_batter, game_time_by_name)
+
+            if shadow_enable and shadow_prob_by_name:
+                for batter_name, best_american, _, market_prob, _, _, _ in ev_candidates:
+                    norm = _normalize_player_name(batter_name)
+                    shadow_prob = _safe_float(shadow_prob_by_name.get(norm))
+                    if shadow_prob is None:
+                        continue
+                    shadow_edge = shadow_prob - market_prob
+                    if shadow_edge >= min_ev_edge_abs and norm not in shadow_alerted:
+                        _record_shadow_virtual_bet(today_str, batter_name, best_american, shadow_prob, market_prob)
+                        shadow_alerted.add(norm)
+
+            # Market-maker vs follower lag scan: detect stale follower books after sharp repricing.
+            for batter_name in watch_batters:
+                odds_key, books = _resolve_books_for_batter(batter_name)
+                if not books:
+                    continue
+                prev_books = prev_odds.get(odds_key, {}) if isinstance(prev_odds, dict) else {}
+                if not prev_books:
+                    continue
+
+                sharp_curr = {k: v for k, v in books.items() if k in SHARP_BOOKS}
+                sharp_prev = {k: v for k, v in prev_books.items() if k in SHARP_BOOKS}
+                if not sharp_curr or not sharp_prev:
+                    continue
+
+                _, sharp_curr_line = _best_line_from_book_map(sharp_curr)
+                _, sharp_prev_line = _best_line_from_book_map(sharp_prev)
+                if sharp_curr_line is None or sharp_prev_line is None:
+                    continue
+
+                try:
+                    sharp_imp_delta = float(american_to_implied_prob(sharp_curr_line) - american_to_implied_prob(sharp_prev_line))
+                except Exception:
+                    continue
+                if sharp_imp_delta < sharp_move_trigger:
+                    continue
+
+                followers = {k: v for k, v in books.items() if k in SQUARE_BOOKS}
+                if not followers:
+                    continue
+
+                sharp_curr_imp = float(american_to_implied_prob(sharp_curr_line))
+                stale_hits = []
+                for fbk, fline in followers.items():
+                    try:
+                        f_imp = float(american_to_implied_prob(fline))
+                    except Exception:
+                        continue
+                    # Follower stale if still materially longer than sharp market.
+                    if (sharp_curr_imp - f_imp) >= stale_implied_gap:
+                        stale_hits.append((fbk, int(round(float(fline))), sharp_curr_imp - f_imp))
+
+                if not stale_hits:
+                    continue
+
+                top_stale = sorted(stale_hits, key=lambda x: x[2], reverse=True)[0]
+                stale_key = f"{_normalize_player_name(batter_name)}|{top_stale[0]}|{top_stale[1]}"
+                if stale_key in stale_follower_alerted:
+                    continue
+
+                stale_msg = (
+                    f"🕒 **FOLLOWER LAG — {batter_name}**\n"
+                    f"Sharp moved to {sharp_curr_line:+d} (delta implied +{sharp_imp_delta*100:.2f} pts)\n"
+                    f"Stale follower: {top_stale[0]} still {top_stale[1]:+d}\n"
+                    f"Implied gap: +{top_stale[2]*100:.2f} pts"
+                )
+                send_discord_webhook(content=stale_msg)
+                print(stale_msg)
+                stale_follower_alerted.add(stale_key)
+
+            watch_batters_for_rlm = []
+            for batter_name in watch_batters:
+                odds_key, books = _resolve_books_for_batter(batter_name)
+                if books and odds_key:
+                    watch_batters_for_rlm.append(odds_key)
+            watch_batters_for_rlm = list(dict.fromkeys(watch_batters_for_rlm))
+
+            for batter_name, best_american, model_prob, market_prob, edge_abs, odds_key, best_book in ev_candidates:
+                norm = _normalize_player_name(batter_name)
+                if norm in alerted_ev:
+                    continue
+
+                _record_clv_entry(today_str, batter_name, best_american, model_prob, source='live_ev_alert')
+                implied_pct = market_prob * 100.0
+                model_pct = model_prob * 100.0
+                edge_pct = edge_abs * 100.0
+                ev_msg = (
+                    f"💰 **+EV WINDOW — {batter_name}**\n"
+                    f"Best line: {best_american:+d} ({odds_key or 'market'})\n"
+                    f"Model HR prob: {model_pct:.1f}%\n"
+                    f"Market implied: {implied_pct:.1f}%\n"
+                    f"Edge: +{edge_pct:.2f} pts"
+                )
+                send_discord_webhook(content=ev_msg)
+                print(ev_msg)
+
+                if auto_wager_enabled:
+                    book_key = str(best_book or '').strip().lower()
+                    kelly_fraction = float(kelly_by_name.get(norm, 0.0) or 0.0)
+                    can_execute = True
+                    skip_reason = None
+                    if not book_key:
+                        can_execute = False
+                        skip_reason = 'missing_book'
+                    elif auto_wager_allow_books and book_key not in auto_wager_allow_books:
+                        can_execute = False
+                        skip_reason = f'book_not_allowed:{book_key}'
+                    elif kelly_fraction < auto_wager_min_kelly:
+                        can_execute = False
+                        skip_reason = f'kelly_below_min:{kelly_fraction:.4f}'
+                    elif edge_abs < auto_wager_min_edge:
+                        can_execute = False
+                        skip_reason = f'edge_below_min:{edge_abs:.4f}'
+
+                    execution_seed = f"{today_str}|{norm}|{book_key}|{int(best_american)}|{kelly_fraction:.6f}"
+                    execution_key = hashlib.sha256(execution_seed.encode('utf-8')).hexdigest()[:32]
+
+                    if execution_key in executed_wager_keys:
+                        can_execute = False
+                        skip_reason = 'already_executed'
+
+                    result = {
+                        'status': 'skipped',
+                        'reason': skip_reason or 'gated',
+                        'stake_usd': 0.0,
+                    }
+                    if can_execute:
+                        result = _execute_auto_wager_direct_api(
+                            date_str=today_str,
+                            batter_name=batter_name,
+                            sportsbook=book_key,
+                            odds_american=best_american,
+                            model_prob=model_prob,
+                            market_prob=market_prob,
+                            edge_abs=edge_abs,
+                            kelly_fraction=kelly_fraction,
+                            game_time=game_time_by_name.get(norm),
+                            execution_key=execution_key,
+                        )
+
+                    log_row = {
+                        'timestamp': datetime.now().isoformat(),
+                        'execution_key': execution_key,
+                        'batter_name': batter_name,
+                        'sportsbook': book_key,
+                        'odds_american': int(best_american),
+                        'model_prob': float(model_prob),
+                        'market_prob': float(market_prob),
+                        'edge_abs': float(edge_abs),
+                        'kelly_fraction': float(kelly_fraction),
+                        'status': str(result.get('status', 'unknown')),
+                        'reason': str(result.get('reason', '')),
+                        'stake_usd': float(_safe_float(result.get('stake_usd'), 0.0) or 0.0),
+                        'endpoint': str(result.get('endpoint', '')),
+                        'http_status': _safe_int(result.get('http_status')),
+                    }
+                    _append_auto_wager_log(today_str, log_row)
+                    if str(result.get('status')) in {'placed', 'dry_run'}:
+                        executed_wager_keys.add(execution_key)
+
+                    exec_msg = (
+                        f"🤖 **AUTO EXECUTION — {batter_name}**\n"
+                        f"Book: {book_key or 'n/a'} | Line: {int(best_american):+d}\n"
+                        f"Status: {result.get('status')} ({result.get('reason')})\n"
+                        f"Stake: ${float(_safe_float(result.get('stake_usd'), 0.0) or 0.0):.2f}"
+                    )
+                    send_discord_webhook(content=exec_msg)
+                    print(exec_msg)
+
+                alerted_ev.add(norm)
+
             if prev_odds:
-                alerts = detect_rlm(current_odds, prev_odds, watch_batters)
+                alerts = detect_rlm(current_odds, prev_odds, watch_batters_for_rlm)
                 for batter, sharp_move, square_move, signal in alerts:
+                    batter_norm = _normalize_player_name(batter)
+                    if batter_norm not in ev_candidate_names:
+                        continue
+
                     batter_row = preds[preds['batter_name'].str.lower() == batter.lower()]
                     model_prob_str = f"{float(batter_row['pred_hr_prob'].iloc[0]) * 100:.1f}%" if not batter_row.empty else 'N/A'
                     msg = (
@@ -6577,9 +7529,12 @@ def monitor_odds_rlm():
                     print(msg)
 
             # Print current market snapshot for top picks
-            print(f"\n[{datetime.now().strftime('%H:%M')}] {len(current_odds)} players tracked across sportsbooks")
+            print(
+                f"\n[{datetime.now().strftime('%H:%M')}] {len(current_odds)} players tracked across sportsbooks "
+                f"| ev_candidates={len(ev_candidates)}"
+            )
             for batter in watch_batters[:5]:
-                books = current_odds.get(batter, {})
+                _, books = _resolve_books_for_batter(batter)
                 if books:
                     sharp = {k: v for k, v in books.items() if k in SHARP_BOOKS}
                     square = {k: v for k, v in books.items() if k in SQUARE_BOOKS}
@@ -6588,7 +7543,8 @@ def monitor_odds_rlm():
                     print(f"  {batter[:25]:<25} {sharp_str:<15} {square_str}  ({len(books)} books)")
 
             prev_odds = current_odds
-            time.sleep(900)
+            audit_clv_performance(today_str, lookback_days=max(7, _env_int('CLV_AUDIT_LOOKBACK_DAYS', 30)))
+            time.sleep(rlm_poll_seconds)
         except Exception as e:
             print(f"RLM monitor error: {e}")
             time.sleep(60)
@@ -6854,6 +7810,246 @@ def load_live_power_profile(date_str=None):
             by_name[_normalize_player_name(batter_name)] = profile
 
     return {'by_id': by_id, 'by_name': by_name}
+
+
+def _load_shadow_model_probability_map(date_str=None):
+    """Load optional shadow model probabilities keyed by normalized batter name."""
+    explicit_path = str(os.getenv('SHADOW_MODEL_PROBS_PATH', '') or '').strip()
+    if explicit_path:
+        candidate = Path(explicit_path)
+    else:
+        date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+        candidate = Path('data') / f'shadow_predictions_{date_str}.csv'
+
+    if not candidate.exists():
+        return {}
+
+    try:
+        shadow_df = pd.read_csv(candidate)
+    except Exception:
+        return {}
+
+    if shadow_df.empty:
+        return {}
+
+    if 'batter_name' not in shadow_df.columns:
+        return {}
+
+    prob_col = None
+    for c in ['shadow_pred_hr_prob', 'pred_hr_prob', 'probability']:
+        if c in shadow_df.columns:
+            prob_col = c
+            break
+    if prob_col is None:
+        return {}
+
+    out = {}
+    for _, row in shadow_df.iterrows():
+        nm = _normalize_player_name(row.get('batter_name'))
+        if not nm:
+            continue
+        p = _safe_float(row.get(prob_col))
+        if p is None or not np.isfinite(p):
+            continue
+        out[nm] = float(np.clip(p, 0.0, 1.0))
+    return out
+
+
+def _record_shadow_virtual_bet(date_str, batter_name, best_odds_american, shadow_prob, market_prob):
+    """Append a paper-trade row for shadow model evaluation without risking capital."""
+    out_path = Path('data') / f'shadow_virtual_bets_{date_str}.csv'
+    Path('data').mkdir(parents=True, exist_ok=True)
+    row = {
+        'timestamp': datetime.now().isoformat(),
+        'batter_name': str(batter_name or ''),
+        'best_odds_american': _safe_float(best_odds_american, np.nan),
+        'shadow_pred_hr_prob': _safe_float(shadow_prob, np.nan),
+        'market_implied_prob': _safe_float(market_prob, np.nan),
+        'shadow_edge_abs': (_safe_float(shadow_prob, 0.0) or 0.0) - (_safe_float(market_prob, 0.0) or 0.0),
+    }
+    df = pd.DataFrame([row])
+    if out_path.exists():
+        df.to_csv(out_path, mode='a', header=False, index=False)
+    else:
+        df.to_csv(out_path, index=False)
+
+
+def _auto_wager_log_path(date_str=None):
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    return Path('data') / f'auto_wager_executions_{date_str}.csv'
+
+
+def _load_executed_wager_keys(date_str=None):
+    path = _auto_wager_log_path(date_str)
+    if not path.exists():
+        return set()
+    try:
+        df = pd.read_csv(path)
+        if 'execution_key' not in df.columns:
+            return set()
+        return set(df['execution_key'].dropna().astype(str).tolist())
+    except Exception:
+        return set()
+
+
+def _append_auto_wager_log(date_str, row):
+    path = _auto_wager_log_path(date_str)
+    Path('data').mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame([row])
+    if path.exists():
+        df.to_csv(path, mode='a', header=False, index=False)
+    else:
+        df.to_csv(path, index=False)
+
+
+def _load_auto_wager_book_config():
+    """Return optional per-book API execution config from env JSON."""
+    raw = str(os.getenv('AUTO_WAGER_BOOK_CONFIG_JSON', '') or '').strip()
+    if not raw:
+        return {}
+    try:
+        payload = _json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    out = {}
+    for k, v in payload.items():
+        if not isinstance(v, dict):
+            continue
+        out[str(k).strip().lower()] = v
+    return out
+
+
+def _resolve_auto_wager_endpoint(book_key, book_config):
+    book_cfg = (book_config or {}).get(str(book_key or '').strip().lower(), {})
+    if isinstance(book_cfg, dict) and str(book_cfg.get('url', '')).strip():
+        return str(book_cfg.get('url')).strip(), book_cfg
+
+    default_url = str(os.getenv('AUTO_WAGER_DEFAULT_URL', '') or '').strip()
+    if default_url:
+        return default_url, book_cfg if isinstance(book_cfg, dict) else {}
+    return None, {}
+
+
+def _estimate_auto_wager_stake(kelly_fraction):
+    bankroll = max(0.0, _env_float('AUTO_WAGER_BANKROLL_USD', 1000.0))
+    stake_floor = max(0.0, _env_float('AUTO_WAGER_MIN_STAKE_USD', 5.0))
+    stake_cap = max(stake_floor, _env_float('AUTO_WAGER_MAX_STAKE_USD', 50.0))
+    kelly_mult = max(0.0, _env_float('AUTO_WAGER_KELLY_MULTIPLIER', 0.25))
+    kf = max(0.0, _safe_float(kelly_fraction, 0.0) or 0.0)
+    stake = bankroll * kf * kelly_mult
+    if stake <= 0:
+        return 0.0
+    return float(np.clip(stake, stake_floor, stake_cap))
+
+
+def _execute_auto_wager_direct_api(
+    date_str,
+    batter_name,
+    sportsbook,
+    odds_american,
+    model_prob,
+    market_prob,
+    edge_abs,
+    kelly_fraction,
+    game_time,
+    execution_key,
+):
+    """Execute a wager through direct sportsbook/exchange API infrastructure."""
+    dry_run = str(os.getenv('AUTO_WAGER_DRY_RUN', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    stake_usd = _estimate_auto_wager_stake(kelly_fraction)
+    if stake_usd <= 0:
+        return {
+            'status': 'skipped',
+            'reason': 'stake_zero',
+            'stake_usd': 0.0,
+        }
+
+    if requests is None:
+        return {
+            'status': 'failed',
+            'reason': 'requests_unavailable',
+            'stake_usd': stake_usd,
+        }
+
+    book_config = _load_auto_wager_book_config()
+    endpoint, cfg = _resolve_auto_wager_endpoint(sportsbook, book_config)
+    if not endpoint:
+        return {
+            'status': 'failed',
+            'reason': 'missing_execution_endpoint',
+            'stake_usd': stake_usd,
+        }
+
+    payload = {
+        'event_date': date_str,
+        'market_type': 'player_home_run',
+        'selection_name': str(batter_name),
+        'sportsbook': str(sportsbook or ''),
+        'odds_american': int(round(float(odds_american))),
+        'stake_usd': round(float(stake_usd), 2),
+        'model_probability': float(model_prob),
+        'market_probability': float(market_prob),
+        'edge_abs': float(edge_abs),
+        'kelly_fraction': float(_safe_float(kelly_fraction, 0.0) or 0.0),
+        'game_time': str(game_time or ''),
+        'idempotency_key': str(execution_key),
+    }
+
+    headers = {'Content-Type': 'application/json'}
+    auth_mode = str((cfg or {}).get('auth', os.getenv('AUTO_WAGER_AUTH_MODE', 'bearer'))).strip().lower()
+    token_env = str((cfg or {}).get('token_env', os.getenv('AUTO_WAGER_TOKEN_ENV', 'AUTO_WAGER_API_TOKEN'))).strip()
+    token = str(os.getenv(token_env, '') or '').strip() if token_env else ''
+    if auth_mode == 'x-api-key' and token:
+        headers['x-api-key'] = token
+    elif token:
+        headers['Authorization'] = f"Bearer {token}"
+    headers['Idempotency-Key'] = str(execution_key)
+
+    if dry_run:
+        return {
+            'status': 'dry_run',
+            'reason': 'dry_run_enabled',
+            'stake_usd': stake_usd,
+            'endpoint': endpoint,
+            'request_payload': payload,
+        }
+
+    timeout_sec = max(3, _env_int('AUTO_WAGER_HTTP_TIMEOUT_SECONDS', 10))
+    try:
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=timeout_sec)
+        resp_text = str(getattr(resp, 'text', '') or '')
+        body = None
+        try:
+            body = resp.json()
+        except Exception:
+            body = {'raw_text': resp_text[:500]}
+        if int(resp.status_code) >= 200 and int(resp.status_code) < 300:
+            return {
+                'status': 'placed',
+                'reason': 'ok',
+                'stake_usd': stake_usd,
+                'endpoint': endpoint,
+                'http_status': int(resp.status_code),
+                'response': body,
+            }
+        return {
+            'status': 'failed',
+            'reason': 'http_error',
+            'stake_usd': stake_usd,
+            'endpoint': endpoint,
+            'http_status': int(resp.status_code),
+            'response': body,
+        }
+    except Exception as exc:
+        return {
+            'status': 'failed',
+            'reason': f'exception: {exc}',
+            'stake_usd': stake_usd,
+            'endpoint': endpoint,
+        }
 
 
 def build_pitch_count_fastball_tendency_lookup(days_back=45, min_sample=25):
@@ -7982,6 +9178,7 @@ def main():
     parser.add_argument("--date", type=str, help="Ingest Statcast records using explicit format: YYYY-MM-DD")
     parser.add_argument("--live", action="store_true", help="Launch real-time Discord home run notifications watch script")
     parser.add_argument("--rlm", action="store_true", help="Monitor all sportsbooks for reverse line movement on today's picks")
+    parser.add_argument("--auto-exec", action="store_true", help="Enable direct API wager execution during live RLM/+EV monitoring")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate saved predictions against actual results")
     parser.add_argument("--eval-date", type=str, help="Date to evaluate predictions for, format YYYY-MM-DD")
     parser.add_argument("--notify-eval", action="store_true", help="Send evaluation summary to Discord if webhook is configured")
@@ -7991,6 +9188,9 @@ def main():
     parser.add_argument("--systematic-ev", action="store_true", help="Run full +EV operation (backfill, self-check, predict, weekly todo)")
     parser.add_argument("--bet-ready", action="store_true", help="Print only actionable wagers (+EV with odds and Kelly > 0)")
     parser.add_argument("--straight-discrepancies", action="store_true", help="Print single straight wagers where model math disagrees with market")
+    parser.add_argument("--audit-clv", action="store_true", help="Audit entry vs closing prices and emit CLV performance reports")
+    parser.add_argument("--audit-clv-date", type=str, help="Date for CLV audit, format YYYY-MM-DD")
+    parser.add_argument("--audit-clv-days", type=int, default=30, help="Rolling lookback window in days for CLV audit trend stats")
     parser.add_argument("--backfill-days", type=int, default=30, help="Lookback window for self-check/backfill commands")
 
     args = parser.parse_args()
@@ -8024,7 +9224,13 @@ def main():
         print_single_straight_market_discrepancies()
         return
 
+    if args.audit_clv:
+        audit_clv_performance(args.audit_clv_date or args.date, lookback_days=max(1, int(args.audit_clv_days)))
+        return
+
     if args.rlm:
+        if args.auto_exec:
+            os.environ['AUTO_WAGER_ENABLED'] = 'true'
         monitor_odds_rlm()
         return
 
