@@ -1019,6 +1019,142 @@ def persist_daily_predictions(predictions_df, date_str=None):
     return filename
 
 
+def _morning_bet_alert_state_path(date_str=None):
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    return Path('data') / f'morning_bet_alert_sent_{date_str}.json'
+
+
+def _market_release_window_active_et():
+    """Return True when current ET time is inside configured market-release window."""
+    now_et = datetime.utcnow() - timedelta(hours=4)
+    start_hour = _env_int('MORNING_ALERT_START_HOUR_ET', 9)
+    end_hour = _env_int('MORNING_ALERT_END_HOUR_ET', 11)
+    end_minute = _env_int('MORNING_ALERT_END_MINUTE_ET', 0)
+
+    cur_min = (now_et.hour * 60) + now_et.minute
+    start_min = (start_hour * 60)
+    end_min = (end_hour * 60) + end_minute
+    return start_min <= cur_min <= end_min
+
+
+def _has_morning_bet_alert_been_sent(date_str=None):
+    path = _morning_bet_alert_state_path(date_str)
+    if not path.exists():
+        return False
+    try:
+        payload = _json.loads(path.read_text(encoding='utf-8'))
+        return bool(payload.get('sent', False))
+    except Exception:
+        return False
+
+
+def _mark_morning_bet_alert_sent(date_str=None, payload=None):
+    path = _morning_bet_alert_state_path(date_str)
+    Path('data').mkdir(parents=True, exist_ok=True)
+    body = {
+        'sent': True,
+        'sent_at': datetime.now().isoformat(),
+    }
+    if isinstance(payload, dict):
+        body.update(payload)
+    try:
+        path.write_text(_json.dumps(body, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def send_morning_bet_now_alert(live_df, date_str=None):
+    """Send a once-per-day morning Discord alert with actionable pre-correction bets."""
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    enabled = str(os.getenv('MORNING_BET_ALERT_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if not enabled:
+        return False
+
+    if not _candidate_discord_webhooks():
+        return False
+
+    if _has_morning_bet_alert_been_sent(date_str):
+        return False
+
+    if not _market_release_window_active_et():
+        return False
+
+    if live_df is None or live_df.empty:
+        return False
+
+    picks = live_df.copy()
+    for c in ['pred_hr_prob', 'market_prob', 'ev_percent', 'kelly_fraction', 'best_market_odds_american']:
+        if c in picks.columns:
+            picks[c] = pd.to_numeric(picks[c], errors='coerce')
+
+    min_odds = _env_int('MORNING_BET_ALERT_MIN_AMERICAN_ODDS', 300)
+    min_edge_abs = _env_float('MORNING_BET_ALERT_MIN_EDGE_ABS', 0.02)
+    min_ev_pct = _env_float('MORNING_BET_ALERT_MIN_EV_PCT', 2.0)
+    min_kelly = _env_float('MORNING_BET_ALERT_MIN_KELLY', 0.005)
+    top_n = max(3, _env_int('MORNING_BET_ALERT_TOP_N', 8))
+
+    picks['edge_abs'] = (picks.get('pred_hr_prob', 0.0) - picks.get('market_prob', np.nan))
+    picks['has_odds'] = picks.get('best_market_odds_american', np.nan).notna()
+
+    actionable = picks[
+        picks['has_odds'] &
+        (picks['best_market_odds_american'] >= min_odds) &
+        (picks['edge_abs'] >= min_edge_abs) &
+        (picks.get('ev_percent', 0.0).fillna(0.0) >= min_ev_pct) &
+        (picks.get('kelly_fraction', 0.0).fillna(0.0) >= min_kelly)
+    ].copy()
+
+    actionable = actionable.sort_values(
+        by=['ev_percent', 'edge_abs', 'kelly_fraction', 'pred_hr_prob'],
+        ascending=[False, False, False, False]
+    ).head(top_n)
+
+    if actionable.empty:
+        message = (
+            f"⏰ **MARKET RELEASE CHECK ({date_str})**\n"
+            "No qualifying +EV HR bets right now under morning risk gates.\n"
+            f"Filters: odds>=+{min_odds}, edge>={min_edge_abs*100:.1f} pts, "
+            f"EV>={min_ev_pct:.1f}%, Kelly>={min_kelly:.3f}."
+        )
+        sent = send_discord_webhook(content=message)
+        if sent:
+            _mark_morning_bet_alert_sent(date_str, {
+                'qualifying_rows': 0,
+                'min_odds': min_odds,
+                'min_edge_abs': min_edge_abs,
+                'min_ev_pct': min_ev_pct,
+                'min_kelly': min_kelly,
+            })
+        return bool(sent)
+
+    lines = [
+        f"🚨 **BET NOW — MARKET RELEASE WINDOW ({date_str})**",
+        "Lines are still inefficient; action before correction:",
+    ]
+    for _, row in actionable.iterrows():
+        lines.append(
+            f"- {row.get('batter_name','')} vs {row.get('pitcher_name','')} | "
+            f"{int(row.get('best_market_odds_american')):+d} ({row.get('best_book','n/a')}) | "
+            f"model={float(row.get('pred_hr_prob', 0.0))*100:.1f}% | "
+            f"mkt={float(row.get('market_prob', 0.0))*100:.1f}% | "
+            f"EV={float(row.get('ev_percent', 0.0)):+.1f}% | "
+            f"Kelly={float(row.get('kelly_fraction', 0.0)):.3f}"
+        )
+
+    sent = send_discord_webhook(content="\n".join(lines))
+    if sent:
+        _mark_morning_bet_alert_sent(date_str, {
+            'qualifying_rows': int(len(actionable)),
+            'min_odds': min_odds,
+            'min_edge_abs': min_edge_abs,
+            'min_ev_pct': min_ev_pct,
+            'min_kelly': min_kelly,
+            'top_n': top_n,
+            'top_names': actionable['batter_name'].astype(str).tolist(),
+        })
+    return bool(sent)
+
+
 def print_bet_ready_wagers(date_str=None, top_n=15):
     """Print only actionable wagers from today's predictions file.
 
@@ -7100,6 +7236,14 @@ def generate_daily_predictions():
     if not _candidate_discord_webhooks():
         print("Discord webhook not configured — skipping notification. Set DISCORD_MLB_WEBHOOK to enable.")
         return live
+
+    # One-time morning signal: "go bet now" before market follower books converge.
+    try:
+        _morning_sent = send_morning_bet_now_alert(live, date_str=target_date)
+        if _morning_sent:
+            print("Morning market-release bet alert sent.")
+    except Exception as _morning_exc:
+        print(f"Morning market-release alert skipped: {_morning_exc}")
 
     def _post_pick_table_batches(df, title):
         if df is None or df.empty:
