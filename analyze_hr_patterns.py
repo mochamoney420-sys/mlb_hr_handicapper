@@ -38,21 +38,53 @@ if env_file.exists():
 # =====================================================================
 
 def load_yesterdays_home_runs():
-    """Load actual home runs from yesterday's live monitoring."""
+    """Load yesterday's complete home-run outcomes from Statcast and merge with any watcher feedback."""
     yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
     feedback_file = Path('data') / f'live_feedback_{yesterday}.csv'
-    
-    if not feedback_file.exists():
+    statcast_file = Path('cache') / f'statcast_{yesterday}.csv'
+
+    hrs = pd.DataFrame()
+
+    if statcast_file.exists():
+        try:
+            statcast_df = pd.read_csv(statcast_file)
+            if {'game_pk', 'batter', 'pitcher', 'events', 'game_date'}.issubset(statcast_df.columns):
+                statcast_df = statcast_df.dropna(subset=['game_pk', 'batter', 'pitcher', 'events']).copy()
+                statcast_df['is_hr'] = (statcast_df['events'] == 'home_run').astype(int)
+                hrs = (
+                    statcast_df[statcast_df['is_hr'] == 1]
+                    .groupby(['game_pk', 'batter', 'pitcher'], as_index=False)
+                    .agg(actual_hr=('is_hr', 'max'))
+                )
+                hrs['date'] = yesterday
+                hrs['source'] = 'statcast'
+                print(f"📊 Found {len(hrs)} home runs from {yesterday} in Statcast")
+        except Exception as exc:
+            print(f"⚠️  Error loading Statcast file: {exc}")
+
+    if feedback_file.exists():
+        try:
+            fb = pd.read_csv(feedback_file)
+            if not fb.empty:
+                fb = fb.copy()
+                fb['date'] = fb.get('date', yesterday)
+                fb['actual_hr'] = pd.to_numeric(fb.get('actual_hr', 1), errors='coerce').fillna(1).astype(int)
+                fb['batter'] = pd.to_numeric(fb.get('batter', np.nan), errors='coerce')
+                fb['pitcher'] = pd.to_numeric(fb.get('pitcher', np.nan), errors='coerce')
+                fb['game_pk'] = pd.to_numeric(fb.get('game_pk', np.nan), errors='coerce')
+                if not hrs.empty:
+                    hrs = pd.concat([hrs, fb[['date', 'batter_name', 'pitcher_name', 'batter', 'pitcher', 'game_pk', 'inning', 'model_prob', 'was_predicted', 'was_most_likely_homer', 'actual_hr']].dropna(subset=['batter_name', 'pitcher_name'])], ignore_index=True)
+                else:
+                    hrs = fb[['date', 'batter_name', 'pitcher_name', 'batter', 'pitcher', 'game_pk', 'inning', 'model_prob', 'was_predicted', 'was_most_likely_homer', 'actual_hr']].dropna(subset=['batter_name', 'pitcher_name']).copy()
+                print(f"🧾 Added {len(fb)} watcher feedback rows for {yesterday}")
+        except Exception as exc:
+            print(f"⚠️  Error loading feedback file: {exc}")
+
+    if hrs.empty:
         print(f"ℹ️  No home run feedback file found: {feedback_file}")
         return pd.DataFrame()
-    
-    try:
-        hrs = pd.read_csv(feedback_file)
-        print(f"📊 Found {len(hrs)} home runs from {yesterday}")
-        return hrs
-    except Exception as e:
-        print(f"⚠️  Error loading feedback: {e}")
-        return pd.DataFrame()
+
+    return hrs.drop_duplicates(subset=['batter_name', 'pitcher_name', 'game_pk'], keep='last')
 
 def load_training_data_for_analysis(days_back=60):
     """Load historical Statcast to analyze HR conditions."""
@@ -90,6 +122,9 @@ def extract_hr_patterns(actual_hrs, training_data):
         pitcher_id = pd.to_numeric(hr_row.get('pitcher', None), errors='coerce')
         batter_name = hr_row.get('batter_name', 'Unknown')
         pitcher_name = hr_row.get('pitcher_name', 'Unknown')
+
+        if pd.isna(batter_id) or pd.isna(pitcher_id):
+            continue
         
         if pd.isna(batter_id) or pd.isna(pitcher_id):
             continue

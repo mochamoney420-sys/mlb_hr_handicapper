@@ -63,10 +63,12 @@ try:
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import log_loss
 except ImportError:
     RandomForestClassifier = None
     CalibratedClassifierCV = None
     TimeSeriesSplit = None
+    log_loss = None
 from datetime import datetime, timedelta
 from pybaseball import statcast
 from threading import Thread
@@ -926,6 +928,23 @@ def load_or_fetch_statcast(date_str):
     except Exception as exc:
         print(f"Failed to fetch Statcast data for {date_str}: {exc}")
         return pd.DataFrame()
+
+
+def calculate_probability_metrics(y_true, probs):
+    """Evaluate probabilistic binary predictions using log-loss and Brier score."""
+    labels = pd.to_numeric(pd.Series(y_true), errors='coerce').fillna(0).astype(int).to_numpy()
+    probs_array = np.clip(pd.to_numeric(pd.Series(probs), errors='coerce').fillna(0.0).to_numpy(), 1e-6, 1 - 1e-6)
+
+    if len(labels) != len(probs_array):
+        raise ValueError("y_true and probs must be the same length")
+
+    if log_loss is None:
+        logloss_value = float('nan')
+    else:
+        logloss_value = float(log_loss(labels, probs_array))
+
+    brier_value = float(np.mean((probs_array - labels) ** 2))
+    return {'log_loss': logloss_value, 'brier_score': brier_value}
 
 
 def _load_actual_hr_outcomes(date_str):
@@ -2863,6 +2882,7 @@ def evaluate_saved_predictions(date_str=None):
 
     merged['brier_error'] = (merged['pred_hr_prob'] - merged['actual_hr']) ** 2
     brier_score = merged['brier_error'].mean()
+    prob_metrics = calculate_probability_metrics(merged['actual_hr'], merged['pred_hr_prob'])
     overall_hr_rate = merged['actual_hr'].mean()
     top_10 = merged.sort_values(by='pred_hr_prob', ascending=False).head(10)
     top_10_hits = top_10['actual_hr'].sum()
@@ -2880,6 +2900,7 @@ def evaluate_saved_predictions(date_str=None):
     print(f"Predictions evaluated: {len(merged)}")
     print(f"Actual HR occurrence rate: {overall_hr_rate:.3f}")
     print(f"Brier score: {brier_score:.4f}")
+    print(f"Log-loss: {prob_metrics['log_loss']:.4f}")
     print(f"Top 10 predictions HR rate: {top_10_rate:.3f} ({int(top_10_hits)} HRs)")
     print("\nTop 10 predictions with actual outcomes:")
     print(top_10[['batter_name', 'pitcher_name', 'pred_hr_prob', 'actual_hr', 'plate_apps']].to_string(index=False))
@@ -2901,6 +2922,7 @@ def evaluate_saved_predictions(date_str=None):
             {"name": "Predictions evaluated", "value": str(len(merged)), "inline": True},
             {"name": "Actual HR rate", "value": f"{overall_hr_rate:.3f}", "inline": True},
             {"name": "Brier score", "value": f"{brier_score:.4f}", "inline": True},
+            {"name": "Log-loss", "value": f"{prob_metrics['log_loss']:.4f}", "inline": True},
             {"name": "Top 10 HR rate", "value": f"{top_10_rate:.3f} ({int(top_10_hits)} HRs)", "inline": True},
             {"name": "Top 3 predictions", "value": "\n".join(top_rows) or "No top predictions available", "inline": False}
         ],
@@ -4931,14 +4953,17 @@ def generate_daily_predictions():
     if xgb is not None:
         base_models.append(xgb.XGBClassifier(
             n_estimators=150, max_depth=5, learning_rate=0.04,
-            eval_metric='logloss', scale_pos_weight=scale_pos_weight
+            objective='binary:logistic', eval_metric='logloss',
+            scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9
         ))
         model_names.append('XGBoost')
 
     if lgb is not None:
         base_models.append(lgb.LGBMClassifier(
             n_estimators=150, max_depth=5, learning_rate=0.04,
-            scale_pos_weight=scale_pos_weight, verbose=-1
+            objective='binary', metric='binary_logloss',
+            scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9,
+            verbose=-1
         ))
         model_names.append('LightGBM')
 
@@ -4998,6 +5023,18 @@ def generate_daily_predictions():
         trained_models.append(m)
 
     print(f"Ensemble trained: {', '.join(model_names)} (TimeSeriesSplit CV)")
+    try:
+        train_probabilities = np.mean([
+            m.predict_proba(X_train)[:, 1] for m in trained_models
+        ], axis=0)
+        train_metrics = calculate_probability_metrics(y_train, train_probabilities)
+        print(
+            "Training probability metrics: "
+            f"log_loss={train_metrics['log_loss']:.4f}, brier={train_metrics['brier_score']:.4f}"
+        )
+    except Exception as exc:
+        print(f"Training probability metrics unavailable: {exc}")
+
     try:
         _base = trained_models[0]
         _fi = None
