@@ -5199,7 +5199,6 @@ def generate_daily_predictions():
         base_models.append(lgb.LGBMClassifier(
             n_estimators=150, max_depth=5, learning_rate=0.04,
             objective='binary', metric='binary_logloss',
-            is_unbalance=True,
             scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9,
             verbose=-1
         ))
