@@ -3769,6 +3769,101 @@ def _coerce_numeric_column(frame, column_name, default=0.0):
     return pd.Series([default] * len(frame), index=frame.index, dtype=float)
 
 
+def _extract_positive_class_probabilities(model, features_frame):
+    """Return robust positive-class probabilities for binary HR classification.
+
+    Uses predict_proba when available and always extracts class-1 probabilities.
+    Falls back to predict output only when predict_proba is unavailable.
+    """
+    if hasattr(model, 'predict_proba'):
+        proba = model.predict_proba(features_frame)
+        proba_arr = np.asarray(proba)
+        if proba_arr.ndim == 2 and proba_arr.shape[1] >= 2:
+            return np.clip(proba_arr[:, 1], 0.0, 1.0)
+        if proba_arr.ndim == 1:
+            return np.clip(proba_arr, 0.0, 1.0)
+
+    # Fallback for estimators without predict_proba.
+    raw_pred = np.asarray(model.predict(features_frame))
+    if raw_pred.ndim == 2 and raw_pred.shape[1] >= 2:
+        return np.clip(raw_pred[:, 1], 0.0, 1.0)
+    return np.clip(raw_pred.reshape(-1), 0.0, 1.0)
+
+
+def print_x_today_diagnostics(live_df, feature_cols, tag='X_today', sample_rows=5):
+    """Print strict diagnostics to catch static, NaN-heavy, or degenerate live feature payloads."""
+    if live_df is None or live_df.empty:
+        print(f"{tag} diagnostics: live frame is empty")
+        return
+
+    expected = list(feature_cols or [])
+    missing = [c for c in expected if c not in live_df.columns]
+    if missing:
+        preview = ', '.join(missing[:12])
+        print(f"{tag} diagnostics: missing feature columns ({len(missing)}): {preview}")
+
+    payload = live_df.reindex(columns=expected)
+    if payload.empty:
+        print(f"{tag} diagnostics: payload matrix is empty after reindex")
+        return
+
+    numeric_payload = payload.apply(pd.to_numeric, errors='coerce')
+    total_cells = max(1, int(numeric_payload.shape[0] * numeric_payload.shape[1]))
+    nan_cells = int(numeric_payload.isna().sum().sum())
+    nan_pct = (nan_cells / total_cells) * 100.0
+    all_zero_rows = int((numeric_payload.fillna(0.0).abs().sum(axis=1) == 0.0).sum())
+
+    nunique_by_col = numeric_payload.nunique(dropna=True)
+    static_cols = nunique_by_col[nunique_by_col <= 1].index.tolist()
+    varying_cols = int((nunique_by_col > 1).sum())
+
+    row_signature = numeric_payload.fillna(-9999.0).round(6).astype(str).agg('|'.join, axis=1)
+    unique_rows = int(row_signature.nunique())
+    repeated_rows = int(len(row_signature) - unique_rows)
+
+    print(
+        f"{tag} diagnostics: rows={len(payload)}, cols={payload.shape[1]}, "
+        f"nan_pct={nan_pct:.1f}%, varying_cols={varying_cols}, "
+        f"static_cols={len(static_cols)}, unique_rows={unique_rows}, repeated_rows={repeated_rows}, "
+        f"all_zero_rows={all_zero_rows}"
+    )
+    if static_cols:
+        print(f"{tag} diagnostics: static columns sample -> {', '.join(static_cols[:10])}")
+
+    preview_cols = [
+        c for c in ['batter_name', 'pitcher_name', 'temp', 'wind_speed', 'wind_out_component', 'park_factor']
+        if c in live_df.columns
+    ] + [c for c in expected if c not in {'batter_name', 'pitcher_name'}][:4]
+    preview_cols = list(dict.fromkeys(preview_cols))[:10]
+    if preview_cols:
+        print(f"{tag} preview ({min(sample_rows, len(live_df))} rows):")
+        print(live_df[preview_cols].head(sample_rows).to_string(index=False))
+
+
+def print_discord_payload_diagnostics(top_prob, radar, top_ev):
+    """Sanity-check Discord payload values before webhook dispatch."""
+    frames = {
+        'top_prob': top_prob,
+        'radar': radar,
+        'top_ev': top_ev,
+    }
+    for label, frame in frames.items():
+        if frame is None or frame.empty:
+            print(f"Discord payload diagnostics ({label}): empty")
+            continue
+
+        probs = pd.to_numeric(frame.get('hr_probability', pd.Series([0.0] * len(frame))), errors='coerce').fillna(0.0)
+        unique_probs = int(probs.round(6).nunique())
+        print(
+            f"Discord payload diagnostics ({label}): rows={len(frame)}, "
+            f"min_prob={probs.min():.4f}, max_prob={probs.max():.4f}, "
+            f"unique_prob_values={unique_probs}"
+        )
+        preview_cols = [c for c in ['batter_name', 'pitcher_name', 'hr_probability', 'model_reliability', 'edge_pct'] if c in frame.columns]
+        if preview_cols:
+            print(frame[preview_cols].head(3).to_string(index=False))
+
+
 def _ensure_discord_radar_columns(rankings_df):
     """Ensure ranking output always has the columns required for Discord sorting."""
     if rankings_df is None:
@@ -4962,6 +5057,7 @@ def generate_daily_predictions():
         base_models.append(lgb.LGBMClassifier(
             n_estimators=150, max_depth=5, learning_rate=0.04,
             objective='binary', metric='binary_logloss',
+            is_unbalance=True,
             scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9,
             verbose=-1
         ))
@@ -4970,7 +5066,8 @@ def generate_daily_predictions():
     # IMPROVEMENT #7: Ensemble Diversity - Add Random Forest (different approach: bagging vs boosting)
     if RandomForestClassifier is not None:
         base_models.append(RandomForestClassifier(
-            n_estimators=200, max_depth=8, min_samples_split=10, random_state=42
+            n_estimators=200, max_depth=8, min_samples_split=10,
+            class_weight='balanced_subsample', random_state=42
         ))
         model_names.append('RandomForest')
 
@@ -5025,7 +5122,7 @@ def generate_daily_predictions():
     print(f"Ensemble trained: {', '.join(model_names)} (TimeSeriesSplit CV)")
     try:
         train_probabilities = np.mean([
-            m.predict_proba(X_train)[:, 1] for m in trained_models
+            _extract_positive_class_probabilities(m, X_train) for m in trained_models
         ], axis=0)
         train_metrics = calculate_probability_metrics(y_train, train_probabilities)
         print(
@@ -5329,8 +5426,10 @@ def generate_daily_predictions():
     ).fillna(0.0)
     live['is_elite_power_batter'] = pd.to_numeric(live.get('batter', np.nan), errors='coerce').isin(elite_power).astype(int)
 
+    print_x_today_diagnostics(live, features_train, tag='X_today', sample_rows=5)
+
     X_live = live[features_train]
-    all_probs = [m.predict_proba(X_live)[:, 1] for m in trained_models]
+    all_probs = [_extract_positive_class_probabilities(m, X_live) for m in trained_models]
     probs = sum(all_probs) / len(all_probs)
 
     # =====================================================================
@@ -6162,6 +6261,7 @@ def generate_daily_predictions():
     print(f"\nMost Likely Homers (≥{discord_min_prob*100:.0f}% confidence) - {len(top_prob)} candidates:")
     print(top_prob.to_string(index=False))
     print(f"\nRadar Coverage: {len(radar)} additional candidates")
+    print_discord_payload_diagnostics(top_prob, radar, top_ev)
 
     # =====================================================================
     # DISCORD WEBHOOK INTEGRATION
@@ -6207,7 +6307,7 @@ def generate_daily_predictions():
                 f"|{'-'*14}|{'-'*14}|{'-'*10}|{'-'*12}|{'-'*8}|{'-'*6}|{'-'*9}|{'-'*9}|{'-'*8}|\n"
                 f"{table_str}\n"
                 "```\n"
-                "Legend: �=HIGH confidence  🟠=MEDIUM confidence  🟣=LOW confidence"
+                "Legend: 🔵=HIGH confidence  🟠=MEDIUM confidence  🟣=LOW confidence"
             )
             if not send_discord_webhook(content=message_content):
                 return False
