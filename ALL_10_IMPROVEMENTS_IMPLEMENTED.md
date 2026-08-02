@@ -209,7 +209,7 @@ Kyle Schwa...| Dakota Hudson| 8:40 PM | <= 6h | 8.3% | 🟢 | +42% | 0.0 | 0.000
    - `batter_lookback_games`: Currently 10, try 5-15
    - `consistency_threshold`: Currently uses full range, can be restricted
 4. **Add MLB API integration** for injury/roster status (when APIs available)
-5. **Calibrate ensemble weights** - currently averaging, could use weighted ensemble
+5. **Monitor ensemble weight stability** - log-loss weighting now enabled; tune only if drift appears
 
 ---
 
@@ -276,4 +276,22 @@ ENABLE_NEURAL_NETWORK=true
 
 ---
 
-**TL;DR**: All 10 improvements integrated seamlessly. Model now accounts for pitcher form, batter streaks, park effects, ensemble diversity, player consistency, time decay, and uncertainty quantification. Expected 50-70% accuracy improvement starting next game day. 🚀
+**TL;DR**: All 10 improvements integrated. Current architecture also includes log-loss-weighted ensemble blending, multiplier sequencing before final Platt calibration, bullpen fatigue pregame multipliers, and count-signal pregame pitch-mix proxying for safer morning deployment.
+
+---
+
+## 2026-08-02 Architecture Closeout
+
+### Completed follow-up items
+
+- Ensemble blending changed from equal average to log-loss-weighted average.
+- Final Platt scaling now runs after probability multipliers.
+- Manual hot-streak probability multiplier removed to prevent double counting against learned recency features.
+- Opposing bullpen fatigue multiplier wired into pre-calibration enhancement flow.
+- Pregame pitch-mix vulnerability proxy added for primary weapon count feature so morning runs do not depend on in-game count state.
+
+### Validation
+
+- Syntax check passed: `python -m py_compile run_daily_predictions.py`
+- Confidence label test suite passed: `python -m unittest test_confidence_labels.py`
+- End-to-end run passed: `python run_daily_predictions.py`

@@ -5228,6 +5228,93 @@ def apply_monotonic_prob_calibration(preds_df, gamma=1.35, cap=0.18, top_signal_
         return preds_df
 
 
+def apply_recent_calibration_correction(
+    preds_df,
+    days_lookback=7,
+    alpha=0.55,
+    min_rows=600,
+    min_files=3,
+    min_multiplier=0.85,
+    max_multiplier=1.45,
+):
+    """Apply a conservative scalar correction from recent evaluated calibration bias.
+
+    The correction uses recent evaluation files to estimate mean(actual)/mean(pred), then
+    shrinks that ratio toward 1.0 via `alpha` to avoid overreaction.
+    """
+    try:
+        if preds_df is None:
+            return preds_df, {'applied': False, 'reason': 'preds_none'}
+        work = preds_df.copy()
+        if work.empty:
+            return work, {'applied': False, 'reason': 'preds_empty'}
+
+        cutoff = datetime.today() - timedelta(days=max(1, int(days_lookback)))
+        eval_files = []
+        for fp in sorted(Path('data').glob('evaluation_*.csv')):
+            try:
+                d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+                if d >= cutoff:
+                    eval_files.append(fp)
+            except Exception:
+                continue
+
+        if len(eval_files) < max(1, int(min_files)):
+            return work, {
+                'applied': False,
+                'reason': 'insufficient_files',
+                'files': len(eval_files),
+            }
+
+        parts = []
+        for fp in eval_files:
+            try:
+                ev = pd.read_csv(fp, usecols=['pred_hr_prob', 'actual_hr'])
+                if ev is not None and not ev.empty:
+                    parts.append(ev)
+            except Exception:
+                continue
+
+        if not parts:
+            return work, {'applied': False, 'reason': 'no_eval_rows'}
+
+        ev_all = pd.concat(parts, ignore_index=True)
+        if len(ev_all) < max(100, int(min_rows)):
+            return work, {
+                'applied': False,
+                'reason': 'insufficient_rows',
+                'rows': int(len(ev_all)),
+            }
+
+        pred_mean = float(pd.to_numeric(ev_all['pred_hr_prob'], errors='coerce').fillna(0.0).mean())
+        actual_mean = float(pd.to_numeric(ev_all['actual_hr'], errors='coerce').fillna(0.0).mean())
+
+        if pred_mean <= 1e-6:
+            return work, {'applied': False, 'reason': 'pred_mean_zero'}
+
+        raw_ratio = actual_mean / pred_mean
+        correction = 1.0 + ((raw_ratio - 1.0) * float(np.clip(alpha, 0.0, 1.0)))
+        correction = float(np.clip(correction, min_multiplier, max_multiplier))
+
+        probs = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+        work['pred_hr_prob'] = np.clip(probs * correction, 0.0, 0.99).round(6)
+        work['recent_calibration_multiplier'] = correction
+
+        diagnostics = {
+            'applied': True,
+            'days': int(days_lookback),
+            'files': int(len(eval_files)),
+            'rows': int(len(ev_all)),
+            'pred_mean': pred_mean,
+            'actual_mean': actual_mean,
+            'raw_ratio': float(raw_ratio),
+            'correction': float(correction),
+        }
+        return work, diagnostics
+    except Exception as exc:
+        return preds_df, {'applied': False, 'reason': f'error:{exc}'}
+
+
 def run_post_mortem_backpropagation(days_lookback=7):
     """Closed-loop post-mortem layer that rewrites adaptive coefficients.
 
@@ -6956,6 +7043,49 @@ def generate_daily_predictions():
         cap=monotonic_cap,
         top_signal_boost=monotonic_boost,
     )
+
+    use_recent_calibration = str(os.getenv('RECENT_CALIBRATION_CORRECTION_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if use_recent_calibration:
+        recent_cal_diag = {'applied': False, 'reason': 'not_run'}
+        recent_days = max(3, _env_int('RECENT_CALIBRATION_DAYS', 7))
+        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.55), 0.0, 1.0))
+        recent_min_rows = max(200, _env_int('RECENT_CALIBRATION_MIN_ROWS', 600))
+        recent_min_files = max(2, _env_int('RECENT_CALIBRATION_MIN_FILES', 3))
+        recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.85), 0.5, 1.0))
+        recent_max_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MAX_MULTIPLIER', 1.45), 1.0, 2.0))
+
+        live, recent_cal_diag = apply_recent_calibration_correction(
+            live,
+            days_lookback=recent_days,
+            alpha=recent_alpha,
+            min_rows=recent_min_rows,
+            min_files=recent_min_files,
+            min_multiplier=recent_min_mult,
+            max_multiplier=recent_max_mult,
+        )
+        if recent_cal_diag.get('applied'):
+            print(
+                "Recent calibration correction applied: "
+                f"mult={recent_cal_diag.get('correction', 1.0):.3f}, "
+                f"pred_mean={recent_cal_diag.get('pred_mean', 0.0):.4f}, "
+                f"actual_mean={recent_cal_diag.get('actual_mean', 0.0):.4f}, "
+                f"rows={int(recent_cal_diag.get('rows', 0))}"
+            )
+        else:
+            print(
+                "Recent calibration correction skipped: "
+                f"{recent_cal_diag.get('reason', 'unknown')}"
+            )
+        live['recent_calibration_multiplier'] = float(recent_cal_diag.get('correction', 1.0))
+        live['recent_calibration_ratio_raw'] = float(recent_cal_diag.get('raw_ratio', 1.0))
+        live['recent_calibration_pred_mean'] = float(recent_cal_diag.get('pred_mean', 0.0))
+        live['recent_calibration_actual_mean'] = float(recent_cal_diag.get('actual_mean', 0.0))
+    else:
+        live['recent_calibration_multiplier'] = 1.0
+        live['recent_calibration_ratio_raw'] = 1.0
+        live['recent_calibration_pred_mean'] = 0.0
+        live['recent_calibration_actual_mean'] = 0.0
+
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     
     # =====================================================================

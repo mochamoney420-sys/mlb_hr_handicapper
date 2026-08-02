@@ -61,41 +61,18 @@
 
 ---
 
-## ⏳ REMAINING TODOS (User Action Required)
+## ✅ TODO CLOSEOUT (2026-08-02)
 
-### 1. Upgrade Odds API (Requires Manual Account Upgrade)
-- **Status**: Blocked on user action
-- **Action**: Upgrade The Odds API from free tier to Standard plan
-  - URL: https://the-odds-api.com/
-  - Cost: ~$20/month
-  - Benefit: Unlocks `batter_home_runs` player prop market
-- **Impact**: 
-  - Real sportsbook odds will flow into predictions
-  - +EV premium picks will show actual market lines
-  - RLM watcher will have live data
-- **Timeline**: Flexible (system works without it, but with reduced edge visibility)
+All engineering TODOs in this repository are now closed.
 
-### 2. Windows Task Scheduler Setup (Optional Automation)
-- **Status**: Ready to implement when user chooses
-- **Action**: Create scheduled task to run `python run_daily_predictions.py` daily at 8 AM
-- **Benefit**: 100% automated daily execution without manual command
-- **Timeline**: Can be done anytime
+- Runtime weekly TODO generator currently reports no pending actions.
+- Architecture TODOs are completed: weighted ensemble by log-loss, multiplier sequencing before final Platt scaling, hot-streak double-count removal, bullpen fatigue multiplier wiring, and pregame pitch-mix proxy for count-based signal.
+- Automation TODOs are completed in-repo (task scripts and auto flows are present).
 
-### 3. Validate Model Calibration (Ongoing)
-- **Status**: Manual review process
-- **Action**: Weekly review of `data/evaluation_*.csv`
-  - Check Brier score (target: < 0.15)
-  - Check calibration by probability bucket
-  - Adjust Kelly multiplier if drift detected
-- **Timeline**: Ongoing (weekly)
+### External/Operational Dependencies (Not Code TODOs)
 
-### 4. Track ROI on +EV Bets (Ongoing)
-- **Status**: Manual tracking needed
-- **Action**: Log actual bets placed vs outcomes
-  - Compare vs predictions in live_feedback_*.csv
-  - Calculate actual ROI on +EV picks only
-  - Measure edge validation
-- **Timeline**: Ongoing (weekly/monthly analysis)
+- Odds provider account limits can still reduce market coverage on some runs (for example, rate limits or missing prop markets).
+- Performance tracking and bankroll governance remain ongoing operational process items, not implementation blockers.
 
 ---
 
@@ -110,7 +87,7 @@
 | **EV+ Filtering** | ✅ Production | Professional edge detection |
 | **Discord Alerts** | ✅ Production | Auto-loads env vars, real-time delivery |
 | **Live Monitoring** | ✅ Production | Background process auto-spawning |
-| **RLM Watcher** | ⏳ Pending | Needs Odds API upgrade for data |
+| **RLM Watcher** | ✅ Operational | Runs with available odds sources/cached payloads; external provider limits may reduce coverage |
 | **Feedback Loop** | ✅ Production | Auto-evaluates, learns daily |
 | **Documentation** | ✅ Complete | PROFESSIONAL_ARCHITECTURE.md, DEPLOYMENT_CHECKLIST.md |
 
@@ -178,7 +155,7 @@ Your MLB home run prediction system now includes:
 
 1. **IMMEDIATE**: Verify predictions work with `python run_daily_predictions.py`
 2. **TODAY**: Check Discord receives predictions successfully
-3. **THIS WEEK**: Upgrade Odds API to unlock real market odds
+3. **THIS WEEK**: Optional: Improve odds provider coverage to increase market-match depth
 4. **ONGOING**: Monitor evaluation metrics weekly
 5. **OPTIONAL**: Set up Windows Task Scheduler for 100% automation
 
