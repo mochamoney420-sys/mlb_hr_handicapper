@@ -381,6 +381,113 @@ def bullpen_xfip_degradation_index(home_bullpen_score, away_bullpen_score, is_ho
     return float(np.clip(centered, -1.0, 1.0))
 
 
+def build_bullpen_fatigue_multiplier_map(
+    statcast_df,
+    lookback_days=14,
+    top_n_arms=3,
+    fatigue_pitch_count=20,
+    boost_multiplier=1.10,
+):
+    """Return team -> bullpen fatigue multiplier based on trailing 48h arm usage.
+
+    Rule: if the top N high-leverage relievers (usage-ranked over recent games)
+    threw at least `fatigue_pitch_count` pitches on each of the last two days,
+    mark bullpen as fatigued and return `boost_multiplier` for opposing hitters.
+    """
+    default_map = {}
+    debug_info = {
+        'teams_flagged': 0,
+        'teams_seen': 0,
+    }
+    if statcast_df is None or statcast_df.empty:
+        return default_map, debug_info
+
+    work = statcast_df.copy()
+    if 'pitcher' not in work.columns:
+        return default_map, debug_info
+
+    # Build stable date axis.
+    date_col = 'game_date' if 'game_date' in work.columns else None
+    if date_col is None:
+        return default_map, debug_info
+    work['_game_date'] = pd.to_datetime(work[date_col], errors='coerce').dt.date
+    work = work[work['_game_date'].notna()].copy()
+    if work.empty:
+        return default_map, debug_info
+
+    cutoff = (datetime.today() - timedelta(days=max(2, int(lookback_days)))).date()
+    work = work[work['_game_date'] >= cutoff].copy()
+    if work.empty:
+        return default_map, debug_info
+
+    # Resolve pitcher's defending team as robustly as possible.
+    if 'pitching_team' in work.columns:
+        work['_pitching_team'] = work['pitching_team'].astype(str).str.upper().str.strip()
+    elif {'inning_topbot', 'home_team', 'away_team'}.issubset(set(work.columns)):
+        itb = work['inning_topbot'].astype(str).str.lower().str.strip()
+        work['_pitching_team'] = np.where(itb.str.startswith('top'), work['home_team'], work['away_team'])
+        work['_pitching_team'] = work['_pitching_team'].astype(str).str.upper().str.strip()
+    elif 'posteam' in work.columns:
+        # In Statcast, posteam is offense; use opposite side where possible is unavailable here,
+        # so fallback to empty and skip unreliable rows.
+        work['_pitching_team'] = ''
+    else:
+        work['_pitching_team'] = ''
+
+    work['pitcher'] = pd.to_numeric(work['pitcher'], errors='coerce')
+    work = work[(work['pitcher'].notna()) & (work['_pitching_team'].astype(str).str.len() >= 2)].copy()
+    if work.empty:
+        return default_map, debug_info
+
+    # Count pitches per pitcher per day.
+    daily = work.groupby(['_pitching_team', 'pitcher', '_game_date'], as_index=False).size()
+    daily = daily.rename(columns={'size': 'pitch_count'})
+
+    # Estimate "high-leverage" bullpen arms as most-used relievers over lookback.
+    usage = daily.groupby(['_pitching_team', 'pitcher'], as_index=False).agg(
+        total_pitches=('pitch_count', 'sum'),
+        active_days=('pitch_count', 'count'),
+        avg_pitches_day=('pitch_count', 'mean'),
+    )
+
+    # Starter filter: relievers typically average fewer pitches/day than starters.
+    reliever_pool = usage[(usage['active_days'] >= 3) & (usage['avg_pitches_day'] <= 35)].copy()
+    if reliever_pool.empty:
+        return default_map, debug_info
+
+    reliever_pool = reliever_pool.sort_values(['_pitching_team', 'total_pitches'], ascending=[True, False])
+
+    today = datetime.today().date()
+    d1 = today - timedelta(days=1)
+    d2 = today - timedelta(days=2)
+    daily_lookup = {
+        (str(r['_pitching_team']), float(r['pitcher']), r['_game_date']): int(r['pitch_count'])
+        for _, r in daily.iterrows()
+    }
+
+    team_map = {}
+    for team, grp in reliever_pool.groupby('_pitching_team'):
+        top_grp = grp.head(max(1, int(top_n_arms)))
+        if len(top_grp) < max(1, int(top_n_arms)):
+            team_map[str(team)] = 1.0
+            continue
+
+        exhausted_count = 0
+        for _, arm in top_grp.iterrows():
+            pid = float(arm['pitcher'])
+            p1 = int(daily_lookup.get((str(team), pid, d1), 0))
+            p2 = int(daily_lookup.get((str(team), pid, d2), 0))
+            if p1 >= int(fatigue_pitch_count) and p2 >= int(fatigue_pitch_count):
+                exhausted_count += 1
+
+        fatigued = exhausted_count >= max(1, int(top_n_arms))
+        team_map[str(team)] = float(boost_multiplier if fatigued else 1.0)
+
+    debug_info['teams_seen'] = int(len(team_map))
+    debug_info['teams_flagged'] = int(sum(1 for v in team_map.values() if float(v) > 1.0))
+    return team_map, debug_info
+
+
 def _clv_tracker_path(date_str=None):
     date_str = date_str or datetime.today().strftime('%Y-%m-%d')
     return Path('data') / f'clv_tracker_{date_str}.csv'
@@ -1702,6 +1809,61 @@ def calculate_probability_metrics(y_true, probs):
 
     brier_value = float(np.mean((probs_array - labels) ** 2))
     return {'log_loss': logloss_value, 'brier_score': brier_value}
+
+
+def calculate_ensemble_weights(y_true, per_model_probs, model_names=None):
+    """Compute log-loss-aware ensemble weights (better models get more voting power)."""
+    labels = pd.to_numeric(pd.Series(y_true), errors='coerce').fillna(0).astype(int).to_numpy()
+    names = list(model_names or [f"model_{i}" for i in range(len(per_model_probs))])
+
+    if not per_model_probs:
+        return np.array([], dtype=float), []
+
+    scores = []
+    for idx, probs in enumerate(per_model_probs):
+        probs_arr = np.clip(pd.to_numeric(pd.Series(probs), errors='coerce').fillna(0.0).to_numpy(), 1e-6, 1 - 1e-6)
+        if len(probs_arr) != len(labels):
+            continue
+        metrics = calculate_probability_metrics(labels, probs_arr)
+        ll = metrics.get('log_loss', np.nan)
+        if not np.isfinite(ll):
+            ll = 1.5
+        # Inverse-loss weighting strongly penalizes flat/underperforming models.
+        inv = 1.0 / max(ll, 1e-6)
+        scores.append((idx, names[idx], float(ll), float(inv)))
+
+    if not scores:
+        w = np.array([1.0 / len(per_model_probs)] * len(per_model_probs), dtype=float)
+        return w, []
+
+    inv_values = np.array([s[3] for s in scores], dtype=float)
+    inv_values = np.power(inv_values, 1.35)
+    inv_values = np.clip(inv_values, 1e-8, np.inf)
+    weight_values = inv_values / inv_values.sum()
+
+    out_weights = np.zeros(len(per_model_probs), dtype=float)
+    diagnostics = []
+    for (row_idx, name, ll, _), w in zip(scores, weight_values):
+        out_weights[row_idx] = float(w)
+        diagnostics.append({'model': name, 'log_loss': float(ll), 'weight': float(w)})
+
+    if out_weights.sum() <= 0:
+        out_weights = np.array([1.0 / len(per_model_probs)] * len(per_model_probs), dtype=float)
+    else:
+        out_weights = out_weights / out_weights.sum()
+
+    return out_weights, diagnostics
+
+
+def weighted_ensemble_probabilities(per_model_probs, weights):
+    if not per_model_probs:
+        return np.array([], dtype=float)
+    probs_stack = np.vstack([np.asarray(p, dtype=float).reshape(-1) for p in per_model_probs])
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    if len(w) != probs_stack.shape[0] or np.sum(w) <= 0:
+        w = np.array([1.0 / probs_stack.shape[0]] * probs_stack.shape[0], dtype=float)
+    w = w / np.sum(w)
+    return np.average(probs_stack, axis=0, weights=w)
 
 
 def _load_actual_hr_outcomes(date_str):
@@ -4445,6 +4607,91 @@ def _pitch_mix_vector(df):
     return {str(k): float(v) for k, v in vc.items()}
 
 
+def build_pregame_primary_weapon_vulnerability_lookup(
+    statcast_df,
+    lookback_days=45,
+    min_sample=40,
+    usage_floor=0.12,
+):
+    """Build pregame pitcher lookup for vulnerable primary weapons from recent pitch mix.
+
+    This replaces in-game count assumptions with a morning-safe proxy:
+    count how many heavily used pitch types are allowing elevated damaging contact.
+    """
+    empty_debug = {'pitchers_seen': 0, 'pitchers_flagged': 0}
+    if statcast_df is None or statcast_df.empty:
+        return {}, empty_debug
+
+    required = {'pitcher', 'pitch_type'}
+    if not required.issubset(set(statcast_df.columns)):
+        return {}, empty_debug
+
+    df = statcast_df.copy()
+    try:
+        if 'game_date' in df.columns:
+            df['game_date'] = pd.to_datetime(df['game_date'], errors='coerce')
+            cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=max(14, int(lookback_days)))
+            df = df[df['game_date'] >= cutoff]
+    except Exception:
+        pass
+
+    if df.empty:
+        return {}, empty_debug
+
+    df['pitcher'] = pd.to_numeric(df['pitcher'], errors='coerce')
+    df = df.dropna(subset=['pitcher', 'pitch_type']).copy()
+    if df.empty:
+        return {}, empty_debug
+
+    if 'launch_speed' in df.columns:
+        launch_speed = pd.to_numeric(df['launch_speed'], errors='coerce').fillna(0.0)
+        hard_hit = launch_speed >= 95.0
+    else:
+        hard_hit = pd.Series([False] * len(df), index=df.index)
+
+    if 'events' in df.columns:
+        is_hr = df['events'].astype(str).eq('home_run')
+    else:
+        is_hr = pd.Series([False] * len(df), index=df.index)
+
+    if 'estimated_woba_using_speedangle' in df.columns:
+        xwoba = pd.to_numeric(df['estimated_woba_using_speedangle'], errors='coerce').fillna(0.0)
+        loud_xwoba = xwoba >= 0.600
+    else:
+        loud_xwoba = pd.Series([False] * len(df), index=df.index)
+
+    df['damaging_contact'] = (hard_hit | is_hr | loud_xwoba).astype(int)
+
+    by_pitch = df.groupby(['pitcher', 'pitch_type'], as_index=False).agg(
+        sample_size=('pitch_type', 'count'),
+        damage_rate=('damaging_contact', 'mean'),
+    )
+    if by_pitch.empty:
+        return {}, empty_debug
+
+    by_pitch['pitcher_total'] = by_pitch.groupby('pitcher')['sample_size'].transform('sum')
+    by_pitch['usage_rate'] = by_pitch['sample_size'] / by_pitch['pitcher_total'].clip(lower=1)
+
+    vulnerable = by_pitch[
+        (by_pitch['sample_size'] >= max(10, int(min_sample)))
+        & (by_pitch['usage_rate'] >= float(usage_floor))
+        & (by_pitch['damage_rate'] >= 0.38)
+    ].copy()
+
+    if vulnerable.empty:
+        return {}, {'pitchers_seen': int(by_pitch['pitcher'].nunique()), 'pitchers_flagged': 0}
+
+    lookup = {
+        int(pid): int(cnt)
+        for pid, cnt in vulnerable.groupby('pitcher')['pitch_type'].nunique().to_dict().items()
+    }
+    debug = {
+        'pitchers_seen': int(by_pitch['pitcher'].nunique()),
+        'pitchers_flagged': int(len(lookup)),
+    }
+    return lookup, debug
+
+
 def _tv_distance(vec_a, vec_b):
     keys = set(vec_a.keys()) | set(vec_b.keys())
     if not keys:
@@ -4813,23 +5060,38 @@ def estimate_model_reliability(pred_prob, consistency_score, sample_size):
     """IMPROVEMENT #4: Confidence/Reliability Level
     Returns: 'HIGH', 'MEDIUM', or 'LOW' confidence"""
     try:
-        if pred_prob < 0.05 or pred_prob > 0.95:
+        p = float(pd.to_numeric(pred_prob, errors='coerce'))
+        c = float(pd.to_numeric(consistency_score, errors='coerce'))
+        n = int(pd.to_numeric(sample_size, errors='coerce'))
+
+        if not np.isfinite(p):
+            return 'LOW'
+        if not np.isfinite(c):
+            c = 0.5
+
+        # HR props are rare-event probabilities, so confidence cutoffs must be
+        # calibrated in the low-probability regime (not 12%+ as in older logic).
+        if p < 0.008:
             return 'LOW'
 
-        if sample_size < 8:
+        if n < 15:
             return 'LOW'
 
-        if consistency_score < 0.25:
+        if c < 0.20:
             return 'LOW'
 
-        if consistency_score > 0.7 and sample_size > 25 and 0.12 < pred_prob < 0.88:
+        if c >= 0.62 and n >= 80 and p >= 0.028:
             return 'HIGH'
 
-        if sample_size >= 12 and consistency_score >= 0.45:
+        # Allow MEDIUM for strong current signal even on smaller batter sample windows.
+        if c >= 0.55 and n >= 15 and p >= 0.08:
+            return 'MEDIUM'
+
+        if c >= 0.40 and n >= 35 and p >= 0.016:
             return 'MEDIUM'
 
         return 'LOW'
-    except:
+    except Exception:
         return 'MEDIUM'
 
 
@@ -5738,6 +6000,7 @@ def generate_daily_predictions():
         'weather_extremes_multiplier': 1.0,
         'sportsbook_value_score': 1.0,
         'opp_bullpen_xfip_degradation': 0.0,
+        'opp_bullpen_fatigue_multiplier': 1.0,
         'umpire_strike_to_ball_ratio': 1.0,
         'umpire_runs_created_per_game': 4.40,
         'lineup_pa_expectation': 4.22,
@@ -5983,15 +6246,23 @@ def generate_daily_predictions():
 
     print(f"Ensemble trained: {', '.join(model_names)} (TimeSeriesSplit CV)")
 
+    ensemble_weights = np.array([1.0 / max(1, len(trained_models))] * len(trained_models), dtype=float)
+
     platt_scaler = None
     platt_blend = float(np.clip(float(os.getenv('PLATT_BLEND_WEIGHT', '1.00')), 0.0, 1.0))
     if use_ensemble_platt and LogisticRegression is not None and X_platt_holdout is not None and len(X_platt_holdout) >= 100:
         holdout_labels = pd.to_numeric(y_platt_holdout, errors='coerce').fillna(0).astype(int)
         if holdout_labels.nunique() >= 2:
             try:
-                holdout_raw = np.mean([
+                holdout_per_model = [
                     _extract_positive_class_probabilities(m, X_platt_holdout) for m in trained_models
-                ], axis=0)
+                ]
+                ensemble_weights, weight_diag = calculate_ensemble_weights(
+                    holdout_labels,
+                    holdout_per_model,
+                    model_names=model_names,
+                )
+                holdout_raw = weighted_ensemble_probabilities(holdout_per_model, ensemble_weights)
                 raw_metrics = calculate_probability_metrics(holdout_labels, holdout_raw)
 
                 platt_scaler = LogisticRegression(max_iter=1000, solver='lbfgs')
@@ -6005,16 +6276,44 @@ def generate_daily_predictions():
                     f"raw_logloss={raw_metrics['log_loss']:.5f} -> platt_logloss={platt_metrics['log_loss']:.5f}, "
                     f"blend={platt_blend:.2f}"
                 )
+                if weight_diag:
+                    print("Ensemble weights (log-loss aware):")
+                    for row in sorted(weight_diag, key=lambda x: x['weight'], reverse=True):
+                        print(
+                            f"  {row['model']:<28} "
+                            f"logloss={row['log_loss']:.5f} weight={row['weight']:.3f}"
+                        )
             except Exception as exc:
                 platt_scaler = None
                 print(f"Ensemble Platt calibration unavailable: {exc}")
         else:
             print("Ensemble Platt calibration skipped: holdout has single-class labels.")
 
+    if X_platt_holdout is None and len(X_model_fit) >= 100:
+        try:
+            fit_per_model = [
+                _extract_positive_class_probabilities(m, X_model_fit) for m in trained_models
+            ]
+            ensemble_weights, weight_diag = calculate_ensemble_weights(
+                y_model_fit,
+                fit_per_model,
+                model_names=model_names,
+            )
+            if weight_diag:
+                print("Ensemble weights (fit-set fallback):")
+                for row in sorted(weight_diag, key=lambda x: x['weight'], reverse=True):
+                    print(
+                        f"  {row['model']:<28} "
+                        f"logloss={row['log_loss']:.5f} weight={row['weight']:.3f}"
+                    )
+        except Exception as exc:
+            print(f"Ensemble weight fallback unavailable: {exc}")
+
     try:
-        train_probabilities = np.mean([
+        train_per_model = [
             _extract_positive_class_probabilities(m, X_model_fit) for m in trained_models
-        ], axis=0)
+        ]
+        train_probabilities = weighted_ensemble_probabilities(train_per_model, ensemble_weights)
         train_metrics = calculate_probability_metrics(y_model_fit, train_probabilities)
         print(
             "Training probability metrics: "
@@ -6056,6 +6355,27 @@ def generate_daily_predictions():
     # Join live matchups with player vectors where available (use inner to ensure features exist)
     live = live_matchups.merge(b_stats, on='batter', how='left')
     live = live.merge(p_stats, on='pitcher', how='left')
+
+    # Pregame proxy for live count-based pitch predictability feature.
+    # Uses recent pitch-mix vulnerability instead of in-game 2-0 / 3-1 state assumptions.
+    pitch_mix_vuln_lookup, pitch_mix_vuln_debug = build_pregame_primary_weapon_vulnerability_lookup(
+        statcast_df,
+        lookback_days=max(21, _env_int('PREGAME_PITCH_MIX_LOOKBACK_DAYS', 45)),
+        min_sample=max(10, _env_int('PREGAME_PITCH_MIX_MIN_SAMPLE', 40)),
+        usage_floor=float(np.clip(_env_float('PREGAME_PITCH_MIX_USAGE_FLOOR', 0.12), 0.05, 0.4)),
+    )
+    live['primary_weapon_vulnerable_pitch_count'] = (
+        pd.to_numeric(live.get('pitcher'), errors='coerce')
+        .map(lambda x: pitch_mix_vuln_lookup.get(int(x), 0) if pd.notna(x) else 0)
+        .fillna(0)
+        .astype(float)
+    )
+    if pitch_mix_vuln_debug.get('pitchers_seen', 0) > 0:
+        print(
+            "Pregame pitch-mix vulnerability proxy: "
+            f"pitchers_flagged={pitch_mix_vuln_debug.get('pitchers_flagged', 0)}/"
+            f"{pitch_mix_vuln_debug.get('pitchers_seen', 0)}"
+        )
 
     live_dataflow_issues = validate_model_dataflow(
         train_df,
@@ -6370,18 +6690,8 @@ def generate_daily_predictions():
 
     X_live = live[features_train]
     all_probs = [_extract_positive_class_probabilities(m, X_live) for m in trained_models]
-    probs = sum(all_probs) / len(all_probs)
-
-    if platt_scaler is not None:
-        try:
-            probs_raw = np.asarray(probs).reshape(-1)
-            probs_platt = platt_scaler.predict_proba(probs_raw.reshape(-1, 1))[:, 1]
-            probs = np.clip(((1.0 - platt_blend) * probs_raw) + (platt_blend * probs_platt), 0.0, 1.0)
-            live['ensemble_raw_prob'] = probs_raw
-            live['ensemble_platt_prob'] = probs_platt
-            live['ensemble_platt_blend_weight'] = platt_blend
-        except Exception as exc:
-            print(f"Live Platt scaling skipped: {exc}")
+    probs = weighted_ensemble_probabilities(all_probs, ensemble_weights)
+    live['ensemble_raw_prob'] = np.asarray(probs).reshape(-1)
 
     # =====================================================================
     # PROFESSIONAL UPGRADE 1: PA Projection + Monte Carlo Simulation
@@ -6404,7 +6714,7 @@ def generate_daily_predictions():
     # =====================================================================
     # IMPROVEMENTS #1-3: PITCHER FORM, BATTER STREAKS, PARK ADJUSTMENT
     # =====================================================================
-    print("Applying elite enhancements: pitcher form, batter streaks, park factors...")
+    print("Applying elite enhancements: pitcher form, park factors, bullpen fatigue...")
     
     # IMPROVEMENT #1: Apply pitcher recent form tracking
     pitcher_form_boosts = np.ones(len(live))
@@ -6413,13 +6723,6 @@ def generate_daily_predictions():
             form_mult = get_pitcher_recent_form(statcast_df, pitcher_id, lookback_games=5)
             pitcher_form_boosts[idx] = form_mult
     
-    # IMPROVEMENT #2: Apply batter hot/cold streaks
-    batter_streak_boosts = np.ones(len(live))
-    for idx, batter_id in enumerate(live.get('batter', pd.Series()).values):
-        if pd.notna(batter_id) and batter_id in statcast_df['batter'].values:
-            streak_mult = get_batter_hot_streak(statcast_df, batter_id, lookback_games=10)
-            batter_streak_boosts[idx] = streak_mult
-    
     # IMPROVEMENT #3: Apply park-adjusted metrics
     park_adjustments = np.ones(len(live))
     for idx, row in live.iterrows():
@@ -6427,9 +6730,28 @@ def generate_daily_predictions():
         batter_hand = row.get('stand', 'R')
         park_adj = apply_park_adjustment(1.0, batter_hand, home_team, '')
         park_adjustments[idx] = park_adj
+
+    # NEW: Bullpen fatigue multiplier based on top reliever workload in trailing 48h.
+    bullpen_fatigue_map, bullpen_fatigue_debug = build_bullpen_fatigue_multiplier_map(
+        statcast_df,
+        lookback_days=max(7, _env_int('BULLPEN_FATIGUE_LOOKBACK_DAYS', 14)),
+        top_n_arms=max(1, _env_int('BULLPEN_FATIGUE_TOP_ARMS', 3)),
+        fatigue_pitch_count=max(10, _env_int('BULLPEN_FATIGUE_PITCH_THRESHOLD', 20)),
+        boost_multiplier=float(np.clip(_env_float('BULLPEN_FATIGUE_BOOST_MULTIPLIER', 1.10), 1.0, 1.25)),
+    )
+    bullpen_fatigue_boosts = np.ones(len(live))
+    for idx, row in live.iterrows():
+        try:
+            opp_team = row.get('away_team') if bool(row.get('is_home_game', False)) else row.get('home_team')
+            opp_key = str(opp_team or '').strip().upper()
+            bullpen_fatigue_boosts[idx] = float(bullpen_fatigue_map.get(opp_key, 1.0))
+        except Exception:
+            bullpen_fatigue_boosts[idx] = 1.0
+    live['opp_bullpen_fatigue_multiplier'] = bullpen_fatigue_boosts
     
-    # Apply combined boosts
-    combined_boosts = pitcher_form_boosts * batter_streak_boosts * park_adjustments
+    # Apply combined pre-calibration boosts.
+    # NOTE: hot-streak manual multiplier removed to avoid double-counting with time-decay learning.
+    combined_boosts = pitcher_form_boosts * park_adjustments * bullpen_fatigue_boosts
     base_model_probs = np.clip(base_model_probs * combined_boosts, 0.0, 1.0)
 
     live = build_cluster_matchup_probabilities(live)
@@ -6444,24 +6766,18 @@ def generate_daily_predictions():
         live['specific_day_upside_score'] = pd.to_numeric(live['specific_day_upside_score'], errors='coerce').fillna(0.0)
         live['upside_boost_multiplier'] = pd.to_numeric(live['upside_boost_multiplier'], errors='coerce').fillna(1.0)
     
-    elite_enhancements_applied = (pitcher_form_boosts != 1.0).sum() + (batter_streak_boosts != 1.0).sum()
+    elite_enhancements_applied = (
+        (pitcher_form_boosts != 1.0).sum()
+        + (park_adjustments != 1.0).sum()
+        + (bullpen_fatigue_boosts > 1.0).sum()
+    )
+    if bullpen_fatigue_debug.get('teams_seen', 0) > 0:
+        print(
+            "Bullpen fatigue multiplier: "
+            f"teams_flagged={bullpen_fatigue_debug.get('teams_flagged', 0)}/"
+            f"{bullpen_fatigue_debug.get('teams_seen', 0)}"
+        )
     print(f"✅ Elite enhancements applied: {elite_enhancements_applied} matchups boosted/adjusted")
-    
-    # POWER SPIKE DETECTION: Boost probabilities for batters with recent hot streaks
-    # Check if batter has recent high HR rate or exit velocity surge
-    if 'bat_hr_rate_recent' in live.columns and 'bat_avg_exit_velocity' in live.columns:
-        hot_streak_multiplier = np.ones(len(live))
-        
-        # Power spike detection: Recent HR rate > 0.08 (league avg ~0.03) signals hot batter
-        hot_batters = pd.to_numeric(live.get('bat_hr_rate_recent', 0), errors='coerce') > 0.08
-        high_exit_velo = pd.to_numeric(live.get('bat_avg_exit_velocity', 0), errors='coerce') > 90.0
-        
-        # Boost by 1.15x if both hot streak indicators present
-        hot_streak_multiplier[hot_batters & high_exit_velo] = 1.15
-        hot_streak_multiplier[hot_batters] = 1.10
-        
-        base_model_probs = np.clip(base_model_probs * hot_streak_multiplier, 0.0, 1.0)
-        probs = base_model_probs.copy()
     
     # PITCHER DEGRADATION BOOST: Increase probabilities when pitcher is showing decline
     # This catches power spike events where pitcher suddenly gets hit harder
@@ -6590,6 +6906,17 @@ def generate_daily_predictions():
     live['stacked_boost_multiplier_cap'] = stacked_multiplier_cap
     live['stacked_boost_multiplier_final'] = capped_multiplier
 
+    # Final calibration wrapper must run after all pre-model and post-model multipliers.
+    if platt_scaler is not None:
+        try:
+            probs_raw = np.asarray(probs).reshape(-1)
+            probs_platt = platt_scaler.predict_proba(probs_raw.reshape(-1, 1))[:, 1]
+            probs = np.clip(((1.0 - platt_blend) * probs_raw) + (platt_blend * probs_platt), 0.0, 1.0)
+            live['ensemble_platt_prob'] = probs_platt
+            live['ensemble_platt_blend_weight'] = platt_blend
+        except Exception as exc:
+            print(f"Final Platt scaling skipped: {exc}")
+
     # =====================================================================
     # PROFESSIONAL UPGRADE 2: Kelly Criterion with Simulated Probabilities
     # =====================================================================
@@ -6641,31 +6968,62 @@ def generate_daily_predictions():
     confidence_upper = []
     reliability_levels = []
     consistency_scores = []
+    batter_sample_sizes = []
+    pred_prob_series = []
     
     for idx, row in live.iterrows():
         batter_id = row.get('batter', None)
         pred_prob = row['pred_hr_prob']
         
         # Get batter consistency (0-1 scale, higher = more consistent)
-        if pd.notna(batter_id) and batter_id in statcast_df['batter'].values:
+        batter_sample_size = 30
+        if pd.notna(batter_id) and ('batter' in statcast_df.columns):
+            batter_rows = statcast_df[statcast_df['batter'] == batter_id]
+            batter_sample_size = int(len(batter_rows)) if len(batter_rows) > 0 else 30
             consistency = get_batter_consistency(statcast_df, batter_id)
         else:
             consistency = 0.5
+        batter_sample_size = int(np.clip(batter_sample_size, 12, 300))
         consistency_scores.append(consistency)
+        batter_sample_sizes.append(batter_sample_size)
+        pred_prob_series.append(float(pred_prob))
         
         # Calculate confidence interval
-        lower, upper = calculate_confidence_interval(pred_prob, sample_size=100)
+        lower, upper = calculate_confidence_interval(pred_prob, sample_size=batter_sample_size)
         confidence_lower.append(lower)
         confidence_upper.append(upper)
         
         # Estimate reliability level
-        reliability = estimate_model_reliability(pred_prob, consistency, sample_size=100)
+        reliability = estimate_model_reliability(pred_prob, consistency, sample_size=batter_sample_size)
         reliability_levels.append(reliability)
+
+    # If labels collapse to one tier, use slate-relative fallback ranks to preserve
+    # meaningful color separation while staying tied to model probability + consistency.
+    unique_levels = set(str(x).upper() for x in reliability_levels)
+    if len(unique_levels) <= 1 and len(reliability_levels) >= 20:
+        probs_np = pd.to_numeric(pd.Series(pred_prob_series), errors='coerce').fillna(0.0)
+        cons_np = pd.to_numeric(pd.Series(consistency_scores), errors='coerce').fillna(0.5)
+        prob_rank = probs_np.rank(pct=True)
+        sample_rank = pd.Series(batter_sample_sizes).rank(pct=True)
+        composite = (prob_rank * 0.60) + (cons_np * 0.30) + (sample_rank * 0.10)
+
+        high_cut = float(composite.quantile(0.85))
+        med_cut = float(composite.quantile(0.50))
+        fallback_levels = []
+        for i in range(len(composite)):
+            if float(composite.iloc[i]) >= high_cut:
+                fallback_levels.append('HIGH')
+            elif float(composite.iloc[i]) >= med_cut:
+                fallback_levels.append('MEDIUM')
+            else:
+                fallback_levels.append('LOW')
+        reliability_levels = fallback_levels
     
     live['confidence_lower_95pct'] = confidence_lower
     live['confidence_upper_95pct'] = confidence_upper
     live['model_reliability'] = reliability_levels
     live['batter_consistency_score'] = consistency_scores
+    live['batter_sample_size_60d'] = batter_sample_sizes
 
     # Reliability-aware hard ceilings to prevent unsupported top-end inflation.
     rel_upper = live['model_reliability'].astype(str).str.upper()
