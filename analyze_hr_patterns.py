@@ -37,6 +37,40 @@ if env_file.exists():
 # HR PATTERN ANALYSIS ENGINE
 # =====================================================================
 
+def _safe_name(value, default='Unknown'):
+    if value is None or pd.isna(value):
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _safe_float(value, default=0.0):
+    val = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
+    if pd.isna(val):
+        return float(default)
+    return float(val)
+
+
+def _sanitize_pattern(pattern):
+    clean = {}
+    for key, value in pattern.items():
+        if isinstance(value, (np.floating, np.integer)):
+            value = float(value)
+        if isinstance(value, float) and np.isnan(value):
+            if key == 'model_prob':
+                clean[key] = 0.0
+            elif key in {'batter_name', 'pitcher_name'}:
+                clean[key] = 'Unknown'
+            else:
+                clean[key] = None
+            continue
+        clean[key] = value
+
+    clean['batter_name'] = _safe_name(clean.get('batter_name', 'Unknown'))
+    clean['pitcher_name'] = _safe_name(clean.get('pitcher_name', 'Unknown'))
+    clean['model_prob'] = _safe_float(clean.get('model_prob', 0.0), 0.0)
+    return clean
+
 def load_yesterdays_home_runs():
     """Load yesterday's complete home-run outcomes from Statcast and merge with any watcher feedback."""
     yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -120,8 +154,8 @@ def extract_hr_patterns(actual_hrs, training_data):
     for idx, hr_row in actual_hrs.iterrows():
         batter_id = pd.to_numeric(hr_row.get('batter', None), errors='coerce')
         pitcher_id = pd.to_numeric(hr_row.get('pitcher', None), errors='coerce')
-        batter_name = hr_row.get('batter_name', 'Unknown')
-        pitcher_name = hr_row.get('pitcher_name', 'Unknown')
+        batter_name = _safe_name(hr_row.get('batter_name', 'Unknown'))
+        pitcher_name = _safe_name(hr_row.get('pitcher_name', 'Unknown'))
 
         if pd.isna(batter_id) or pd.isna(pitcher_id):
             continue
@@ -153,7 +187,7 @@ def extract_hr_patterns(actual_hrs, training_data):
             'batter_id': int(batter_id),
             'pitcher_id': int(pitcher_id),
             'hr_date': hr_row.get('game_date', datetime.today().strftime('%Y-%m-%d')),
-            'model_prob': float(hr_row.get('model_prob', 0)),
+            'model_prob': _safe_float(hr_row.get('model_prob', 0), 0.0),
         }
         
         # Batter's recent form
@@ -184,9 +218,9 @@ def extract_hr_patterns(actual_hrs, training_data):
             hr_features['pitcher_pa_count_recent'] = int(len(pitcher_pas_sorted))
         
         # Game conditions (if available)
-        hr_features['weather_temp'] = float(hr_row.get('temp', 71))
-        hr_features['weather_wind_speed'] = float(hr_row.get('wind_speed', 5))
-        hr_features['park_factor'] = float(hr_row.get('park_factor', 100))
+        hr_features['weather_temp'] = _safe_float(hr_row.get('temp', 71), 71.0)
+        hr_features['weather_wind_speed'] = _safe_float(hr_row.get('wind_speed', 5), 5.0)
+        hr_features['park_factor'] = _safe_float(hr_row.get('park_factor', 100), 100.0)
         
         patterns.append(hr_features)
         
@@ -208,9 +242,9 @@ def build_learning_insights_from_evaluation(eval_df):
     summary_stats = {}
     for _, row in eval_df[eval_df['actual_hr'] == 1].iterrows():
         pattern = {
-            'batter_name': row.get('batter_name', 'Unknown'),
-            'pitcher_name': row.get('pitcher_name', 'Unknown'),
-            'model_prob': float(row.get('pred_hr_prob', 0.0)),
+            'batter_name': _safe_name(row.get('batter_name', 'Unknown')),
+            'pitcher_name': _safe_name(row.get('pitcher_name', 'Unknown')),
+            'model_prob': _safe_float(row.get('pred_hr_prob', 0.0), 0.0),
         }
         patterns.append(pattern)
         summary_stats[str(pattern['batter_name'])] = summary_stats.get(str(pattern['batter_name']), 0) + 1
@@ -314,15 +348,11 @@ def save_learning_report(insights):
     today = insights['analysis_date']
     report_file = Path('data') / f'hr_learning_report_{today}.json'
     
-    # Convert patterns to serializable format
+    # Convert patterns to serializable format and strip NaN literals.
     insights_copy = insights.copy()
-    insights_copy['patterns'] = [
-        {k: float(v) if isinstance(v, (np.floating, np.integer)) else v 
-         for k, v in p.items()}
-        for p in insights_copy['patterns']
-    ]
-    
-    report_file.write_text(json.dumps(insights_copy, indent=2))
+    insights_copy['patterns'] = [_sanitize_pattern(p) for p in insights_copy['patterns']]
+
+    report_file.write_text(json.dumps(insights_copy, indent=2, allow_nan=False), encoding='utf-8')
     
     return report_file
 

@@ -2140,6 +2140,41 @@ def run_model_self_check(days_lookback=30):
     else:
         print(f"ℹ️  No evaluation for {yesterday_str} yet")
 
+    # 6. Check recent closed-loop miss-rate trend for underprediction collapse.
+    try:
+        miss_rate_alert_threshold = float(np.clip(float(os.getenv('SELF_CHECK_MISS_RATE_ALERT_THRESHOLD', '0.85')), 0.50, 1.0))
+    except Exception:
+        miss_rate_alert_threshold = 0.85
+    try:
+        miss_rate_min_samples = max(20, int(float(os.getenv('SELF_CHECK_MISS_RATE_MIN_SAMPLES', '40'))))
+    except Exception:
+        miss_rate_min_samples = 40
+
+    try:
+        latest_closed_loop = sorted(Path('data').glob('closed_loop_report_*.json'))
+        if latest_closed_loop:
+            newest_report = latest_closed_loop[-1]
+            report = json.loads(newest_report.read_text(encoding='utf-8'))
+            samples = int(report.get('samples', 0) or 0)
+            missed_hr = int(report.get('missed_hr', 0) or 0)
+            miss_rate = (missed_hr / samples) if samples > 0 else 0.0
+            print(
+                "Closed-loop check: "
+                f"samples={samples}, missed_hr={missed_hr}, miss_rate={miss_rate:.1%}"
+            )
+            if samples >= miss_rate_min_samples and miss_rate >= miss_rate_alert_threshold:
+                msg = (
+                    f"⚠️  High miss-rate detected in closed-loop report ({miss_rate:.1%} over {samples} samples) - "
+                    "possible probability suppression"
+                )
+                print(msg)
+                silent_failures.append(msg)
+                issues_found += 1
+        else:
+            print("ℹ️  No closed-loop report found yet")
+    except Exception as e:
+        print(f"⚠️  Could not evaluate closed-loop miss trend: {e}")
+
     # SUMMARY
     print("\n" + "=" * 70)
     if issues_found == 0:
@@ -5908,43 +5943,78 @@ def project_batting_order_pa(batting_order_slot, avg_game_length_innings=9):
     return base_pa * multiplier
 
 
+def build_expected_pa_distribution(expected_pa, spread=0.70, min_pa=1, max_pa=8):
+    """Build a lightweight discrete PA distribution around expected PA count."""
+    try:
+        mu = float(expected_pa)
+    except Exception:
+        mu = 4.0
+    if not np.isfinite(mu):
+        mu = 4.0
+
+    sigma = max(0.30, float(spread))
+    lower = max(int(min_pa), int(math.floor(mu)) - 1)
+    upper = min(int(max_pa), int(math.ceil(mu)) + 2)
+    if lower > upper:
+        lower = upper = int(np.clip(round(mu), min_pa, max_pa))
+
+    dist = {}
+    for pa in range(lower, upper + 1):
+        z = (pa - mu) / sigma
+        weight = math.exp(-0.5 * (z ** 2))
+        dist[int(pa)] = float(weight)
+
+    total = float(sum(dist.values()))
+    if total <= 0:
+        fallback_pa = int(np.clip(round(mu), min_pa, max_pa))
+        return {fallback_pa: 1.0}
+
+    return {k: float(v / total) for k, v in dist.items()}
+
+
+def adjust_expected_pa_for_context(base_pa, team_implied_total=np.nan, game_total=np.nan):
+    """Adjust PA expectation using available Vegas scoring context."""
+    pa = float(base_pa) if pd.notna(base_pa) else 4.0
+    pa = float(np.clip(pa, 2.0, 6.5))
+
+    team_total = pd.to_numeric(pd.Series([team_implied_total]), errors='coerce').iloc[0]
+    if pd.isna(team_total):
+        g_total = pd.to_numeric(pd.Series([game_total]), errors='coerce').iloc[0]
+        if pd.notna(g_total):
+            team_total = float(g_total) / 2.0
+
+    if pd.notna(team_total):
+        # 4.2 is a neutral baseline implied runs per team.
+        total_delta = float(np.clip((float(team_total) - 4.2) / 2.0, -0.35, 0.45))
+        pa *= (1.0 + (0.35 * total_delta))
+
+    return float(np.clip(pa, 2.0, 6.8))
+
+
+def calculate_game_hr_probability(hr_rate_per_pa, expected_pa_distribution):
+    """Calculate game-level HR probability from HR/PA and PA distribution via Poisson."""
+    p_pa = float(hr_rate_per_pa)
+    if not np.isfinite(p_pa):
+        return 0.0
+    if p_pa <= 0:
+        return 0.0
+    if p_pa >= 1:
+        return 1.0
+
+    final_game_prob = 0.0
+    for pa, pa_prob in expected_pa_distribution.items():
+        lam = p_pa * float(pa)
+        prob_one_or_more_hrs = 1.0 - math.exp(-lam)
+        final_game_prob += prob_one_or_more_hrs * float(pa_prob)
+
+    return float(np.clip(final_game_prob, 0.0, 1.0))
+
+
 def monte_carlo_hr_simulation(single_pa_prob, num_simulations=10000, avg_pas=3.0):
-    """
-    Run Monte Carlo simulation to calculate the probability of ≥1 home run
-    given a player's single-PA home run probability.
-    
-    Binomial approach: 
-    - Each PA has probability p of being a home run
-    - After N PAs, what's P(HR_count ≥ 1)?
-    - Equivalently: 1 - P(0 home runs) = 1 - (1-p)^N
-    
-    For precision with rare events, we simulate:
-    - 10,000 simulated games
-    - Each game: draw N (from distribution around avg_pas)
-    - Each PA: Bernoulli(p) for HR
-    
-    Returns: float, simulated probability of ≥1 HR
-    """
-    if single_pa_prob <= 0 or single_pa_prob >= 1:
-        return single_pa_prob  # Edge case: if p=0 or p=1, HR prob = p
-    
-    # Use exact binomial formula for speed (more accurate for rare events)
-    # P(≥1 HR | p, N) = 1 - (1-p)^N
-    # Then average over distribution of N
-    
-    # Distribution of PAs: normal around avg_pas with std 0.5
-    pas_distribution = np.random.normal(avg_pas, 0.5, num_simulations)
-    pas_distribution = np.maximum(pas_distribution, 1).astype(int)  # Minimum 1 PA
-    
-    # Binomial probability: P(at least 1 HR)
-    # = 1 - P(no HRs) = 1 - (1-p)^N
-    prob_no_hr = (1 - single_pa_prob) ** pas_distribution
-    prob_at_least_one = 1 - prob_no_hr
-    
-    # Average across simulated games
-    simulated_prob = prob_at_least_one.mean()
-    
-    return float(simulated_prob)
+    """Backward-compatible wrapper; now uses analytic Poisson weighting."""
+    spread = float(np.clip(_env_float('PA_DISTRIBUTION_STD', 0.70), 0.30, 1.20))
+    pa_dist = build_expected_pa_distribution(avg_pas, spread=spread)
+    return calculate_game_hr_probability(single_pa_prob, pa_dist)
 
 
 def calculate_ev_premium(model_prob, market_prob, market_odds_american=None):
@@ -6781,21 +6851,49 @@ def generate_daily_predictions():
     live['ensemble_raw_prob'] = np.asarray(probs).reshape(-1)
 
     # =====================================================================
-    # PROFESSIONAL UPGRADE 1: PA Projection + Monte Carlo Simulation
+    # PROFESSIONAL UPGRADE 1: PA Projection + Poisson-Weighted Conversion
     # =====================================================================
-    # Project batting order-based PA count for each batter
+    # Project batting order-based PA count for each batter.
     order_slots = live.get('batting_order_slot', pd.Series([5] * len(live))).fillna(5).astype(int).clip(1, 9)
-    projected_pas = order_slots.apply(project_batting_order_pa)
-    live['projected_pas'] = projected_pas
-    
-    # Run Monte Carlo: convert single-PA probability to game-level probability
-    simulated_probs = pd.Series([
-        monte_carlo_hr_simulation(p, avg_pas=pa) 
-        for p, pa in zip(probs, projected_pas)
-    ], index=range(len(probs)))
-    
-    # Use simulated (game-level) probabilities as our model prediction
-    probs = simulated_probs.values
+    slot_projected_pas = order_slots.apply(project_batting_order_pa)
+    lineup_pa_expectation = pd.to_numeric(
+        live.get('lineup_pa_expectation', slot_projected_pas),
+        errors='coerce'
+    ).fillna(slot_projected_pas)
+
+    implied_team_total_col = None
+    for candidate in ['team_implied_total', 'implied_team_total', 'vegas_team_total']:
+        if candidate in live.columns:
+            implied_team_total_col = candidate
+            break
+
+    if implied_team_total_col is not None:
+        implied_team_totals = pd.to_numeric(live.get(implied_team_total_col), errors='coerce')
+    else:
+        implied_team_totals = pd.Series([np.nan] * len(live), index=live.index)
+
+    game_totals = pd.to_numeric(live.get('game_total', pd.Series([np.nan] * len(live), index=live.index)), errors='coerce')
+    pa_dist_spread = float(np.clip(_env_float('PA_DISTRIBUTION_STD', 0.70), 0.30, 1.20))
+
+    projected_pas = []
+    game_level_probs = []
+    for p_pa, base_pa, team_total, game_total in zip(probs, lineup_pa_expectation, implied_team_totals, game_totals):
+        expected_pa = adjust_expected_pa_for_context(
+            base_pa,
+            team_implied_total=team_total,
+            game_total=game_total,
+        )
+        pa_dist = build_expected_pa_distribution(expected_pa, spread=pa_dist_spread)
+        game_prob = calculate_game_hr_probability(p_pa, pa_dist)
+        projected_pas.append(expected_pa)
+        game_level_probs.append(game_prob)
+
+    live['projected_pas'] = pd.Series(projected_pas, index=live.index).round(3)
+    live['pa_distribution_std'] = pa_dist_spread
+    live['pa_conversion_method'] = 'poisson_weighted_pa_dist'
+
+    # Convert HR/PA into single-game HR probability analytically.
+    probs = np.asarray(game_level_probs)
     base_model_probs = probs.copy()
     
     # =====================================================================
@@ -7028,9 +7126,13 @@ def generate_daily_predictions():
         return max(round(edge / _b * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
 
     live['pred_hr_prob'] = probs
+    if 'game_pk' in live.columns:
+        game_count_value = int(pd.to_numeric(live['game_pk'], errors='coerce').dropna().nunique())
+    else:
+        game_count_value = max(1, int(np.ceil(len(live) / 18.0)))
     live = apply_daily_hr_volume_constraints(
         live,
-        game_count=max(1, int(len(live.get('game_pk').dropna().unique()) // 9)) if 'game_pk' in live.columns else 1,
+        game_count=max(1, game_count_value),
         avg_hr_per_game=2.5,
     )
     live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
