@@ -78,6 +78,7 @@ def load_yesterdays_home_runs():
     statcast_file = Path('cache') / f'statcast_{yesterday}.csv'
 
     hrs = pd.DataFrame()
+    fb_enrichment = pd.DataFrame()
 
     if statcast_file.exists():
         try:
@@ -92,6 +93,9 @@ def load_yesterdays_home_runs():
                 )
                 hrs['date'] = yesterday
                 hrs['source'] = 'statcast'
+                hrs['batter_name'] = np.nan
+                hrs['pitcher_name'] = np.nan
+                hrs['model_prob'] = np.nan
                 print(f"📊 Found {len(hrs)} home runs from {yesterday} in Statcast")
         except Exception as exc:
             print(f"⚠️  Error loading Statcast file: {exc}")
@@ -106,6 +110,17 @@ def load_yesterdays_home_runs():
                 fb['batter'] = pd.to_numeric(fb.get('batter', np.nan), errors='coerce')
                 fb['pitcher'] = pd.to_numeric(fb.get('pitcher', np.nan), errors='coerce')
                 fb['game_pk'] = pd.to_numeric(fb.get('game_pk', np.nan), errors='coerce')
+                fb['batter_name'] = fb.get('batter_name', pd.Series(['Unknown'] * len(fb))).apply(_safe_name)
+                fb['pitcher_name'] = fb.get('pitcher_name', pd.Series(['Unknown'] * len(fb))).apply(_safe_name)
+                fb['model_prob'] = pd.to_numeric(fb.get('model_prob', np.nan), errors='coerce')
+
+                fb_enrichment = fb[['game_pk', 'batter', 'pitcher', 'batter_name', 'pitcher_name', 'model_prob']].copy()
+                fb_enrichment = fb_enrichment.dropna(subset=['game_pk', 'batter', 'pitcher'])
+                fb_enrichment = fb_enrichment.sort_values(['game_pk', 'batter', 'pitcher']).drop_duplicates(
+                    subset=['game_pk', 'batter', 'pitcher'],
+                    keep='last'
+                )
+
                 if not hrs.empty:
                     hrs = pd.concat([hrs, fb[['date', 'batter_name', 'pitcher_name', 'batter', 'pitcher', 'game_pk', 'inning', 'model_prob', 'was_predicted', 'was_most_likely_homer', 'actual_hr']].dropna(subset=['batter_name', 'pitcher_name'])], ignore_index=True)
                 else:
@@ -118,7 +133,40 @@ def load_yesterdays_home_runs():
         print(f"ℹ️  No home run feedback file found: {feedback_file}")
         return pd.DataFrame()
 
-    return hrs.drop_duplicates(subset=['batter_name', 'pitcher_name', 'game_pk'], keep='last')
+    # Enrich Statcast-only rows with watcher names/probability where matchup keys overlap.
+    if not fb_enrichment.empty and {'game_pk', 'batter', 'pitcher'}.issubset(hrs.columns):
+        hrs = hrs.merge(
+            fb_enrichment,
+            on=['game_pk', 'batter', 'pitcher'],
+            how='left',
+            suffixes=('', '_fb')
+        )
+        hrs['batter_name'] = hrs.get('batter_name', pd.Series([np.nan] * len(hrs))).combine_first(hrs.get('batter_name_fb'))
+        hrs['pitcher_name'] = hrs.get('pitcher_name', pd.Series([np.nan] * len(hrs))).combine_first(hrs.get('pitcher_name_fb'))
+        hrs['model_prob'] = pd.to_numeric(
+            hrs.get('model_prob', pd.Series([np.nan] * len(hrs))).combine_first(hrs.get('model_prob_fb')),
+            errors='coerce'
+        )
+        hrs = hrs.drop(columns=[c for c in ['batter_name_fb', 'pitcher_name_fb', 'model_prob_fb'] if c in hrs.columns])
+
+    # Fall back to stable ID-based labels when names are unavailable.
+    if 'batter_name' in hrs.columns:
+        hrs['batter_name'] = hrs['batter_name'].apply(_safe_name)
+        batter_id_label = hrs.get('batter', pd.Series([np.nan] * len(hrs))).apply(
+            lambda x: f"Batter_{int(x)}" if pd.notna(x) else 'Unknown'
+        )
+        hrs['batter_name'] = hrs['batter_name'].where(hrs['batter_name'] != 'Unknown', batter_id_label)
+    if 'pitcher_name' in hrs.columns:
+        hrs['pitcher_name'] = hrs['pitcher_name'].apply(_safe_name)
+        pitcher_id_label = hrs.get('pitcher', pd.Series([np.nan] * len(hrs))).apply(
+            lambda x: f"Pitcher_{int(x)}" if pd.notna(x) else 'Unknown'
+        )
+        hrs['pitcher_name'] = hrs['pitcher_name'].where(hrs['pitcher_name'] != 'Unknown', pitcher_id_label)
+
+    if 'model_prob' in hrs.columns:
+        hrs['model_prob'] = pd.to_numeric(hrs['model_prob'], errors='coerce').fillna(0.0)
+
+    return hrs.drop_duplicates(subset=['game_pk', 'batter', 'pitcher'], keep='last')
 
 def load_training_data_for_analysis(days_back=60):
     """Load historical Statcast to analyze HR conditions."""

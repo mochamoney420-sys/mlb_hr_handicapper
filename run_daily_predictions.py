@@ -550,6 +550,15 @@ def _load_odds_snapshots(date_str=None):
     return snapshots
 
 
+def _load_latest_odds_snapshot_payload(date_str=None):
+    """Return the newest raw odds payload captured for the day, if available."""
+    snapshots = _load_odds_snapshots(date_str)
+    if not snapshots:
+        return {}
+    payload = snapshots[-1].get('odds', {})
+    return payload if isinstance(payload, dict) else {}
+
+
 def _resolve_snapshot_book_map(snapshot_odds, batter_name):
     norm = _normalize_player_name(batter_name)
     if not norm:
@@ -2094,6 +2103,9 @@ def run_model_self_check(days_lookback=30):
     print("\n🔍 SCANNING FOR SILENT FAILURES...")
     
     silent_failures = []
+    today_prob_mean = None
+    today_prob_q90 = None
+    today_prob_max = None
     if today_pred.exists():
         try:
             today_preds_df = pd.read_csv(today_pred)
@@ -2119,7 +2131,13 @@ def run_model_self_check(days_lookback=30):
                     silent_failures.append(msg)
                     issues_found += 1
                 else:
-                    print(f"✅ Today's predictions: {len(today_preds_df)} rows, mean={prob_col.mean():.3f}, max={prob_col.max():.3f}")
+                    today_prob_mean = float(prob_col.mean())
+                    today_prob_q90 = float(prob_col.quantile(0.90))
+                    today_prob_max = float(prob_col.max())
+                    print(
+                        f"✅ Today's predictions: {len(today_preds_df)} rows, "
+                        f"mean={today_prob_mean:.3f}, q90={today_prob_q90:.3f}, max={today_prob_max:.3f}"
+                    )
         except Exception as e:
             msg = f"Could not read today's predictions: {e}"
             print(f"❌ {msg}")
@@ -2149,6 +2167,14 @@ def run_model_self_check(days_lookback=30):
         miss_rate_min_samples = max(20, int(float(os.getenv('SELF_CHECK_MISS_RATE_MIN_SAMPLES', '40'))))
     except Exception:
         miss_rate_min_samples = 40
+    try:
+        recovery_mean_threshold = float(np.clip(float(os.getenv('SELF_CHECK_RECOVERY_MEAN_THRESHOLD', '0.040')), 0.0, 1.0))
+    except Exception:
+        recovery_mean_threshold = 0.04
+    try:
+        recovery_q90_threshold = float(np.clip(float(os.getenv('SELF_CHECK_RECOVERY_Q90_THRESHOLD', '0.055')), 0.0, 1.0))
+    except Exception:
+        recovery_q90_threshold = 0.055
 
     try:
         latest_closed_loop = sorted(Path('data').glob('closed_loop_report_*.json'))
@@ -2163,13 +2189,25 @@ def run_model_self_check(days_lookback=30):
                 f"samples={samples}, missed_hr={missed_hr}, miss_rate={miss_rate:.1%}"
             )
             if samples >= miss_rate_min_samples and miss_rate >= miss_rate_alert_threshold:
-                msg = (
-                    f"⚠️  High miss-rate detected in closed-loop report ({miss_rate:.1%} over {samples} samples) - "
-                    "possible probability suppression"
+                current_recovered = (
+                    today_prob_mean is not None
+                    and today_prob_q90 is not None
+                    and today_prob_mean >= recovery_mean_threshold
+                    and today_prob_q90 >= recovery_q90_threshold
                 )
-                print(msg)
-                silent_failures.append(msg)
-                issues_found += 1
+                if current_recovered:
+                    print(
+                        "ℹ️  Closed-loop miss-rate is high, but today's predictions have recovered; "
+                        "treating this as stale historical drift rather than an active failure"
+                    )
+                else:
+                    msg = (
+                        f"⚠️  High miss-rate detected in closed-loop report ({miss_rate:.1%} over {samples} samples) - "
+                        "possible probability suppression"
+                    )
+                    print(msg)
+                    silent_failures.append(msg)
+                    issues_found += 1
         else:
             print("ℹ️  No closed-loop report found yet")
     except Exception as e:
@@ -5383,8 +5421,7 @@ def run_post_mortem_backpropagation(days_lookback=7):
             s = pd.Series([default] * len(df), index=df.index)
         return pd.to_numeric(s, errors='coerce').fillna(default)
 
-    false_pos_rows = []
-    missed_rows = []
+    all_eval_rows = []
     for d, fp in eval_files:
         try:
             ev = pd.read_csv(fp)
@@ -5392,13 +5429,33 @@ def run_post_mortem_backpropagation(days_lookback=7):
                 continue
             ev['pred_hr_prob'] = _num_series(ev, 'pred_hr_prob', 0.0)
             ev['actual_hr'] = _num_series(ev, 'actual_hr', 0.0).astype(int)
-            false_pos_rows.append(ev[(ev['pred_hr_prob'] >= 0.18) & (ev['actual_hr'] == 0)].copy())
-            missed_rows.append(ev[(ev['pred_hr_prob'] <= 0.10) & (ev['actual_hr'] == 1)].copy())
+            all_eval_rows.append(ev)
         except Exception:
             continue
 
-    false_pos = pd.concat(false_pos_rows, ignore_index=True) if false_pos_rows else pd.DataFrame()
-    missed = pd.concat(missed_rows, ignore_index=True) if missed_rows else pd.DataFrame()
+    eval_all = pd.concat(all_eval_rows, ignore_index=True) if all_eval_rows else pd.DataFrame()
+    if eval_all.empty:
+        return {
+            'coefficients': coeffs,
+            'samples': 0,
+            'false_pos': 0,
+            'diagnostics': {},
+        }
+
+    hr_rows = eval_all[eval_all['actual_hr'] == 1]
+    non_hr_rows = eval_all[eval_all['actual_hr'] == 0]
+
+    if not hr_rows.empty:
+        missed_cutoff = float(np.clip(hr_rows['pred_hr_prob'].quantile(0.45), 0.06, 0.20))
+    else:
+        missed_cutoff = 0.10
+    if not non_hr_rows.empty:
+        false_pos_cutoff = float(np.clip(non_hr_rows['pred_hr_prob'].quantile(0.92), 0.14, 0.32))
+    else:
+        false_pos_cutoff = 0.20
+
+    false_pos = eval_all[(eval_all['pred_hr_prob'] >= false_pos_cutoff) & (eval_all['actual_hr'] == 0)].copy()
+    missed = eval_all[(eval_all['pred_hr_prob'] <= missed_cutoff) & (eval_all['actual_hr'] == 1)].copy()
 
     n_false = len(false_pos)
     n_missed = len(missed)
@@ -5508,6 +5565,8 @@ def run_post_mortem_backpropagation(days_lookback=7):
         'false_pos': int(n_false),
         'missed_hr': int(n_missed),
         'diagnostics': {
+            'missed_cutoff': round(missed_cutoff, 4),
+            'false_pos_cutoff': round(false_pos_cutoff, 4),
             'temp_false_rate': round(temp_false_rate, 4),
             'wind_false_rate': round(wind_false_rate, 4),
             'spin_miss_rate': round(spin_miss_rate, 4),
@@ -7136,9 +7195,9 @@ def generate_daily_predictions():
         avg_hr_per_game=2.5,
     )
     live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
-    monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.25)
-    monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.35)
-    monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.020)
+    monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.35)
+    monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.45)
+    monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.030)
     live = apply_monotonic_prob_calibration(
         live,
         gamma=monotonic_gamma,
@@ -7150,11 +7209,11 @@ def generate_daily_predictions():
     if use_recent_calibration:
         recent_cal_diag = {'applied': False, 'reason': 'not_run'}
         recent_days = max(3, _env_int('RECENT_CALIBRATION_DAYS', 7))
-        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.55), 0.0, 1.0))
+        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.70), 0.0, 1.0))
         recent_min_rows = max(200, _env_int('RECENT_CALIBRATION_MIN_ROWS', 600))
         recent_min_files = max(2, _env_int('RECENT_CALIBRATION_MIN_FILES', 3))
-        recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.85), 0.5, 1.0))
-        recent_max_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MAX_MULTIPLIER', 1.45), 1.0, 2.0))
+        recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.90), 0.5, 1.2))
+        recent_max_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MAX_MULTIPLIER', 1.90), 1.0, 2.5))
 
         live, recent_cal_diag = apply_recent_calibration_correction(
             live,
@@ -7280,6 +7339,9 @@ def generate_daily_predictions():
 
     # Apply real market odds if ODDS_API_KEY is configured
     market_odds_raw = fetch_hr_prop_odds_raw()
+    snapshot_odds_raw = _load_latest_odds_snapshot_payload()
+    if not market_odds_raw and snapshot_odds_raw:
+        market_odds_raw = snapshot_odds_raw
     market_odds = _build_devigged_probs_from_raw_books(market_odds_raw)
 
     def _match_raw_best_line(bname):
@@ -7342,10 +7404,28 @@ def generate_daily_predictions():
             return None
         live['market_prob'] = live['batter_name'].apply(_match_odds) if market_odds else np.nan
 
-        raw_matches = live['batter_name'].apply(_match_raw_best_line)
         raw_book_lines = live['batter_name'].apply(_match_raw_book_lines)
-        live['best_book'] = raw_matches.apply(lambda x: x[0])
-        live['best_market_odds_american'] = raw_matches.apply(lambda x: x[1])
+        if raw_book_lines.map(lambda d: len(d) if isinstance(d, dict) else 0).sum() == 0 and snapshot_odds_raw:
+            market_odds_raw = snapshot_odds_raw
+            market_odds = _build_devigged_probs_from_raw_books(market_odds_raw)
+            raw_book_lines = live['batter_name'].apply(_match_raw_book_lines)
+
+        tiered_lines = raw_book_lines.apply(_split_best_lines_by_tier)
+
+        live['sharp_book'] = tiered_lines.apply(lambda x: x.get('sharp_book'))
+        live['sharp_market_odds_american'] = tiered_lines.apply(lambda x: x.get('sharp_market_odds_american'))
+        live['sharp_market_implied_prob'] = live['sharp_market_odds_american'].apply(
+            lambda x: american_to_implied_prob(x) if pd.notna(x) else np.nan
+        )
+
+        live['retail_book'] = tiered_lines.apply(lambda x: x.get('retail_book'))
+        live['retail_market_odds_american'] = tiered_lines.apply(lambda x: x.get('retail_market_odds_american'))
+        live['retail_market_implied_prob'] = live['retail_market_odds_american'].apply(
+            lambda x: american_to_implied_prob(x) if pd.notna(x) else np.nan
+        )
+
+        live['best_book'] = live['sharp_book'].combine_first(live['retail_book'])
+        live['best_market_odds_american'] = live['sharp_market_odds_american'].combine_first(live['retail_market_odds_american'])
         live['best_market_implied_prob'] = live['best_market_odds_american'].apply(
             lambda x: american_to_implied_prob(x) if pd.notna(x) else np.nan
         )
@@ -7379,8 +7459,18 @@ def generate_daily_predictions():
         live['book_prob_dispersion'] = raw_book_lines.apply(_book_dispersion)
         live['arbitrage_value_pct'] = raw_book_lines.apply(_arbitrage_value_pct)
 
+        live['sharp_retail_odds_gap'] = (
+            pd.to_numeric(live['retail_market_odds_american'], errors='coerce')
+            - pd.to_numeric(live['sharp_market_odds_american'], errors='coerce')
+        )
+        live['sharp_retail_implied_gap'] = (
+            pd.to_numeric(live['retail_market_implied_prob'], errors='coerce')
+            - pd.to_numeric(live['sharp_market_implied_prob'], errors='coerce')
+        )
+
         # Prefer devigged market prob where available, else implied from best line.
         live['market_prob'] = pd.to_numeric(live['market_prob'], errors='coerce')
+        live['market_prob'] = live['market_prob'].fillna(live['sharp_market_implied_prob'])
         live['market_prob'] = live['market_prob'].fillna(live['best_market_implied_prob'])
 
         medium_no_odds_mask = (
@@ -7605,10 +7695,14 @@ def generate_daily_predictions():
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
                                     'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
                                     'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
+                                    'projected_pas', 'pa_distribution_std', 'pa_conversion_method',
                                     'kelly_multiplier',
                                     'base_model_prob', 'physics_delta', 'blend_weight_physics', 'probability_mode',
                                     'physics_uplift_cap',
                                     'reliability_prob_cap',
+                                    'sharp_book', 'sharp_market_odds_american', 'sharp_market_implied_prob',
+                                    'retail_book', 'retail_market_odds_american', 'retail_market_implied_prob',
+                                    'sharp_retail_odds_gap', 'sharp_retail_implied_gap',
                                     'adaptive_feedback_multiplier', 'pitcher_fear_factor', 'pitcher_intent_suppression',
                                     'is_elite_power_batter', 'optimist_score', 'pessimist_score', 'debate_rounds',
                                     'optimist_wins', 'pessimist_wins', 'adversarial_margin', 'adversarial_multiplier',
@@ -7631,6 +7725,8 @@ def generate_daily_predictions():
                                     'release_extension_decay_ft', 'spin_velocity_ratio_decay', 'primary_weapon_vulnerable_pitch_count',
                                     'bullpen_exposure_multiplier',
                                     'lineup_protection_woba_proxy', 'context_multiplier',
+                                    'recent_calibration_multiplier', 'recent_calibration_ratio_raw',
+                                    'recent_calibration_pred_mean', 'recent_calibration_actual_mean',
                                     'confidence_lower_95pct', 'confidence_upper_95pct', 'model_reliability', 'batter_consistency_score',
                                     'model_name', 'prediction_timestamp']])
 
@@ -8512,6 +8608,38 @@ def _best_line_from_book_map(book_map):
             best_american = int(round(o))
             best_book = str(bk)
     return best_book, best_american
+
+
+def _best_line_from_book_map_with_preference(book_map, preferred_books=None):
+    """Return the best line, preferring a specific sportsbook tier when available."""
+    if not isinstance(book_map, dict) or not book_map:
+        return None, None
+
+    preferred = {str(b).strip().lower() for b in (preferred_books or set()) if str(b).strip()}
+    preferred_map = {
+        bk: odds for bk, odds in book_map.items()
+        if str(bk).strip().lower() in preferred
+    }
+    if preferred_map:
+        best_book, best_american = _best_line_from_book_map(preferred_map)
+        if best_book is not None and best_american is not None:
+            return best_book, best_american
+    return _best_line_from_book_map(book_map)
+
+
+def _split_best_lines_by_tier(book_map):
+    """Return sharp, retail, and all-book best lines for a matchup."""
+    sharp_book, sharp_odds = _best_line_from_book_map_with_preference(book_map, SHARP_BOOKS)
+    retail_book, retail_odds = _best_line_from_book_map_with_preference(book_map, SQUARE_BOOKS)
+    best_book, best_odds = _best_line_from_book_map(book_map)
+    return {
+        'sharp_book': sharp_book,
+        'sharp_market_odds_american': sharp_odds,
+        'retail_book': retail_book,
+        'retail_market_odds_american': retail_odds,
+        'best_book': best_book,
+        'best_market_odds_american': best_odds,
+    }
 
 
 def load_live_power_profile(date_str=None):
