@@ -552,11 +552,57 @@ def _load_odds_snapshots(date_str=None):
 
 def _load_latest_odds_snapshot_payload(date_str=None):
     """Return the newest raw odds payload captured for the day, if available."""
-    snapshots = _load_odds_snapshots(date_str)
-    if not snapshots:
-        return {}
-    payload = snapshots[-1].get('odds', {})
-    return payload if isinstance(payload, dict) else {}
+    candidates = []
+    if date_str is not None:
+        candidates.append(str(date_str))
+    else:
+        candidates.append(datetime.today().strftime('%Y-%m-%d'))
+
+    seen = set()
+    for candidate_date in candidates:
+        snapshots = _load_odds_snapshots(candidate_date)
+        if snapshots:
+            payload = snapshots[-1].get('odds', {})
+            if isinstance(payload, dict) and len(payload) > 1:
+                return payload
+        seen.add(candidate_date)
+
+    data_dir = Path('data')
+    for snapshot_file in sorted(data_dir.glob('odds_snapshots_*.jsonl'), reverse=True):
+        date_token = snapshot_file.stem.replace('odds_snapshots_', '')
+        if date_token in seen:
+            continue
+        try:
+            snapshots = _load_odds_snapshots(date_token)
+            if not snapshots:
+                continue
+            payload = snapshots[-1].get('odds', {})
+            if isinstance(payload, dict) and len(payload) > 1:
+                return payload
+        except Exception:
+            continue
+    return {}
+
+
+def _is_placeholder_raw_odds_payload(raw_odds):
+    if not isinstance(raw_odds, dict) or len(raw_odds) < 2:
+        return True
+
+    normalized_players = []
+    total_pairs = 0
+    for player, book_map in raw_odds.items():
+        normalized_players.append(_normalize_player_name(player))
+        if isinstance(book_map, dict):
+            total_pairs += sum(1 for _, odds in book_map.items() if _safe_float(odds) is not None)
+
+    if total_pairs < 2:
+        return True
+
+    placeholder_tokens = {'player a', 'player b', 'player c', 'unknown', 'n/a', 'null'}
+    if all(name in placeholder_tokens or not name for name in normalized_players):
+        return True
+
+    return False
 
 
 def _resolve_snapshot_book_map(snapshot_odds, batter_name):
@@ -3682,9 +3728,15 @@ def fetch_hr_prop_odds_raw():
         return {}
     if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
         cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
-        if cached_raw:
+        if cached_raw and not _is_placeholder_raw_odds_payload(cached_raw):
             print(f"Using cached raw odds payload during cooldown ({cached_age} seconds old)")
             return cached_raw
+        if cached_raw:
+            print("Ignoring placeholder raw odds cache during cooldown")
+        snapshot_raw = _load_latest_odds_snapshot_payload()
+        if snapshot_raw:
+            print("Using latest snapshot raw odds payload during cooldown")
+            return snapshot_raw
         if use_free_fallback and load_free_odds_sources is not None:
             return load_free_odds_sources()
         return {}
@@ -3693,15 +3745,25 @@ def fetch_hr_prop_odds_raw():
             raw = _fetch_hr_props_raw_from_odds_api(api_key)
         else:
             raw = _fetch_hr_props_raw_from_sportsgameodds(api_key)
+        if raw and _is_placeholder_raw_odds_payload(raw):
+            print("Ignoring placeholder raw odds payload from provider")
+            raw = {}
         if not raw:
             cached_raw, cached_age = _load_cached_hr_prop_odds_payload()
-            if cached_raw:
+            if cached_raw and not _is_placeholder_raw_odds_payload(cached_raw):
                 print(f"Using cached raw odds payload ({cached_age} seconds old)")
                 return cached_raw
+            if cached_raw:
+                print("Ignoring placeholder raw odds cache")
+            snapshot_raw = _load_latest_odds_snapshot_payload()
+            if snapshot_raw:
+                print("Using latest snapshot raw odds payload")
+                return snapshot_raw
             if load_free_odds_sources is not None:
                 return load_free_odds_sources()
             return {}
-        _save_cached_hr_prop_odds_payload(raw)
+        if not _is_placeholder_raw_odds_payload(raw):
+            _save_cached_hr_prop_odds_payload(raw)
         return raw
     except Exception as e:
         print(f"Odds raw fetch failed ({provider}): {e}")
