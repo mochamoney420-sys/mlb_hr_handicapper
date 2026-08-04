@@ -5319,6 +5319,25 @@ def _select_thresholded_candidates(rankings_df, min_prob, max_rows):
     return qualified.head(max_rows).reset_index(drop=True)
 
 
+def _build_discord_top_keys(frame):
+    """Safely build a set of batter/pitcher key pairs for filtering Discord rows."""
+    if frame is None or getattr(frame, 'empty', False):
+        return set()
+
+    if not isinstance(frame, pd.DataFrame):
+        return set()
+
+    batter_col = 'batter_name' if 'batter_name' in frame.columns else None
+    pitcher_col = 'pitcher_name' if 'pitcher_name' in frame.columns else None
+    if not batter_col or not pitcher_col:
+        return set()
+
+    return {
+        (str(row.get(batter_col, '')), str(row.get(pitcher_col, '')))
+        for _, row in frame.iterrows()
+    }
+
+
 def _build_discord_snapshot_summary(target_date, rankings, top_prob, radar, top_ev, discord_min_prob, discord_window_1_hours, discord_window_2_hours):
     """Build a single Discord summary that matches the actual pick tables being sent."""
     lines = [f"⚾ MLB HR MODEL SNAPSHOT ({target_date})", f"Candidates ranked: {len(rankings)}"]
@@ -8118,11 +8137,20 @@ def generate_daily_predictions():
         & (pd.to_numeric(radar.get('ev_pct', 0.0), errors='coerce').fillna(0.0) >= max(3.0, discord_min_ev_pct * 0.5))
     ]
 
-    top_keys = set(zip(top_prob['batter_name'].astype(str), top_prob['pitcher_name'].astype(str)))
+    top_keys = _build_discord_top_keys(top_prob)
     radar = radar[
-        ~radar.apply(lambda r: (str(r['batter_name']), str(r['pitcher_name'])) in top_keys, axis=1)
+        ~radar.apply(lambda r: (str(r.get('batter_name', '')), str(r.get('pitcher_name', ''))) in top_keys, axis=1)
     ]
     radar = pd.DataFrame(radar).copy()
+    if 'portfolio_action_score' not in radar.columns:
+        hr_prob = pd.to_numeric(radar.get('hr_probability', 0.0), errors='coerce')
+        ev_pct = pd.to_numeric(radar.get('ev_pct', 0.0), errors='coerce')
+        physics_delta_abs = pd.to_numeric(radar.get('physics_delta_abs', 0.0), errors='coerce')
+        radar['portfolio_action_score'] = (
+            hr_prob.fillna(0.0) * 100.0
+            + ev_pct.fillna(0.0) * 0.5
+            + physics_delta_abs.fillna(0.0) * 0.1
+        )
     radar['hr_probability'] = _coerce_numeric_column(radar, 'hr_probability', default=0.0)
     radar['physics_delta'] = _coerce_numeric_column(radar, 'physics_delta', default=0.0)
     radar['physics_delta_abs'] = radar['physics_delta'].abs()
