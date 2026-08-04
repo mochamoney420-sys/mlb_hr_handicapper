@@ -425,6 +425,29 @@ def load_odds_from_public_urls(urls: List[str]) -> Dict[str, Dict[str, int]]:
     return merged
 
 
+def _discover_default_local_odds_files() -> Tuple[List[str], List[str]]:
+    """Return default local JSON/CSV odds files to try if no env vars are provided."""
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+
+    json_candidates = [
+        data_dir / "hr_prop_odds.json",
+        data_dir / "free_odds.json",
+        data_dir / "odds.json",
+        data_dir / "market_odds.json",
+    ]
+    csv_candidates = [
+        data_dir / "hr_prop_odds.csv",
+        data_dir / "free_odds.csv",
+        data_dir / "odds.csv",
+        data_dir / "market_odds.csv",
+    ]
+
+    json_paths = [str(path) for path in json_candidates if path.exists()]
+    csv_paths = [str(path) for path in csv_candidates if path.exists()]
+    return json_paths, csv_paths
+
+
 def load_free_odds_sources() -> Dict[str, Dict[str, int]]:
     """Load odds from configured free/public sources.
 
@@ -432,12 +455,25 @@ def load_free_odds_sources() -> Dict[str, Dict[str, int]]:
     - FREE_ODDS_JSON_PATH: local JSON export path
     - FREE_ODDS_CSV_PATH: local CSV export path
     - FREE_ODDS_PUBLIC_URLS: comma-separated public URLs (JSON feeds and/or HTML pages)
+
+    If no explicit env values are set, the loader also checks common local files in the
+    project data directory such as data/hr_prop_odds.json and data/hr_prop_odds.csv.
     """
     merged: Dict[str, Dict[str, int]] = {}
 
     json_path = os.getenv("FREE_ODDS_JSON_PATH", "").strip()
     csv_path = os.getenv("FREE_ODDS_CSV_PATH", "").strip()
     public_urls = [u.strip() for u in os.getenv("FREE_ODDS_PUBLIC_URLS", "").split(",") if u.strip()]
+
+    if not json_path:
+        default_json_paths, _ = _discover_default_local_odds_files()
+        if default_json_paths:
+            json_path = default_json_paths[0]
+
+    if not csv_path:
+        _, default_csv_paths = _discover_default_local_odds_files()
+        if default_csv_paths:
+            csv_path = default_csv_paths[0]
 
     if json_path:
         j = load_odds_from_local_json(json_path)
