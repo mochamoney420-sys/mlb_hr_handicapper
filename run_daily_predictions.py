@@ -1294,13 +1294,15 @@ def send_morning_bet_now_alert(live_df, date_str=None):
         "Lines are still inefficient; action before correction:",
     ]
     for _, row in actionable.iterrows():
+        stake_usd = float(row.get('stake_usd', _estimate_bet_stake_usd(row.get('kelly_fraction', 0.0))) or 0.0)
         lines.append(
             f"- {row.get('batter_name','')} vs {row.get('pitcher_name','')} | "
             f"{int(row.get('best_market_odds_american')):+d} ({row.get('best_book','n/a')}) | "
             f"model={float(row.get('pred_hr_prob', 0.0))*100:.1f}% | "
             f"mkt={float(row.get('market_prob', 0.0))*100:.1f}% | "
             f"EV={float(row.get('ev_percent', 0.0)):+.1f}% | "
-            f"Kelly={float(row.get('kelly_fraction', 0.0)):.3f}"
+            f"Kelly={float(row.get('kelly_fraction', 0.0)):.3f} | "
+            f"Stake=${stake_usd:.2f}"
         )
 
     sent = send_discord_webhook(content="\n".join(lines))
@@ -1408,9 +1410,10 @@ def print_bet_ready_wagers(date_str=None, top_n=15):
     keep_cols = [
         'batter_name', 'pitcher_name', 'pred_hr_prob', 'best_book',
         'best_market_odds_american', 'fair_odds_american',
-        'ev_percent', 'edge_pct', 'kelly_fraction', 'game_time'
+        'ev_percent', 'edge_pct', 'kelly_fraction', 'stake_usd', 'game_time'
     ]
     keep_cols = [c for c in keep_cols if c in actionable.columns]
+    actionable['stake_usd'] = actionable['kelly_fraction'].apply(_estimate_bet_stake_usd)
     report = actionable[keep_cols].sort_values(
         by=['ev_percent', 'kelly_fraction'],
         ascending=[False, False]
@@ -1518,11 +1521,12 @@ def print_conservative_bet_ready_wagers(date_str=None, top_n=10):
         + shortlist['ev_percent'].fillna(0)
         + shortlist['edge_pct'].fillna(0) / 2.0
     )
+    shortlist['stake_usd'] = shortlist['kelly_fraction'].apply(_estimate_bet_stake_usd)
 
     keep_cols = [
         'batter_name', 'pitcher_name', 'pred_hr_prob', 'model_reliability',
         'best_book', 'best_market_odds_american', 'fair_odds_american',
-        'edge_pct', 'ev_percent', 'kelly_fraction', 'conservative_score', 'game_time'
+        'edge_pct', 'ev_percent', 'kelly_fraction', 'stake_usd', 'conservative_score', 'game_time'
     ]
     keep_cols = [c for c in keep_cols if c in shortlist.columns]
     shortlist = shortlist.sort_values(
@@ -1639,12 +1643,13 @@ def build_single_straight_market_discrepancies(preds_df, top_n=12):
         + shortlist['ev_percent'].clip(lower=0.0) * 0.30
         + shortlist['kelly_fraction'].clip(lower=0.0) * 100.0 * 0.15
     )
+    shortlist['stake_usd'] = shortlist['kelly_fraction'].apply(_estimate_bet_stake_usd)
 
     keep_cols = [
         'wager_type', 'batter_name', 'pitcher_name', 'game_time', 'model_reliability',
         'pred_hr_prob', 'market_prob', 'prob_edge_abs', 'market_edge_pct',
         'best_book', 'best_market_odds_american', 'fair_odds_american',
-        'ev_percent', 'kelly_fraction', 'matched_book_count', 'discrepancy_score'
+        'ev_percent', 'kelly_fraction', 'stake_usd', 'matched_book_count', 'discrepancy_score'
     ]
     keep_cols = [c for c in keep_cols if c in shortlist.columns]
     shortlist = shortlist[keep_cols].sort_values(
@@ -4834,6 +4839,215 @@ def _tv_distance(vec_a, vec_b):
     return 0.5 * sum(abs(float(vec_a.get(k, 0.0)) - float(vec_b.get(k, 0.0))) for k in keys)
 
 
+def build_recent_batter_woba_proxy(statcast_df, rows_df, lookback_days=45, min_sample=4):
+    """Create a recent batter wOBA proxy from Statcast xwOBA-style signals."""
+    if rows_df is None or getattr(rows_df, 'empty', True):
+        return pd.Series([0.0] * 0, dtype=float)
+    if statcast_df is None or getattr(statcast_df, 'empty', True):
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+    if 'batter' not in statcast_df.columns or 'estimated_woba_using_speedangle' not in statcast_df.columns:
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    work = statcast_df.copy()
+    try:
+        if 'game_date' in work.columns:
+            work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+            cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=max(14, int(lookback_days)))
+            work = work[work['game_date'] >= cutoff]
+    except Exception:
+        pass
+
+    work['batter'] = pd.to_numeric(work['batter'], errors='coerce')
+    work = work.dropna(subset=['batter']).copy()
+    if work.empty:
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    xwoba = pd.to_numeric(work['estimated_woba_using_speedangle'], errors='coerce').fillna(0.0)
+    work['xwoba'] = xwoba
+    bat_summary = work.groupby('batter', as_index=False).agg(
+        sample_size=('xwoba', 'count'),
+        recent_xwoba=('xwoba', 'mean'),
+    )
+    if int(min_sample) > 1:
+        bat_summary = bat_summary[bat_summary['sample_size'] >= max(1, int(min_sample))].copy()
+    if bat_summary.empty:
+        bat_summary = work.groupby('batter', as_index=False).agg(
+            sample_size=('xwoba', 'count'),
+            recent_xwoba=('xwoba', 'mean'),
+        )
+
+    def _score_for_row(row):
+        try:
+            batter_id = int(row.get('batter', np.nan))
+        except Exception:
+            return 0.0
+        if pd.isna(batter_id):
+            return 0.0
+        match = bat_summary[bat_summary['batter'] == batter_id]
+        if match.empty:
+            return 0.0
+        return float(np.clip(match['recent_xwoba'].iloc[0], 0.0, 1.0))
+
+    return rows_df.apply(_score_for_row, axis=1).astype(float)
+
+
+def build_recent_pitcher_damage_proxy(statcast_df, rows_df, lookback_days=45, min_sample=4):
+    """Create a recent pitcher damage proxy from recent barrel/hard-hit/HR allowed rate."""
+    if rows_df is None or getattr(rows_df, 'empty', True):
+        return pd.Series([0.0] * 0, dtype=float)
+    if statcast_df is None or getattr(statcast_df, 'empty', True):
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+    if 'pitcher' not in statcast_df.columns:
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    work = statcast_df.copy()
+    try:
+        if 'game_date' in work.columns:
+            work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+            cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=max(14, int(lookback_days)))
+            work = work[work['game_date'] >= cutoff]
+    except Exception:
+        pass
+
+    work['pitcher'] = pd.to_numeric(work['pitcher'], errors='coerce')
+    work = work.dropna(subset=['pitcher']).copy()
+    if work.empty:
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    if 'launch_speed' in work.columns:
+        hard_hit = pd.to_numeric(work['launch_speed'], errors='coerce').fillna(0.0) >= 95.0
+    else:
+        hard_hit = pd.Series([False] * len(work), index=work.index)
+    if 'events' in work.columns:
+        is_hr = work['events'].astype(str).str.lower().eq('home_run')
+    else:
+        is_hr = pd.Series([False] * len(work), index=work.index)
+    damage = (hard_hit.astype(int) + is_hr.astype(int)).clip(0, 1)
+    work['damage_flag'] = damage
+
+    pit_summary = work.groupby('pitcher', as_index=False).agg(
+        sample_size=('damage_flag', 'count'),
+        recent_damage_rate=('damage_flag', 'mean'),
+    )
+    if int(min_sample) > 1:
+        pit_summary = pit_summary[pit_summary['sample_size'] >= max(1, int(min_sample))].copy()
+    if pit_summary.empty:
+        pit_summary = work.groupby('pitcher', as_index=False).agg(
+            sample_size=('damage_flag', 'count'),
+            recent_damage_rate=('damage_flag', 'mean'),
+        )
+
+    def _score_for_row(row):
+        try:
+            pitcher_id = int(row.get('pitcher', np.nan))
+        except Exception:
+            return 0.0
+        if pd.isna(pitcher_id):
+            return 0.0
+        match = pit_summary[pit_summary['pitcher'] == pitcher_id]
+        if match.empty:
+            return 0.0
+        return float(np.clip(match['recent_damage_rate'].iloc[0], 0.0, 1.0))
+
+    return rows_df.apply(_score_for_row, axis=1).astype(float)
+
+
+def build_batter_pitch_mix_matchup_feature(
+    statcast_df,
+    rows_df,
+    lookback_days=45,
+    min_sample=10,
+    usage_floor=0.12,
+    damage_threshold=0.38,
+):
+    """Create a dedicated batter-vs-pitcher pitch-mix matchup feature.
+
+    This evaluates how often the batter has produced damaging contact against the
+    pitch types the pitcher uses most frequently, giving the model an explicit
+    matchup signal instead of relying only on indirect proxies.
+    """
+    if rows_df is None or getattr(rows_df, 'empty', True):
+        return pd.Series([0.0] * 0, dtype=float)
+
+    if statcast_df is None or getattr(statcast_df, 'empty', True):
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    required = {'batter', 'pitcher', 'pitch_type'}
+    if not required.issubset(set(statcast_df.columns)):
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    work = statcast_df.copy()
+    try:
+        if 'game_date' in work.columns:
+            work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+            cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=max(14, int(lookback_days)))
+            work = work[work['game_date'] >= cutoff]
+    except Exception:
+        pass
+
+    if work.empty:
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    work['batter'] = pd.to_numeric(work['batter'], errors='coerce')
+    work['pitcher'] = pd.to_numeric(work['pitcher'], errors='coerce')
+    work = work.dropna(subset=['batter', 'pitcher', 'pitch_type']).copy()
+    if work.empty:
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    if 'launch_speed' in work.columns:
+        hard_hit = pd.to_numeric(work['launch_speed'], errors='coerce').fillna(0.0) >= 95.0
+    else:
+        hard_hit = pd.Series([False] * len(work), index=work.index)
+
+    if 'events' in work.columns:
+        is_hr = work['events'].astype(str).str.lower().eq('home_run')
+    else:
+        is_hr = pd.Series([False] * len(work), index=work.index)
+
+    if 'estimated_woba_using_speedangle' in work.columns:
+        xwoba = pd.to_numeric(work['estimated_woba_using_speedangle'], errors='coerce').fillna(0.0)
+        loud_xwoba = xwoba >= 0.600
+    else:
+        loud_xwoba = pd.Series([False] * len(work), index=work.index)
+
+    work['damaging_contact'] = (hard_hit | is_hr | loud_xwoba).astype(int)
+
+    by_matchup = work.groupby(['batter', 'pitcher', 'pitch_type'], as_index=False).agg(
+        sample_size=('pitch_type', 'count'),
+        damage_rate=('damaging_contact', 'mean'),
+    )
+    if by_matchup.empty:
+        return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
+
+    by_matchup['pitcher_total'] = by_matchup.groupby(['batter', 'pitcher'])['sample_size'].transform('sum')
+    by_matchup['usage_rate'] = by_matchup['sample_size'] / by_matchup['pitcher_total'].clip(lower=1)
+
+    vulnerable = by_matchup[
+        (by_matchup['sample_size'] >= max(1, int(min_sample)))
+        & (by_matchup['usage_rate'] >= float(usage_floor))
+        & (by_matchup['damage_rate'] >= float(damage_threshold))
+    ].copy()
+
+    def _score_for_row(row):
+        try:
+            batter_id = int(row.get('batter', np.nan))
+            pitcher_id = int(row.get('pitcher', np.nan))
+        except Exception:
+            return 0.0
+        if pd.isna(batter_id) or pd.isna(pitcher_id):
+            return 0.0
+
+        subset = vulnerable[(vulnerable['batter'] == batter_id) & (vulnerable['pitcher'] == pitcher_id)]
+        if subset.empty:
+            return 0.0
+        weighted_damage = subset['usage_rate'].mul(subset['damage_rate'])
+        if weighted_damage.empty:
+            return 0.0
+        score = float(np.clip(weighted_damage.mean(), 0.0, 1.0))
+        return score
+
+    return rows_df.apply(_score_for_row, axis=1).astype(float)
+
 
 def apply_park_adjustment(prob, batter_hand, home_team, away_team):
     """IMPROVEMENT #3: Park-Adjusted Metrics
@@ -6261,6 +6475,26 @@ def generate_daily_predictions():
     train_df = raw_pa.drop(columns=_drop_all, errors='ignore').merge(b_stats, on='batter', how='inner')
     train_df = train_df.merge(p_stats, on='pitcher', how='inner')
     train_df = build_matchup_weather_features(train_df)
+    train_df['batter_pitch_mix_matchup_score'] = build_batter_pitch_mix_matchup_feature(
+        statcast_df,
+        train_df[['batter', 'pitcher']],
+        lookback_days=max(21, _env_int('PREGAME_PITCH_MIX_LOOKBACK_DAYS', 45)),
+        min_sample=max(3, _env_int('PREGAME_PITCH_MIX_MIN_SAMPLE', 10)),
+        usage_floor=float(np.clip(_env_float('PREGAME_PITCH_MIX_USAGE_FLOOR', 0.12), 0.05, 0.4)),
+        damage_threshold=float(np.clip(_env_float('PREGAME_PITCH_MIX_DAMAGE_THRESHOLD', 0.38), 0.15, 0.70)),
+    )
+    train_df['recent_batter_woba_proxy'] = build_recent_batter_woba_proxy(
+        statcast_df,
+        train_df[['batter', 'pitcher']],
+        lookback_days=max(21, _env_int('RECENT_BATTER_WOBA_LOOKBACK_DAYS', 45)),
+        min_sample=max(2, _env_int('RECENT_BATTER_WOBA_MIN_SAMPLE', 4)),
+    )
+    train_df['recent_pitcher_damage_proxy'] = build_recent_pitcher_damage_proxy(
+        statcast_df,
+        train_df[['batter', 'pitcher']],
+        lookback_days=max(21, _env_int('RECENT_PITCHER_DAMAGE_LOOKBACK_DAYS', 45)),
+        min_sample=max(2, _env_int('RECENT_PITCHER_DAMAGE_MIN_SAMPLE', 4)),
+    )
 
     professional_default_cols = {
         'platoon_advantage_multiplier': 1.0,
@@ -6356,6 +6590,7 @@ def generate_daily_predictions():
         'micro_weather_score', 'lineup_slot_pressure_score', 'lineup_grab_window_score',
         'split_advantage_score', 'flyball_pitcher_target_score', 'hot_streak_contact_score',
         'arsenal_vulnerability_score', 'game_total_context_score',
+        'batter_pitch_mix_matchup_score', 'recent_batter_woba_proxy', 'recent_pitcher_damage_proxy',
 
         # Professional features used in live scoring and calibration
         'platoon_advantage_multiplier', 'breaking_pitch_vulnerability',
@@ -6647,6 +6882,26 @@ def generate_daily_predictions():
         .map(lambda x: pitch_mix_vuln_lookup.get(int(x), 0) if pd.notna(x) else 0)
         .fillna(0)
         .astype(float)
+    )
+    live['batter_pitch_mix_matchup_score'] = build_batter_pitch_mix_matchup_feature(
+        statcast_df,
+        live[['batter', 'pitcher']],
+        lookback_days=max(21, _env_int('PREGAME_PITCH_MIX_LOOKBACK_DAYS', 45)),
+        min_sample=max(3, _env_int('PREGAME_PITCH_MIX_MIN_SAMPLE', 10)),
+        usage_floor=float(np.clip(_env_float('PREGAME_PITCH_MIX_USAGE_FLOOR', 0.12), 0.05, 0.4)),
+        damage_threshold=float(np.clip(_env_float('PREGAME_PITCH_MIX_DAMAGE_THRESHOLD', 0.38), 0.15, 0.70)),
+    )
+    live['recent_batter_woba_proxy'] = build_recent_batter_woba_proxy(
+        statcast_df,
+        live[['batter', 'pitcher']],
+        lookback_days=max(21, _env_int('RECENT_BATTER_WOBA_LOOKBACK_DAYS', 45)),
+        min_sample=max(2, _env_int('RECENT_BATTER_WOBA_MIN_SAMPLE', 4)),
+    )
+    live['recent_pitcher_damage_proxy'] = build_recent_pitcher_damage_proxy(
+        statcast_df,
+        live[['batter', 'pitcher']],
+        lookback_days=max(21, _env_int('RECENT_PITCHER_DAMAGE_LOOKBACK_DAYS', 45)),
+        min_sample=max(2, _env_int('RECENT_PITCHER_DAMAGE_MIN_SAMPLE', 4)),
     )
     if pitch_mix_vuln_debug.get('pitchers_seen', 0) > 0:
         print(
@@ -7692,6 +7947,9 @@ def generate_daily_predictions():
         'release_extension_decay_ft': 0.0,
         'spin_velocity_ratio_decay': 0.0,
         'primary_weapon_vulnerable_pitch_count': 0.0,
+        'batter_pitch_mix_matchup_score': 0.0,
+        'recent_batter_woba_proxy': 0.0,
+        'recent_pitcher_damage_proxy': 0.0,
         'bullpen_exposure_multiplier': 1.0,
         'lineup_protection_woba_proxy': 0.10,
         'context_multiplier': 1.0,
@@ -7754,6 +8012,25 @@ def generate_daily_predictions():
         else:
             live[_col] = _coerce_numeric_column(live.get(_col), _default, live.index)
 
+    market_defaults = {
+        'sharp_book': np.nan,
+        'sharp_market_odds_american': np.nan,
+        'sharp_market_implied_prob': np.nan,
+        'retail_book': np.nan,
+        'retail_market_odds_american': np.nan,
+        'retail_market_implied_prob': np.nan,
+        'sharp_retail_odds_gap': np.nan,
+        'sharp_retail_implied_gap': np.nan,
+        'best_book': np.nan,
+        'best_market_odds_american': np.nan,
+        'best_market_implied_prob': np.nan,
+        'market_prob': np.nan,
+        'market_edge_pct': np.nan,
+    }
+    for _col, _default in market_defaults.items():
+        if _col not in live.columns:
+            live[_col] = pd.Series([_default] * len(live), index=live.index)
+
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
                                     'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
                                     'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
@@ -7785,6 +8062,7 @@ def generate_daily_predictions():
                                     'ballistic_barrier_distance_ft', 'ballistic_carry_gap_ft', 'ballistic_multiplier',
                                     'spin_decay_rpm', 'spin_decay_flag', 'release_pos_x_std_15', 'release_pos_z_std_15',
                                     'release_extension_decay_ft', 'spin_velocity_ratio_decay', 'primary_weapon_vulnerable_pitch_count',
+                                    'recent_batter_woba_proxy', 'recent_pitcher_damage_proxy',
                                     'bullpen_exposure_multiplier',
                                     'lineup_protection_woba_proxy', 'context_multiplier',
                                     'recent_calibration_multiplier', 'recent_calibration_ratio_raw',
@@ -7801,6 +8079,9 @@ def generate_daily_predictions():
     discord_top_ev_n = max(3, _env_int('DISCORD_TOP_EV_COUNT', 12))
     discord_rows_per_message = max(5, _env_int('DISCORD_ROWS_PER_MESSAGE', 10))
     discord_min_prob = _env_float('DISCORD_MIN_PROB', 0.015)
+    discord_min_edge_pct = _env_float('DISCORD_MIN_EDGE_PCT', 4.0)
+    discord_min_ev_pct = _env_float('DISCORD_MIN_EV_PCT', 8.0)
+    discord_min_kelly = _env_float('DISCORD_MIN_KELLY', 0.02)
     discord_radar_n = max(8, _env_int('DISCORD_RADAR_COUNT', 20))
     discord_window_1_hours = max(1, _env_int('DISCORD_WINDOW_1_HOURS', 2))
     discord_window_2_hours = max(discord_window_1_hours + 1, _env_int('DISCORD_WINDOW_2_HOURS', 6))
@@ -7811,6 +8092,12 @@ def generate_daily_predictions():
         by=['portfolio_action_score', 'hr_probability', 'ev_pct', 'kelly_fraction'],
         ascending=[False, False, False, False]
     ).reset_index(drop=True)
+    prob_pool = prob_pool[
+        (pd.to_numeric(prob_pool.get('hr_probability', 0.0), errors='coerce').fillna(0.0) >= discord_min_prob)
+        & (pd.to_numeric(prob_pool.get('edge_pct', 0.0), errors='coerce').fillna(0.0) >= discord_min_edge_pct)
+        & (pd.to_numeric(prob_pool.get('ev_pct', 0.0), errors='coerce').fillna(0.0) >= discord_min_ev_pct)
+        & (pd.to_numeric(prob_pool.get('kelly_fraction', 0.0), errors='coerce').fillna(0.0) >= discord_min_kelly)
+    ].copy()
     top_prob = _select_thresholded_candidates(prob_pool, discord_min_prob, discord_top_prob_n)
     if top_prob.empty:
         print(f"No predictions met the minimum Discord confidence threshold ({discord_min_prob * 100:.0f}%).")
@@ -7825,7 +8112,11 @@ def generate_daily_predictions():
         ]]
     ).copy()
     radar = _finalize_discord_radar_frame(radar)
-    radar = radar[radar['hr_probability'] >= max(0.010, discord_min_prob * 0.7)]
+    radar = radar[
+        (radar['hr_probability'] >= max(0.010, discord_min_prob * 0.7))
+        & (pd.to_numeric(radar.get('edge_pct', 0.0), errors='coerce').fillna(0.0) >= max(2.0, discord_min_edge_pct * 0.5))
+        & (pd.to_numeric(radar.get('ev_pct', 0.0), errors='coerce').fillna(0.0) >= max(3.0, discord_min_ev_pct * 0.5))
+    ]
 
     top_keys = set(zip(top_prob['batter_name'].astype(str), top_prob['pitcher_name'].astype(str)))
     radar = radar[
@@ -8857,16 +9148,32 @@ def _resolve_auto_wager_endpoint(book_key, book_config):
     return None, {}
 
 
-def _estimate_auto_wager_stake(kelly_fraction):
-    bankroll = max(0.0, _env_float('AUTO_WAGER_BANKROLL_USD', 1000.0))
-    stake_floor = max(0.0, _env_float('AUTO_WAGER_MIN_STAKE_USD', 5.0))
-    stake_cap = max(stake_floor, _env_float('AUTO_WAGER_MAX_STAKE_USD', 50.0))
-    kelly_mult = max(0.0, _env_float('AUTO_WAGER_KELLY_MULTIPLIER', 0.25))
+def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=None, max_stake_usd=None, kelly_multiplier=None):
+    """Estimate a practical stake from a bankroll and Kelly fraction.
+
+    This keeps the staking logic reusable for both auto-wager execution and
+    human-readable shortlist reporting. The default env names are split so the
+    same helper can be used without coupling to the auto-wager subsystem.
+    """
+    bankroll = max(0.0, _env_float('BET_STAKE_BANKROLL_USD', bankroll_usd if bankroll_usd is not None else 1000.0))
+    stake_floor = max(0.0, _env_float('BET_STAKE_MIN_USD', min_stake_usd if min_stake_usd is not None else 5.0))
+    stake_cap = max(stake_floor, _env_float('BET_STAKE_MAX_USD', max_stake_usd if max_stake_usd is not None else 50.0))
+    kelly_mult = max(0.0, _env_float('BET_STAKE_KELLY_MULTIPLIER', kelly_multiplier if kelly_multiplier is not None else 0.25))
     kf = max(0.0, _safe_float(kelly_fraction, 0.0) or 0.0)
     stake = bankroll * kf * kelly_mult
     if stake <= 0:
         return 0.0
     return float(np.clip(stake, stake_floor, stake_cap))
+
+
+def _estimate_auto_wager_stake(kelly_fraction):
+    return _estimate_bet_stake_usd(
+        kelly_fraction,
+        bankroll_usd=_env_float('AUTO_WAGER_BANKROLL_USD', 1000.0),
+        min_stake_usd=_env_float('AUTO_WAGER_MIN_STAKE_USD', 5.0),
+        max_stake_usd=_env_float('AUTO_WAGER_MAX_STAKE_USD', 50.0),
+        kelly_multiplier=_env_float('AUTO_WAGER_KELLY_MULTIPLIER', 0.25),
+    )
 
 
 def _execute_auto_wager_direct_api(
