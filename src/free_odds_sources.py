@@ -435,16 +435,38 @@ def _discover_default_local_odds_files() -> Tuple[List[str], List[str]]:
         data_dir / "free_odds.json",
         data_dir / "odds.json",
         data_dir / "market_odds.json",
+        data_dir / "hr_props.json",
+        data_dir / "hr_prop_market.json",
+        Path("hr_prop_odds.json"),
+        Path("free_odds.json"),
+        Path("odds.json"),
+        Path("market_odds.json"),
     ]
     csv_candidates = [
         data_dir / "hr_prop_odds.csv",
         data_dir / "free_odds.csv",
         data_dir / "odds.csv",
         data_dir / "market_odds.csv",
+        data_dir / "hr_props.csv",
+        data_dir / "hr_prop_market.csv",
+        Path("hr_prop_odds.csv"),
+        Path("free_odds.csv"),
+        Path("odds.csv"),
+        Path("market_odds.csv"),
     ]
 
-    json_paths = [str(path) for path in json_candidates if path.exists()]
-    csv_paths = [str(path) for path in csv_candidates if path.exists()]
+    seen = set()
+    json_paths = []
+    for path in json_candidates:
+        if path and str(path) not in seen and path.exists():
+            json_paths.append(str(path))
+            seen.add(str(path))
+
+    csv_paths = []
+    for path in csv_candidates:
+        if path and str(path) not in seen and path.exists():
+            csv_paths.append(str(path))
+            seen.add(str(path))
     return json_paths, csv_paths
 
 

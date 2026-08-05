@@ -1410,13 +1410,16 @@ def print_bet_ready_wagers(date_str=None, top_n=15):
     keep_cols = [
         'batter_name', 'pitcher_name', 'pred_hr_prob', 'best_book',
         'best_market_odds_american', 'fair_odds_american',
-        'ev_percent', 'edge_pct', 'kelly_fraction', 'stake_usd', 'game_time'
+        'ev_percent', 'edge_pct', 'kelly_fraction', 'stake_usd', 'actionability_score', 'game_time'
     ]
     keep_cols = [c for c in keep_cols if c in actionable.columns]
     actionable['stake_usd'] = actionable['kelly_fraction'].apply(_estimate_bet_stake_usd)
+    actionable['actionability_score'] = actionable.apply(_estimate_actionability_score, axis=1)
+    min_actionability = _env_float('BET_READY_MIN_ACTIONABILITY_SCORE', 12.0)
+    actionable = actionable[actionable['actionability_score'] >= min_actionability].copy()
     report = actionable[keep_cols].sort_values(
-        by=['ev_percent', 'kelly_fraction'],
-        ascending=[False, False]
+        by=['actionability_score', 'ev_percent', 'kelly_fraction'],
+        ascending=[False, False, False]
     ).head(max(1, int(top_n))).reset_index(drop=True)
 
     print("\nBET-READY WAGERS (+EV, ODDS-VALIDATED):")
@@ -1480,6 +1483,8 @@ def print_conservative_bet_ready_wagers(date_str=None, top_n=10):
             preds['is_positive_ev_bool'] = False
 
     preds['model_reliability'] = preds.get('model_reliability', 'MEDIUM').astype(str).str.upper()
+    if 'best_market_odds_american' not in preds.columns:
+        preds['best_market_odds_american'] = np.nan
     preds['has_market_odds'] = preds.get('best_market_odds_american', pd.Series([np.nan] * len(preds))).notna()
 
     min_american = _env_int('CONSERVATIVE_MIN_AMERICAN_ODDS', -220)
@@ -1513,20 +1518,41 @@ def print_conservative_bet_ready_wagers(date_str=None, top_n=10):
     ].copy()
 
     if shortlist.empty:
-        print("No conservative shortlist: no rows passed strict risk filters.")
-        return shortlist
+        shortlist = preds[
+            reliability_gate &
+            (preds['pred_hr_prob'] >= max(min_prob * 0.5, 0.02)) &
+            (preds['pred_hr_prob'] <= max_prob)
+        ].copy()
+        if shortlist.empty:
+            print("No conservative shortlist: no rows passed strict risk filters.")
+            return shortlist
+        print("Strict conservative filters returned no rows; falling back to a broader model-driven shortlist.")
 
+    shortlist_base = shortlist.copy()
     shortlist['conservative_score'] = (
         shortlist['kelly_fraction'].fillna(0) * 100
         + shortlist['ev_percent'].fillna(0)
         + shortlist['edge_pct'].fillna(0) / 2.0
     )
     shortlist['stake_usd'] = shortlist['kelly_fraction'].apply(_estimate_bet_stake_usd)
+    shortlist['actionability_score'] = shortlist.apply(_estimate_actionability_score, axis=1)
+    min_actionability = _env_float('CONSERVATIVE_MIN_ACTIONABILITY_SCORE', 18.0)
+    shortlist = shortlist[shortlist['actionability_score'] >= min_actionability].copy()
+    if shortlist.empty and not shortlist_base.empty:
+        shortlist = shortlist_base.copy()
+        shortlist['conservative_score'] = (
+            shortlist['kelly_fraction'].fillna(0) * 100
+            + shortlist['ev_percent'].fillna(0)
+            + shortlist['edge_pct'].fillna(0) / 2.0
+        )
+        shortlist['stake_usd'] = shortlist['kelly_fraction'].apply(_estimate_bet_stake_usd)
+        shortlist['actionability_score'] = shortlist.apply(_estimate_actionability_score, axis=1)
+        print("No rows survived the conservative actionability threshold; keeping the best-ranked fallback rows.")
 
     keep_cols = [
         'batter_name', 'pitcher_name', 'pred_hr_prob', 'model_reliability',
         'best_book', 'best_market_odds_american', 'fair_odds_american',
-        'edge_pct', 'ev_percent', 'kelly_fraction', 'stake_usd', 'conservative_score', 'game_time'
+        'edge_pct', 'ev_percent', 'kelly_fraction', 'stake_usd', 'actionability_score', 'conservative_score', 'game_time'
     ]
     keep_cols = [c for c in keep_cols if c in shortlist.columns]
     shortlist = shortlist.sort_values(
@@ -2848,6 +2874,8 @@ def _odds_provider_name():
         return 'sportsgameodds'
     if raw in {'theoddsapi', 'the-odds-api', 'oddsapi'}:
         return 'theoddsapi'
+    if raw in {'sharpapi', 'sharp_api', 'sharp-api'}:
+        return 'sharpapi'
     return 'sportsgameodds'
 
 
@@ -3325,6 +3353,105 @@ def _fetch_hr_props_raw_from_sportsgameodds(api_key):
     return parsed
 
 
+def _fetch_hr_props_raw_from_sharpapi(api_key):
+    """Fetch MLB HR props from sharpapi.io /odds endpoint (line=0.5 main-line props)."""
+    if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
+        return {}
+    if requests is None:
+        return {}
+
+    headers = {'X-API-Key': str(api_key or '').strip()}
+    base_url = 'https://api.sharpapi.io/api/v1/odds'
+    limit = 200
+    max_pages = max(1, int(float(os.getenv('SHARPAPI_MAX_PAGES', '10'))))
+
+    raw_rows = []
+    offset = 0
+    cursor = None
+    for _ in range(max_pages):
+        params = {
+            'sport': 'baseball',
+            'league': 'MLB',
+            'market': 'player_home_runs',
+            'is_main_line': 'true',
+            'is_active': 'true',
+            'limit': str(limit),
+        }
+        if cursor:
+            params['cursor'] = cursor
+        else:
+            params['offset'] = str(offset)
+        try:
+            resp = requests.get(base_url, headers=headers, params=params, timeout=15)
+        except Exception as exc:
+            print(f"SharpAPI fetch error: {exc}")
+            break
+
+        if resp.status_code in (401, 403):
+            body = (resp.text or '')[:200]
+            _set_odds_invalid_key_cooldown(reason_text=body)
+            print(f"SharpAPI invalid key ({resp.status_code}): {body}")
+            return {}
+        if resp.status_code == 429:
+            _set_rate_limit_cooldown()
+            break
+        if resp.status_code != 200:
+            print(f"SharpAPI returned {resp.status_code}: {resp.text[:200]}")
+            break
+
+        payload = resp.json()
+        batch = payload.get('data') or []
+        raw_rows.extend(batch)
+        pagination = payload.get('pagination', {})
+        cursor = pagination.get('next_cursor')
+        if not pagination.get('has_more') or not cursor:
+            break
+        offset += limit  # fallback; cursor takes priority
+
+    if not raw_rows:
+        return {}
+
+    # Build {player: {book: american_odds}} keeping best (lowest absolute) odds per book.
+    out: dict = {}
+    today_local = datetime.today().date()
+    allowed_dates = {today_local, today_local + timedelta(days=1)}
+    for row in raw_rows:
+        if not row.get('is_active', True):
+            continue
+        # Only keep the "over" (hit at least 1 HR) side; under odds are not HR props.
+        if str(row.get('selection_type', 'over')).lower() not in {'over', 'yes', ''}:
+            continue
+        player = str(row.get('player_name') or row.get('selection') or '').strip()
+        book = str(row.get('sportsbook') or 'unknown').strip().lower()
+        odds_raw = row.get('odds_american')
+        if not player or odds_raw is None:
+            continue
+        try:
+            odds_i = int(round(float(odds_raw)))
+        except Exception:
+            continue
+        # HR over props must be positive American odds (underdogs); negative = under/favorite side.
+        if odds_i <= 0 or odds_i < 100 or odds_i > 15000:
+            continue
+        # Date guard — reject stale props
+        start_raw = row.get('event_start_time', '')
+        if start_raw:
+            try:
+                ev_date = datetime.fromisoformat(start_raw.replace('Z', '+00:00')).date()
+                if ev_date not in allowed_dates:
+                    continue
+            except Exception:
+                pass
+        out.setdefault(player, {})[book] = odds_i
+
+    if out:
+        n_pairs = sum(len(v) for v in out.values())
+        print(f"SharpAPI HR props: {n_pairs} book-player pairs across {len(out)} players")
+    else:
+        print("SharpAPI returned no recognized HR prop outcomes in current slate.")
+    return out
+
+
 def _filter_current_slate_odds_events(events_payload, source_label='odds'):
     """Keep only current-slate odds events and reject stale historical events.
 
@@ -3672,12 +3799,14 @@ def fetch_hr_prop_odds():
             return _fetch_hr_props_raw_from_odds_api(api_key)
         if provider_name == 'sportsgameodds':
             return _fetch_hr_props_raw_from_sportsgameodds(api_key)
+        if provider_name == 'sharpapi':
+            return _fetch_hr_props_raw_from_sharpapi(api_key)
         return {}
 
     try:
         candidates = []
         if provider in {'auto', 'fallback'}:
-            candidates = ['sportsgameodds', 'theoddsapi']
+            candidates = ['sharpapi', 'sportsgameodds', 'theoddsapi']
         else:
             candidates = [provider]
 
@@ -3748,6 +3877,8 @@ def fetch_hr_prop_odds_raw():
     try:
         if provider == 'theoddsapi':
             raw = _fetch_hr_props_raw_from_odds_api(api_key)
+        elif provider == 'sharpapi':
+            raw = _fetch_hr_props_raw_from_sharpapi(api_key)
         else:
             raw = _fetch_hr_props_raw_from_sportsgameodds(api_key)
         if raw and _is_placeholder_raw_odds_payload(raw):
@@ -4136,7 +4267,27 @@ def get_advanced_hr_metrics(days_back=60):
     ).reset_index()
     batter_stats['bat_hr_fb_rate'] = batter_stats['bat_total_hr'] / batter_stats['bat_total_fb'].clip(lower=1)
     batter_stats['bat_pull_rate'] = batter_stats['bat_pulled_fly_count'] / batter_stats['bat_total_fb'].clip(lower=1)
+
+    # HR rate split by opposing pitcher handedness (RHP vs LHP).
+    pa_df['p_throws'] = pa_df.get('p_throws', pd.Series(['R'] * len(pa_df), index=pa_df.index)).fillna('R')
+    _vs_rhp = pa_df[pa_df['p_throws'] == 'R'].groupby('batter', as_index=False).agg(
+        bat_hr_rate_vs_rhp=('is_hr', 'mean'), bat_pa_vs_rhp=('is_hr', 'count'))
+    _vs_lhp = pa_df[pa_df['p_throws'] == 'L'].groupby('batter', as_index=False).agg(
+        bat_hr_rate_vs_lhp=('is_hr', 'mean'), bat_pa_vs_lhp=('is_hr', 'count'))
+    batter_stats = batter_stats.merge(_vs_rhp[['batter', 'bat_hr_rate_vs_rhp']], on='batter', how='left')
+    batter_stats = batter_stats.merge(_vs_lhp[['batter', 'bat_hr_rate_vs_lhp']], on='batter', how='left')
+    batter_stats['bat_hr_rate_vs_rhp'] = batter_stats['bat_hr_rate_vs_rhp'].fillna(batter_stats['bat_hr_rate'])
+    batter_stats['bat_hr_rate_vs_lhp'] = batter_stats['bat_hr_rate_vs_lhp'].fillna(batter_stats['bat_hr_rate'])
+
+    # Days since batter last hit a HR (recency/drought signal).
+    _today_ts = pd.Timestamp(datetime.today().date())
+    _last_hr = pa_df[pa_df['is_hr'] == 1].groupby('batter')['game_date'].max().reset_index()
+    _last_hr['bat_days_since_last_hr'] = (_today_ts - _last_hr['game_date']).dt.days.clip(0, 60)
+    batter_stats = batter_stats.merge(_last_hr[['batter', 'bat_days_since_last_hr']], on='batter', how='left')
+    batter_stats['bat_days_since_last_hr'] = batter_stats['bat_days_since_last_hr'].fillna(30)
+
     batter_stats = batter_stats.merge(recent_batter, on='batter', how='left')
+
     batter_stats = batter_stats.merge(baseline_batter, on='batter', how='left')
     batter_stats['bat_barrel_rate_14d'] = pd.to_numeric(batter_stats.get('bat_barrel_rate_14d', np.nan), errors='coerce').fillna(batter_stats['bat_barrel_rate'])
     batter_stats['bat_hard_hit_rate_14d'] = pd.to_numeric(batter_stats.get('bat_hard_hit_rate_14d', np.nan), errors='coerce').fillna(batter_stats['bat_hard_hit_rate'])
@@ -4243,6 +4394,19 @@ def get_today_matchups():
         probable_home_pitcher = game.get('home_probable_pitcher', 'Unknown Pitcher')
         probable_away_pitcher = game.get('away_probable_pitcher', 'Unknown Pitcher')
 
+        # Resolve probable pitcher names to MLBAM IDs for Statcast feature lookup.
+        def _resolve_pitcher_id(name):
+            if not name or name in ('Unknown Pitcher', 'TBD', ''):
+                return None
+            try:
+                results = statsapi.lookup_player(name, gameType='R')
+                if results:
+                    return int(results[0]['id'])
+            except Exception:
+                pass
+            return None
+        probable_home_pitcher_id = _resolve_pitcher_id(probable_home_pitcher)
+        probable_away_pitcher_id = _resolve_pitcher_id(probable_away_pitcher)
         # Pull geolocation data via venue metadata or fallback to baseline coordinate mappings
         venue_id = game.get('venue_id', 0)
         venue_data = statsapi.get('venue', {'venueIds': str(venue_id)})
@@ -4364,6 +4528,10 @@ def get_today_matchups():
 
                     if not pitcher_name or pitcher_name == 'Unknown Pitcher':
                         pitcher_name = probable_away_pitcher if team_type == 'home' else probable_home_pitcher
+
+                    # Fall back to pre-resolved probable pitcher ID when boxscore hasn't populated yet.
+                    if not pitcher_id:
+                        pitcher_id = probable_away_pitcher_id if team_type == 'home' else probable_home_pitcher_id
 
                     matchups.append({
                         'game_pk': game_id,
@@ -4839,6 +5007,73 @@ def _tv_distance(vec_a, vec_b):
     return 0.5 * sum(abs(float(vec_a.get(k, 0.0)) - float(vec_b.get(k, 0.0))) for k in keys)
 
 
+def build_batter_recent_hr_features(statcast_df, rows_df, short_days=7, long_days=14):
+    """Build recent HR count and rate features for batters over short and long windows."""
+    if rows_df is None or getattr(rows_df, 'empty', True):
+        return pd.DataFrame(index=getattr(rows_df, 'index', pd.RangeIndex(0)))
+    empty_result = pd.DataFrame({
+        'batter_hr_last_7d': 0.0,
+        'batter_hr_last_14d': 0.0,
+        'batter_hr_rate_7d': 0.0,
+        'batter_hr_rate_14d': 0.0,
+    }, index=rows_df.index)
+    if statcast_df is None or getattr(statcast_df, 'empty', True) or 'batter' not in statcast_df.columns:
+        return empty_result
+
+    work = statcast_df.copy()
+    try:
+        work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+        today = pd.Timestamp(datetime.today().date())
+        work = work[work['game_date'] < today].copy()
+    except Exception:
+        pass
+
+    work['batter'] = pd.to_numeric(work['batter'], errors='coerce')
+    work = work.dropna(subset=['batter']).copy()
+    if work.empty:
+        return empty_result
+
+    if 'events' in work.columns:
+        work['is_hr'] = work['events'].astype(str).str.lower().eq('home_run').astype(int)
+    else:
+        work['is_hr'] = 0
+
+    today_ts = pd.Timestamp(datetime.today().date())
+    cut_short = today_ts - pd.Timedelta(days=short_days)
+    cut_long = today_ts - pd.Timedelta(days=long_days)
+
+    short_df = work[work['game_date'] >= cut_short]
+    long_df = work[work['game_date'] >= cut_long]
+
+    short_agg = short_df.groupby('batter', as_index=False).agg(
+        batter_hr_last_7d=('is_hr', 'sum'),
+        batter_pa_7d=('is_hr', 'count'),
+    )
+    long_agg = long_df.groupby('batter', as_index=False).agg(
+        batter_hr_last_14d=('is_hr', 'sum'),
+        batter_pa_14d=('is_hr', 'count'),
+    )
+
+    def _score(row):
+        try:
+            batter_id = int(row.get('batter', np.nan))
+        except Exception:
+            return pd.Series({'batter_hr_last_7d': 0.0, 'batter_hr_last_14d': 0.0,
+                              'batter_hr_rate_7d': 0.033, 'batter_hr_rate_14d': 0.033})
+        s = short_agg[short_agg['batter'] == batter_id]
+        l = long_agg[long_agg['batter'] == batter_id]
+        hr7 = float(s['batter_hr_last_7d'].iloc[0]) if not s.empty else 0.0
+        pa7 = float(s['batter_pa_7d'].iloc[0]) if not s.empty else 0.0
+        hr14 = float(l['batter_hr_last_14d'].iloc[0]) if not l.empty else 0.0
+        pa14 = float(l['batter_pa_14d'].iloc[0]) if not l.empty else 0.0
+        rate7 = hr7 / pa7 if pa7 >= 5 else 0.033
+        rate14 = hr14 / pa14 if pa14 >= 10 else 0.033
+        return pd.Series({'batter_hr_last_7d': hr7, 'batter_hr_last_14d': hr14,
+                          'batter_hr_rate_7d': rate7, 'batter_hr_rate_14d': rate14})
+
+    return rows_df.apply(_score, axis=1).astype(float)
+
+
 def build_recent_batter_woba_proxy(statcast_df, rows_df, lookback_days=45, min_sample=4):
     """Create a recent batter wOBA proxy from Statcast xwOBA-style signals."""
     if rows_df is None or getattr(rows_df, 'empty', True):
@@ -5285,10 +5520,33 @@ def _ensure_discord_radar_columns(rankings_df):
     if 'physics_delta' not in work.columns:
         work['physics_delta'] = 0.0
 
-    if 'ev_pct' not in work.columns and 'ev_percent' in work.columns:
-        work['ev_pct'] = pd.to_numeric(work['ev_percent'], errors='coerce').fillna(0.0)
+    if 'ev_pct' not in work.columns:
+        if 'ev_percent' in work.columns:
+            work['ev_pct'] = pd.to_numeric(work['ev_percent'], errors='coerce').fillna(0.0)
+        else:
+            work['ev_pct'] = 0.0
+
+    if 'portfolio_action_score' not in work.columns:
+        work['portfolio_action_score'] = _build_portfolio_action_score(work)
 
     return work
+
+
+def _build_portfolio_action_score(frame):
+    """Return a robust portfolio action score series for Discord/radar ranking."""
+    if frame is None:
+        return pd.Series(dtype=float)
+
+    if not isinstance(frame, pd.DataFrame):
+        return pd.Series([0.0], dtype=float)
+
+    if frame.empty:
+        return pd.Series(dtype=float, index=frame.index)
+
+    hr_prob = _coerce_numeric_column(frame, 'hr_probability', default=0.0)
+    ev_pct = _coerce_numeric_column(frame, 'ev_pct', default=0.0)
+    physics_delta_abs = _coerce_numeric_column(frame, 'physics_delta_abs', default=0.0)
+    return (hr_prob * 100.0) + (ev_pct * 0.5) + (physics_delta_abs * 0.1)
 
 
 def _finalize_discord_radar_frame(rankings_df):
@@ -5299,7 +5557,9 @@ def _finalize_discord_radar_frame(rankings_df):
     work = _ensure_discord_radar_columns(rankings_df).copy()
     work['hr_probability'] = _coerce_numeric_column(work, 'hr_probability', default=0.0)
     work['physics_delta'] = _coerce_numeric_column(work, 'physics_delta', default=0.0)
+    work['ev_pct'] = _coerce_numeric_column(work, 'ev_pct', default=0.0)
     work['physics_delta_abs'] = work['physics_delta'].abs()
+    work['portfolio_action_score'] = _build_portfolio_action_score(work)
     return work
 
 
@@ -5409,7 +5669,27 @@ def _prepare_discord_rankings(live_df):
     market_prob = _coerce_numeric_column(work, 'market_prob', default=np.nan)
     prob_edge_abs = (pred_prob - market_prob).fillna(0.0) if 'market_prob' in work.columns else pred_prob * 0.0
 
-    work['portfolio_action_score'] = (
+    out = work.copy()
+    if 'pred_hr_prob' in out.columns:
+        if 'hr_probability' in out.columns:
+            out = out.drop(columns=['pred_hr_prob'])
+        else:
+            out = out.rename(columns={'pred_hr_prob': 'hr_probability'})
+    if 'ev_percent' in out.columns:
+        if 'ev_pct' in out.columns:
+            out = out.drop(columns=['ev_percent'])
+        else:
+            out = out.rename(columns={'ev_percent': 'ev_pct'})
+
+    if 'model_reliability' not in out.columns:
+        out['model_reliability'] = 'MEDIUM'
+
+    out['hr_probability'] = pred_prob
+    out['edge_pct'] = edge_pct
+    out['ev_pct'] = ev_pct
+    out['kelly_fraction'] = kelly
+    out['specific_day_upside_score'] = upside
+    out['portfolio_action_score'] = (
         (pred_prob * 100.0) * 0.45
         + (edge_pct * 0.55)
         + (ev_pct * 0.35)
@@ -5417,11 +5697,7 @@ def _prepare_discord_rankings(live_df):
         + (upside * 100.0 * 0.20)
         + (prob_edge_abs * 100.0 * 0.25)
     )
-
-    rename_map = {'pred_hr_prob': 'hr_probability', 'ev_percent': 'ev_pct'}
-    if 'model_reliability' not in work.columns:
-        work['model_reliability'] = 'MEDIUM'
-    return work.rename(columns=rename_map)
+    return out
 
 
 def estimate_model_reliability(pred_prob, consistency_score, sample_size):
@@ -6514,6 +6790,9 @@ def generate_daily_predictions():
         lookback_days=max(21, _env_int('RECENT_PITCHER_DAMAGE_LOOKBACK_DAYS', 45)),
         min_sample=max(2, _env_int('RECENT_PITCHER_DAMAGE_MIN_SAMPLE', 4)),
     )
+    _train_recent_hr = build_batter_recent_hr_features(statcast_df, train_df[['batter', 'pitcher']])
+    for _rh_col in _train_recent_hr.columns:
+        train_df[_rh_col] = _train_recent_hr[_rh_col].values
 
     professional_default_cols = {
         'platoon_advantage_multiplier': 1.0,
@@ -6610,6 +6889,8 @@ def generate_daily_predictions():
         'split_advantage_score', 'flyball_pitcher_target_score', 'hot_streak_contact_score',
         'arsenal_vulnerability_score', 'game_total_context_score',
         'batter_pitch_mix_matchup_score', 'recent_batter_woba_proxy', 'recent_pitcher_damage_proxy',
+        'batter_hr_last_7d', 'batter_hr_last_14d', 'batter_hr_rate_7d', 'batter_hr_rate_14d',
+        'bat_hr_rate_vs_rhp', 'bat_hr_rate_vs_lhp', 'bat_days_since_last_hr',
 
         # Professional features used in live scoring and calibration
         'platoon_advantage_multiplier', 'breaking_pitch_vulnerability',
@@ -6922,6 +7203,9 @@ def generate_daily_predictions():
         lookback_days=max(21, _env_int('RECENT_PITCHER_DAMAGE_LOOKBACK_DAYS', 45)),
         min_sample=max(2, _env_int('RECENT_PITCHER_DAMAGE_MIN_SAMPLE', 4)),
     )
+    _recent_hr_cols = build_batter_recent_hr_features(statcast_df, live[['batter', 'pitcher']])
+    for _rh_col in _recent_hr_cols.columns:
+        live[_rh_col] = _recent_hr_cols[_rh_col].values
     if pitch_mix_vuln_debug.get('pitchers_seen', 0) > 0:
         print(
             "Pregame pitch-mix vulnerability proxy: "
@@ -6939,10 +7223,17 @@ def generate_daily_predictions():
         for issue in live_dataflow_issues:
             print(f"  - {issue}")
 
-    # Fill missing numeric features with reasonable baselines
-    for col in ['bat_pa_count', 'bat_hr_rate', 'bat_barrel_rate', 'bat_hard_hit_rate', 'bat_sweet_spot_rate']:
+    # Fix: unknown batters get MLB league-average features instead of zeros so they aren't predicted at 0%.
+    _batter_league_avg = {
+        'bat_pa_count': 0,
+        'bat_hr_rate': 0.033,
+        'bat_barrel_rate': 0.080,
+        'bat_hard_hit_rate': 0.380,
+        'bat_sweet_spot_rate': 0.360,
+    }
+    for col, default in _batter_league_avg.items():
         if col in live.columns:
-            live[col] = live[col].fillna(0)
+            live[col] = live[col].fillna(default)
     if 'bat_wrc_plus' in live.columns:
         live['bat_wrc_plus'] = live['bat_wrc_plus'].fillna(100)  # League average
     for col in ['pitch_pa_count', 'pitch_hr_allowed_rate', 'pitch_barrel_allowed_rate', 'pitch_hard_hit_allowed_rate', 'pitch_sweet_spot_allowed_rate']:
@@ -6971,6 +7262,23 @@ def generate_daily_predictions():
     live['pitch_hr_per_9'] = live['pitch_hr_per_9'].fillna(1.10)
     live['wind_out_component'] = live['wind_out_component'].fillna(0.0)
     live['bat_pull_rate'] = live['bat_pull_rate'].fillna(0.38)
+    for _rh_col in ['batter_hr_last_7d', 'batter_hr_last_14d']:
+        if _rh_col in live.columns:
+            live[_rh_col] = live[_rh_col].fillna(0.0)
+    for _rh_col in ['batter_hr_rate_7d', 'batter_hr_rate_14d']:
+        if _rh_col in live.columns:
+            live[_rh_col] = live[_rh_col].fillna(0.033)
+    for _col, _default in [('bat_hr_rate_vs_rhp', 0.033), ('bat_hr_rate_vs_lhp', 0.033),
+                            ('bat_days_since_last_hr', 30.0)]:
+        if _col in live.columns:
+            live[_col] = live[_col].fillna(_default)
+        else:
+            live[_col] = _default
+    # Use handedness-split HR rate when pitcher hand is known.
+    if 'pitcher_hand' in live.columns and 'bat_hr_rate_vs_rhp' in live.columns:
+        p_throws = live['pitcher_hand'].astype(str).str.upper().str.strip()
+        live['bat_hr_rate_vs_rhp'] = live['bat_hr_rate_vs_rhp'].fillna(0.033)
+        live['bat_hr_rate_vs_lhp'] = live['bat_hr_rate_vs_lhp'].fillna(0.033)
     if 'lineup_pa_expectation' in live.columns:
         live['lineup_pa_expectation'] = pd.to_numeric(live['lineup_pa_expectation'], errors='coerce').fillna(4.22)
     else:
@@ -7520,6 +7828,19 @@ def generate_daily_predictions():
         edge = p * _b - (1 - p)
         return max(round(edge / _b * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
 
+    # Direct pitcher-damage signal boost: recent_pitcher_damage_proxy has ~0.33 correlation
+    # with actual HRs but the ML model under-weights it. Apply as a final multiplier.
+    use_damage_boost = str(os.getenv('PITCHER_DAMAGE_BOOST_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if use_damage_boost and 'recent_pitcher_damage_proxy' in live.columns:
+        damage_proxy = pd.to_numeric(live['recent_pitcher_damage_proxy'], errors='coerce').fillna(0.0)
+        damage_center = float(np.clip(_env_float('PITCHER_DAMAGE_CENTER', 0.40), 0.10, 0.60))
+        damage_strength = float(np.clip(_env_float('PITCHER_DAMAGE_BOOST_STRENGTH', 1.25), 0.0, 3.0))
+        # 0.0 means no statcast match (pitcher ID missing) — treat as neutral, not penalized
+        damage_proxy_adj = damage_proxy.where(damage_proxy > 0.0, damage_center)
+        damage_boost = np.clip(1.0 + (damage_proxy_adj.values - damage_center) * damage_strength, 0.60, 1.45)
+        probs = np.clip(probs * damage_boost, 0.0, 0.99)
+        live['pitcher_damage_boost'] = damage_boost
+
     live['pred_hr_prob'] = probs
     if 'game_pk' in live.columns:
         game_count_value = int(pd.to_numeric(live['game_pk'], errors='coerce').dropna().nunique())
@@ -7545,11 +7866,11 @@ def generate_daily_predictions():
     if use_recent_calibration:
         recent_cal_diag = {'applied': False, 'reason': 'not_run'}
         recent_days = max(3, _env_int('RECENT_CALIBRATION_DAYS', 7))
-        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.70), 0.0, 1.0))
+        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.55), 0.0, 1.0))
         recent_min_rows = max(200, _env_int('RECENT_CALIBRATION_MIN_ROWS', 600))
         recent_min_files = max(2, _env_int('RECENT_CALIBRATION_MIN_FILES', 3))
         recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.90), 0.5, 1.2))
-        recent_max_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MAX_MULTIPLIER', 1.90), 1.0, 2.5))
+        recent_max_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MAX_MULTIPLIER', 1.40), 1.0, 2.5))
 
         live, recent_cal_diag = apply_recent_calibration_correction(
             live,
@@ -7627,7 +7948,9 @@ def generate_daily_predictions():
     # If labels collapse to one tier, use slate-relative fallback ranks to preserve
     # meaningful color separation while staying tied to model probability + consistency.
     unique_levels = set(str(x).upper() for x in reliability_levels)
-    if len(unique_levels) <= 1 and len(reliability_levels) >= 20:
+    n_high_raw = sum(1 for r in reliability_levels if str(r).upper() == 'HIGH')
+    # Fire fallback when fewer than 5% are HIGH, regardless of whether MEDIUM exists.
+    if n_high_raw < max(1, int(len(reliability_levels) * 0.05)) and len(reliability_levels) >= 20:
         probs_np = pd.to_numeric(pd.Series(pred_prob_series), errors='coerce').fillna(0.0)
         cons_np = pd.to_numeric(pd.Series(consistency_scores), errors='coerce').fillna(0.5)
         prob_rank = probs_np.rank(pct=True)
@@ -8050,6 +8373,9 @@ def generate_daily_predictions():
         if _col not in live.columns:
             live[_col] = pd.Series([_default] * len(live), index=live.index)
 
+    if 'pitcher_damage_boost' not in live.columns:
+        live['pitcher_damage_boost'] = np.nan
+
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
                                     'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
                                     'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
@@ -8086,6 +8412,7 @@ def generate_daily_predictions():
                                     'lineup_protection_woba_proxy', 'context_multiplier',
                                     'recent_calibration_multiplier', 'recent_calibration_ratio_raw',
                                     'recent_calibration_pred_mean', 'recent_calibration_actual_mean',
+                                    'pitcher_damage_boost',
                                     'confidence_lower_95pct', 'confidence_upper_95pct', 'model_reliability', 'batter_consistency_score',
                                     'model_name', 'prediction_timestamp']])
 
@@ -8107,15 +8434,17 @@ def generate_daily_predictions():
     print(f"Discord threshold resolved: {discord_min_prob * 100:.1f}%")
 
     # Top probabilities for reporting/Discord delivery.
+    has_market_data = (
+        'best_market_odds_american' in live.columns
+        and pd.to_numeric(live['best_market_odds_american'], errors='coerce').notna().any()
+    )
+    # Most Likely Homers is a pure probability ranking — market-edge gates belong in +EV section only.
     prob_pool = rankings.sort_values(
-        by=['portfolio_action_score', 'hr_probability', 'ev_pct', 'kelly_fraction'],
+        by=['hr_probability', 'portfolio_action_score', 'ev_pct', 'kelly_fraction'],
         ascending=[False, False, False, False]
     ).reset_index(drop=True)
     prob_pool = prob_pool[
-        (pd.to_numeric(prob_pool.get('hr_probability', 0.0), errors='coerce').fillna(0.0) >= discord_min_prob)
-        & (pd.to_numeric(prob_pool.get('edge_pct', 0.0), errors='coerce').fillna(0.0) >= discord_min_edge_pct)
-        & (pd.to_numeric(prob_pool.get('ev_pct', 0.0), errors='coerce').fillna(0.0) >= discord_min_ev_pct)
-        & (pd.to_numeric(prob_pool.get('kelly_fraction', 0.0), errors='coerce').fillna(0.0) >= discord_min_kelly)
+        pd.to_numeric(prob_pool.get('hr_probability', 0.0), errors='coerce').fillna(0.0) >= discord_min_prob
     ].copy()
     top_prob = _select_thresholded_candidates(prob_pool, discord_min_prob, discord_top_prob_n)
     if top_prob.empty:
@@ -8142,17 +8471,11 @@ def generate_daily_predictions():
         ~radar.apply(lambda r: (str(r.get('batter_name', '')), str(r.get('pitcher_name', ''))) in top_keys, axis=1)
     ]
     radar = pd.DataFrame(radar).copy()
-    if 'portfolio_action_score' not in radar.columns:
-        hr_prob = pd.to_numeric(radar.get('hr_probability', 0.0), errors='coerce')
-        ev_pct = pd.to_numeric(radar.get('ev_pct', 0.0), errors='coerce')
-        physics_delta_abs = pd.to_numeric(radar.get('physics_delta_abs', 0.0), errors='coerce')
-        radar['portfolio_action_score'] = (
-            hr_prob.fillna(0.0) * 100.0
-            + ev_pct.fillna(0.0) * 0.5
-            + physics_delta_abs.fillna(0.0) * 0.1
-        )
+    radar = _finalize_discord_radar_frame(radar)
+    radar['portfolio_action_score'] = _build_portfolio_action_score(radar)
     radar['hr_probability'] = _coerce_numeric_column(radar, 'hr_probability', default=0.0)
     radar['physics_delta'] = _coerce_numeric_column(radar, 'physics_delta', default=0.0)
+    radar['ev_pct'] = _coerce_numeric_column(radar, 'ev_pct', default=0.0)
     radar['physics_delta_abs'] = radar['physics_delta'].abs()
     radar = radar.sort_values(
         by=['portfolio_action_score', 'physics_delta_abs', 'hr_probability', 'ev_pct'],
@@ -8287,6 +8610,7 @@ def generate_daily_predictions():
 
     discrepancy_top_n = max(3, _env_int('STRAIGHT_DISCREPANCY_TOP_N', 12))
     straight_discrepancies = build_single_straight_market_discrepancies(live, top_n=discrepancy_top_n)
+    target_date = datetime.today().strftime('%Y-%m-%d')
     if straight_discrepancies.empty:
         print("Single-straight discrepancy scan: no rows passed discrepancy filters.")
     else:
@@ -8299,7 +8623,6 @@ def generate_daily_predictions():
     # =====================================================================
     # DISCORD WEBHOOK INTEGRATION
     # =====================================================================
-    target_date = datetime.today().strftime('%Y-%m-%d')
     if not _candidate_discord_webhooks():
         print("Discord webhook not configured — skipping notification. Set DISCORD_MLB_WEBHOOK to enable.")
         return live
@@ -9174,6 +9497,32 @@ def _resolve_auto_wager_endpoint(book_key, book_config):
     if default_url:
         return default_url, book_cfg if isinstance(book_cfg, dict) else {}
     return None, {}
+
+
+def _estimate_actionability_score(row):
+    """Create a single quality score for ranking actionable picks."""
+    try:
+        pred_prob = max(0.0, _safe_float(row.get('pred_hr_prob', 0.0), 0.0) or 0.0)
+        ev_pct = max(0.0, _safe_float(row.get('ev_percent', 0.0), 0.0) or 0.0)
+        edge_pct = max(0.0, _safe_float(row.get('edge_pct', 0.0), 0.0) or 0.0)
+        kelly = max(0.0, _safe_float(row.get('kelly_fraction', 0.0), 0.0) or 0.0)
+        reliability = str(row.get('model_reliability', 'MEDIUM') or 'MEDIUM').upper()
+        matchup_signal = max(0.0, _safe_float(row.get('batter_pitch_mix_matchup_score', 0.0), 0.0) or 0.0)
+        recent_batter = max(0.0, _safe_float(row.get('recent_batter_woba_proxy', 0.0), 0.0) or 0.0)
+        recent_pitcher = max(0.0, _safe_float(row.get('recent_pitcher_damage_proxy', 0.0), 0.0) or 0.0)
+
+        reliability_bonus = {'HIGH': 1.0, 'MEDIUM': 0.6, 'LOW': 0.0}.get(reliability, 0.6)
+        matchup_bonus = 0.1 * min(1.0, (matchup_signal + recent_batter + recent_pitcher) / 3.0)
+        return float(
+            (pred_prob * 100.0) * 0.20
+            + ev_pct * 0.35
+            + edge_pct * 0.15
+            + (kelly * 100.0) * 0.20
+            + reliability_bonus * 10.0
+            + matchup_bonus * 10.0
+        )
+    except Exception:
+        return 0.0
 
 
 def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=None, max_stake_usd=None, kelly_multiplier=None):
@@ -10540,6 +10889,27 @@ def main():
     # Spawn (or reuse) background live monitor process to catch home runs throughout the day.
     print("\n📡 Ensuring live home run monitor is running in background...")
     launch_live_monitor_background()
+
+    # Auto-launch RLM line-movement monitor if ODDS_API_KEY is configured.
+    if os.getenv('ODDS_API_KEY') and str(os.getenv('RLM_AUTOLAUNCH', 'true')).strip().lower() not in {'0', 'false', 'no'}:
+        _rlm_marker = Path('data') / f'rlm_monitor_{datetime.today().strftime("%Y-%m-%d")}.pid'
+        if not _rlm_marker.exists():
+            try:
+                _rlm_log = Path('data') / 'rlm_monitor.log'
+                _rlm_proc = subprocess.Popen(
+                    [sys.executable, __file__, '--rlm'],
+                    stdout=_rlm_log.open('a', encoding='utf-8'),
+                    stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0,
+                )
+                import time as _t; _t.sleep(2)
+                if _rlm_proc.poll() is None:
+                    _rlm_marker.write_text(str(_rlm_proc.pid), encoding='utf-8')
+                    print(f"📈 RLM line-movement monitor launched (PID {_rlm_proc.pid}). Log: {_rlm_log}")
+            except Exception as _rlm_exc:
+                print(f"⚠️ Could not start RLM monitor: {_rlm_exc}")
+        else:
+            print("📈 RLM line-movement monitor already running today.")
 
 
 if __name__ == "__main__":
