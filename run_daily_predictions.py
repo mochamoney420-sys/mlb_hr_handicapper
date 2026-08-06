@@ -20,6 +20,7 @@ import subprocess
 import re
 import json
 import hashlib
+import pickle
 from datetime import datetime
 from pathlib import Path
 from itertools import combinations
@@ -65,13 +66,16 @@ try:
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import log_loss
-    from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import LogisticRegression, SGDClassifier
+    from sklearn.preprocessing import StandardScaler
 except ImportError:
     RandomForestClassifier = None
     CalibratedClassifierCV = None
     TimeSeriesSplit = None
     log_loss = None
     LogisticRegression = None
+    SGDClassifier = None
+    StandardScaler = None
 from datetime import datetime, timedelta
 from pybaseball import statcast
 from threading import Thread
@@ -4147,9 +4151,11 @@ def load_historical_statcast_seasons(
     today = datetime.today()
     if end_year is None:
         end_year = today.year - 1  # previous complete season
+    lookback_seasons = max(1, int(os.getenv('HIST_SEASONS_LOOKBACK', '2')))
     if start_year is None:
-        start_year = max(min_year, int(os.getenv('HIST_SEASONS_START_YEAR', str(end_year - 3))))
+        start_year = max(min_year, int(os.getenv('HIST_SEASONS_START_YEAR', str(end_year - (lookback_seasons - 1)))))
     start_year = max(min_year, int(start_year))
+    hist_rows_per_year_cap = max(0, int(os.getenv('HIST_ROWS_PER_YEAR', '200000')))
 
     def _sanitize_for_concat(df_in):
         """Convert extension dtypes to numpy/object to avoid concat mask blowups."""
@@ -4178,6 +4184,12 @@ def load_historical_statcast_seasons(
             return tmp.tail(keep_rows).copy()
         return df_in.tail(keep_rows).copy()
 
+    def _apply_year_row_cap(df_in):
+        """Apply an always-on per-season cap for runtime/memory control."""
+        if hist_rows_per_year_cap <= 0:
+            return df_in
+        return _trim_year_frame(df_in, hist_rows_per_year_cap)
+
     frames = []
     for year in range(start_year, end_year + 1):
         pq_path = Path(hist_dir) / f'statcast_{year}.parquet'
@@ -4185,7 +4197,11 @@ def load_historical_statcast_seasons(
             try:
                 df_yr = pd.read_parquet(pq_path)
                 df_yr = _sanitize_for_concat(df_yr)
+                _pre_cap = len(df_yr)
+                df_yr = _apply_year_row_cap(df_yr)
                 frames.append(df_yr)
+                if len(df_yr) < _pre_cap:
+                    print(f"  Historical {year}: capped to {len(df_yr):,} rows for speed")
                 print(f"  Historical {year}: {len(df_yr):,} rows loaded from cache")
                 continue
             except Exception as exc:
@@ -4201,7 +4217,11 @@ def load_historical_statcast_seasons(
             if season_df is not None and not season_df.empty:
                 season_df.to_parquet(pq_path, index=False)
                 season_df = _sanitize_for_concat(season_df)
+                _pre_cap = len(season_df)
+                season_df = _apply_year_row_cap(season_df)
                 frames.append(season_df)
+                if len(season_df) < _pre_cap:
+                    print(f"  Historical {year}: capped to {len(season_df):,} rows for speed")
                 print(f"  Historical {year}: {len(season_df):,} rows fetched and cached")
             else:
                 print(f"  Historical {year}: no data returned")
@@ -4214,7 +4234,7 @@ def load_historical_statcast_seasons(
     try:
         hist = pd.concat(frames, ignore_index=True)
     except MemoryError:
-        fallback_rows = max(75000, int(os.getenv('HIST_FALLBACK_ROWS_PER_YEAR', '250000')))
+        fallback_rows = max(50000, int(os.getenv('HIST_FALLBACK_ROWS_PER_YEAR', '150000')))
         print(
             "  Warning: low memory while combining historical seasons; "
             f"retrying with last {fallback_rows:,} rows per year"
@@ -4824,6 +4844,262 @@ def build_feedback_weight_series(train_df, feedback_df):
             weights.loc[match_mask] *= multiplier
 
     return weights.clip(lower=0.5, upper=15.0)
+
+
+def apply_rolling_training_window(train_df):
+    """Filter training rows to a rolling time window to reduce drift/latency.
+
+    Uses `TRAINING_ROLLING_WINDOW_DAYS` (default 365). Set to 0 to disable.
+    """
+    if train_df is None or getattr(train_df, 'empty', True) or 'game_date' not in train_df.columns:
+        return train_df
+
+    rolling_days = max(0, _env_int('TRAINING_ROLLING_WINDOW_DAYS', 365))
+    if rolling_days <= 0:
+        return train_df
+
+    work = train_df.copy()
+    work['game_date'] = pd.to_datetime(work.get('game_date', pd.NaT), errors='coerce')
+    max_game_date = work['game_date'].max()
+    if pd.isna(max_game_date):
+        return train_df
+
+    cutoff = max_game_date - pd.Timedelta(days=rolling_days)
+    keep_mask = work['game_date'].isna() | (work['game_date'] >= cutoff)
+    filtered = work.loc[keep_mask].copy()
+    dropped = int(len(work) - len(filtered))
+    print(
+        "Rolling training window: "
+        f"days={rolling_days}, kept={len(filtered):,}, dropped={dropped:,}, cutoff={cutoff.date()}"
+    )
+    return filtered
+
+
+def build_recent_minibatch_weights(train_df):
+    """Upweight the most recent mini-batch to capture short-term form changes.
+
+    Uses `TRAINING_MINI_BATCH_DAYS` (default 7) and
+    `TRAINING_MINI_BATCH_MULTIPLIER` (default 1.20).
+    """
+    if train_df is None or getattr(train_df, 'empty', True) or 'game_date' not in train_df.columns:
+        return np.ones(len(train_df) if train_df is not None else 0, dtype=float)
+
+    mini_days = max(1, _env_int('TRAINING_MINI_BATCH_DAYS', 7))
+    mini_mult = float(np.clip(_env_float('TRAINING_MINI_BATCH_MULTIPLIER', 1.20), 1.0, 2.5))
+
+    game_dates = pd.to_datetime(train_df.get('game_date', pd.NaT), errors='coerce')
+    max_game_date = game_dates.max()
+    if pd.isna(max_game_date):
+        return np.ones(len(train_df), dtype=float)
+
+    cutoff = max_game_date - pd.Timedelta(days=mini_days)
+    recent_mask = game_dates >= cutoff
+    weights = np.ones(len(train_df), dtype=float)
+    if recent_mask.any() and mini_mult > 1.0:
+        weights[np.asarray(recent_mask.fillna(False), dtype=bool)] = mini_mult
+    print(
+        "Mini-batch recency weights: "
+        f"days={mini_days}, multiplier={mini_mult:.2f}, boosted_rows={int(recent_mask.sum()):,}"
+    )
+    return weights
+
+
+def _online_sidecar_state_path():
+    Path('data').mkdir(parents=True, exist_ok=True)
+    return Path('data') / 'online_sidecar_state.pkl'
+
+
+def _load_online_sidecar_state(feature_names):
+    path = _online_sidecar_state_path()
+    if not path.exists():
+        return None
+    try:
+        state = pickle.loads(path.read_bytes())
+        saved_features = list(state.get('feature_names', []))
+        if saved_features != list(feature_names):
+            return None
+        return state
+    except Exception:
+        return None
+
+
+def _save_online_sidecar_state(state):
+    try:
+        _online_sidecar_state_path().write_bytes(pickle.dumps(state))
+    except Exception as exc:
+        print(f"Online sidecar state save skipped: {exc}")
+
+
+def _build_online_sidecar_state(feature_names, alpha):
+    if SGDClassifier is None or StandardScaler is None:
+        return None
+    model = SGDClassifier(
+        loss='log_loss',
+        penalty='elasticnet',
+        alpha=float(np.clip(alpha, 1e-6, 1e-2)),
+        l1_ratio=0.10,
+        learning_rate='optimal',
+        random_state=42,
+        average=True,
+    )
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    return {
+        'feature_names': list(feature_names),
+        'model': model,
+        'scaler': scaler,
+        'medians': {},
+        'update_count': 0,
+        'initialized': False,
+        'last_update_utc': None,
+    }
+
+
+def update_online_sidecar_model(train_df, feature_names, sample_weights):
+    """Incrementally update optional online sidecar model from recent mini-batch."""
+    enabled = str(os.getenv('ONLINE_SIDECAR_ENABLED', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    if not enabled:
+        return None, {'enabled': False, 'applied': False, 'reason': 'disabled'}
+    if SGDClassifier is None or StandardScaler is None:
+        return None, {'enabled': True, 'applied': False, 'reason': 'sklearn_missing'}
+    if train_df is None or getattr(train_df, 'empty', True) or 'is_hr' not in train_df.columns:
+        return None, {'enabled': True, 'applied': False, 'reason': 'no_training_rows'}
+
+    if any(c not in train_df.columns for c in feature_names):
+        return None, {'enabled': True, 'applied': False, 'reason': 'missing_features'}
+
+    mini_days = max(1, _env_int('ONLINE_SIDECAR_BATCH_DAYS', 7))
+    min_rows = max(100, _env_int('ONLINE_SIDECAR_MIN_ROWS', 800))
+    alpha = float(np.clip(_env_float('ONLINE_SIDECAR_ALPHA', 0.0005), 1e-6, 1e-2))
+
+    work = train_df.copy()
+    work['game_date'] = pd.to_datetime(work.get('game_date', pd.NaT), errors='coerce')
+    max_game_date = work['game_date'].max()
+    if pd.isna(max_game_date):
+        return None, {'enabled': True, 'applied': False, 'reason': 'missing_game_date'}
+
+    cutoff = max_game_date - pd.Timedelta(days=mini_days)
+    batch_mask = work['game_date'] >= cutoff
+    batch_rows = int(batch_mask.sum())
+    if batch_rows < min_rows:
+        return None, {
+            'enabled': True,
+            'applied': False,
+            'reason': 'insufficient_batch_rows',
+            'batch_rows': batch_rows,
+            'required_rows': min_rows,
+        }
+
+    state = _load_online_sidecar_state(feature_names)
+    if state is None:
+        state = _build_online_sidecar_state(feature_names, alpha)
+    if state is None:
+        return None, {'enabled': True, 'applied': False, 'reason': 'state_init_failed'}
+
+    work_nodup = work.loc[:, ~work.columns.duplicated(keep='first')]
+    x_full = work_nodup.reindex(columns=feature_names).apply(pd.to_numeric, errors='coerce')
+    medians = x_full.median(numeric_only=True).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    state['medians'] = medians.to_dict()
+    x_batch = x_full.loc[batch_mask].fillna(medians)
+    y_batch = pd.to_numeric(work.loc[batch_mask, 'is_hr'], errors='coerce').fillna(0).astype(int)
+
+    w_arr = np.asarray(sample_weights, dtype=float).reshape(-1)
+    if len(w_arr) != len(work):
+        w_batch = np.ones(len(x_batch), dtype=float)
+    else:
+        w_batch = np.clip(w_arr[np.asarray(batch_mask, dtype=bool)], 0.25, 20.0)
+
+    scaler = state['scaler']
+    scaler.partial_fit(x_batch.values)
+    x_scaled = scaler.transform(x_batch.values)
+
+    model = state['model']
+    if bool(state.get('initialized', False)):
+        model.partial_fit(x_scaled, y_batch.values, sample_weight=w_batch)
+    else:
+        model.partial_fit(x_scaled, y_batch.values, classes=np.array([0, 1]), sample_weight=w_batch)
+        state['initialized'] = True
+
+    state['update_count'] = int(state.get('update_count', 0)) + 1
+    state['last_update_utc'] = datetime.utcnow().isoformat()
+    _save_online_sidecar_state(state)
+
+    diagnostics = {
+        'enabled': True,
+        'applied': True,
+        'batch_days': mini_days,
+        'batch_rows': batch_rows,
+        'positive_rate': float(y_batch.mean()) if len(y_batch) else 0.0,
+        'update_count': int(state.get('update_count', 0)),
+    }
+    print(
+        "Online sidecar update: "
+        f"rows={batch_rows:,}, pos_rate={diagnostics['positive_rate']:.4f}, "
+        f"updates={diagnostics['update_count']}"
+    )
+    return state, diagnostics
+
+
+def apply_online_sidecar_blend(base_probs, live_features, feature_names, sidecar_state=None):
+    """Apply conservative bounded blend from optional online sidecar model."""
+    enabled = str(os.getenv('ONLINE_SIDECAR_ENABLED', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    blend_enabled = str(os.getenv('ONLINE_SIDECAR_BLEND_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if not enabled or not blend_enabled:
+        return np.asarray(base_probs), None, {'enabled': enabled, 'applied': False, 'reason': 'disabled'}
+
+    if sidecar_state is None:
+        sidecar_state = _load_online_sidecar_state(feature_names)
+    if not sidecar_state or not bool(sidecar_state.get('initialized', False)):
+        return np.asarray(base_probs), None, {'enabled': True, 'applied': False, 'reason': 'missing_state'}
+
+    min_updates = max(1, _env_int('ONLINE_SIDECAR_MIN_UPDATES', 3))
+    update_count = int(sidecar_state.get('update_count', 0))
+    if update_count < min_updates:
+        return np.asarray(base_probs), None, {
+            'enabled': True,
+            'applied': False,
+            'reason': 'insufficient_updates',
+            'update_count': update_count,
+            'min_updates': min_updates,
+        }
+
+    blend_weight = float(np.clip(_env_float('ONLINE_SIDECAR_WEIGHT', 0.12), 0.0, 0.25))
+    max_delta = float(np.clip(_env_float('ONLINE_SIDECAR_MAX_DELTA', 0.03), 0.0, 0.10))
+    if blend_weight <= 0 or max_delta <= 0:
+        return np.asarray(base_probs), None, {'enabled': True, 'applied': False, 'reason': 'zero_blend'}
+
+    medians = pd.Series(sidecar_state.get('medians', {}), dtype=float)
+    live_nodup = live_features.loc[:, ~live_features.columns.duplicated(keep='first')]
+    x_live = live_nodup.reindex(columns=feature_names).apply(pd.to_numeric, errors='coerce')
+    if not medians.empty:
+        x_live = x_live.fillna(medians)
+    x_live = x_live.fillna(0.0)
+
+    scaler = sidecar_state.get('scaler')
+    model = sidecar_state.get('model')
+    if scaler is None or model is None:
+        return np.asarray(base_probs), None, {'enabled': True, 'applied': False, 'reason': 'invalid_state'}
+
+    x_scaled = scaler.transform(x_live.values)
+    sidecar_probs = model.predict_proba(x_scaled)[:, 1]
+    sidecar_probs = np.clip(np.asarray(sidecar_probs), 0.0, 1.0)
+    base_arr = np.clip(np.asarray(base_probs), 0.0, 1.0)
+
+    delta = np.clip(sidecar_probs - base_arr, -max_delta, max_delta)
+    blended = np.clip(base_arr + (blend_weight * delta), 0.0, 1.0)
+    diag = {
+        'enabled': True,
+        'applied': True,
+        'blend_weight': blend_weight,
+        'max_delta': max_delta,
+        'update_count': update_count,
+        'mean_abs_delta': float(np.mean(np.abs(delta))) if len(delta) else 0.0,
+    }
+    print(
+        "Online sidecar blend: "
+        f"weight={blend_weight:.3f}, max_delta={max_delta:.3f}, "
+        f"mean_abs_delta={diag['mean_abs_delta']:.4f}, updates={update_count}"
+    )
+    return blended, sidecar_probs, diag
 
 
 def load_feedback_weights(train_df, days_lookback=30):
@@ -6955,6 +7231,9 @@ def generate_daily_predictions():
         else:
             train_df[col] = pd.to_numeric(train_df[col], errors='coerce').fillna(default)
 
+    # Rolling mini-batch training: keep a bounded historical window for stability and speed.
+    train_df = apply_rolling_training_window(train_df)
+
     # Auto-evaluate yesterday's predictions to feed the learning loop
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
     if (Path('data') / f'predictions_{yesterday_str}.csv').exists() and \
@@ -6968,6 +7247,8 @@ def generate_daily_predictions():
                 log_error("evaluation", f"evaluate_saved_predictions({yesterday_str})", _e, "WARNING")
 
     sample_weights = load_feedback_weights(train_df)
+    recent_minibatch_weights = build_recent_minibatch_weights(train_df)
+    sample_weights = np.clip(np.asarray(sample_weights) * recent_minibatch_weights, 0.5, 15.0)
     missed_count = int((sample_weights > 1.2).sum())
     print(f"Feedback weights loaded — {missed_count} training rows upweighted from past misses.")
 
@@ -7072,6 +7353,14 @@ def generate_daily_predictions():
     
     X_train = train_df[features_train]
     y_train = train_df['is_hr']
+
+    online_sidecar_state = None
+    online_sidecar_diag = {'enabled': False, 'applied': False, 'reason': 'not_attempted'}
+    online_sidecar_state, online_sidecar_diag = update_online_sidecar_model(
+        train_df,
+        features_train,
+        sample_weights,
+    )
 
     positive_count = int(pd.to_numeric(y_train, errors='coerce').fillna(0).sum())
     negative_count = int(len(y_train) - positive_count)
@@ -7971,6 +8260,24 @@ def generate_daily_predictions():
         damage_boost = np.clip(1.0 + (damage_proxy_adj.values - damage_center) * damage_strength, 0.60, 1.45)
         probs = np.clip(probs * damage_boost, 0.0, 0.99)
         live['pitcher_damage_boost'] = damage_boost
+
+    # Optional conservative online sidecar blend (bounded adjustment around base ensemble).
+    probs, sidecar_probs, sidecar_blend_diag = apply_online_sidecar_blend(
+        probs,
+        live,
+        features_train,
+        sidecar_state=online_sidecar_state,
+    )
+    if sidecar_probs is None:
+        live['sidecar_online_prob'] = np.nan
+    else:
+        live['sidecar_online_prob'] = sidecar_probs
+    live['sidecar_blend_applied'] = int(bool(sidecar_blend_diag.get('applied', False)))
+    live['sidecar_blend_weight'] = float(sidecar_blend_diag.get('blend_weight', 0.0) or 0.0)
+    live['sidecar_max_delta'] = float(sidecar_blend_diag.get('max_delta', 0.0) or 0.0)
+    live['sidecar_update_count'] = int(sidecar_blend_diag.get('update_count', 0) or 0)
+    live['sidecar_training_applied'] = int(bool(online_sidecar_diag.get('applied', False)))
+    live['sidecar_training_update_count'] = int(online_sidecar_diag.get('update_count', 0) or 0)
 
     live['pred_hr_prob'] = probs
     if 'game_pk' in live.columns:
