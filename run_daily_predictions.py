@@ -68,6 +68,7 @@ try:
     from sklearn.metrics import log_loss
     from sklearn.linear_model import LogisticRegression, SGDClassifier
     from sklearn.preprocessing import StandardScaler
+    from sklearn.isotonic import IsotonicRegression
 except ImportError:
     RandomForestClassifier = None
     CalibratedClassifierCV = None
@@ -76,6 +77,11 @@ except ImportError:
     LogisticRegression = None
     SGDClassifier = None
     StandardScaler = None
+    IsotonicRegression = None
+try:
+    from sklearn.frozen import FrozenEstimator
+except Exception:
+    FrozenEstimator = None
 from datetime import datetime, timedelta
 from pybaseball import statcast
 from threading import Thread
@@ -666,6 +672,55 @@ def _infer_close_line_from_snapshots(snapshots, batter_name, game_dt):
         ts, book, line = sorted(post_candidates, key=lambda x: x[0])[0]
         return line, book, ts
     return None, None, None
+
+
+def _snapshot_market_consensus(
+    snapshots,
+    batter_name,
+    min_snapshots=2,
+    min_books=2,
+    max_implied_spread=0.08,
+):
+    """Score how consistent market pricing is across snapshots/books for one batter."""
+    if not snapshots or not batter_name:
+        return {
+            'snapshot_points': 0,
+            'snapshot_books': 0,
+            'snapshot_implied_spread': np.nan,
+            'snapshot_consensus_ok': False,
+        }
+
+    implied_points = []
+    books_seen = set()
+    for snap in snapshots:
+        book_map = _resolve_snapshot_book_map(snap.get('odds', {}), batter_name)
+        if not isinstance(book_map, dict) or not book_map:
+            continue
+
+        for bk, odds in book_map.items():
+            p = american_to_implied_prob(odds)
+            if p is None or not np.isfinite(p):
+                continue
+            implied_points.append(float(p))
+            books_seen.add(str(bk).strip().lower())
+
+    spread = np.nan
+    if implied_points:
+        spread = float(max(implied_points) - min(implied_points))
+
+    consensus_ok = (
+        len(implied_points) >= max(1, int(min_snapshots))
+        and len(books_seen) >= max(1, int(min_books))
+        and np.isfinite(spread)
+        and spread <= float(max_implied_spread)
+    )
+
+    return {
+        'snapshot_points': int(len(implied_points)),
+        'snapshot_books': int(len(books_seen)),
+        'snapshot_implied_spread': spread,
+        'snapshot_consensus_ok': bool(consensus_ok),
+    }
 
 
 def audit_clv_performance(date_str=None, lookback_days=30):
@@ -1740,6 +1795,77 @@ def _candidate_discord_webhooks(explicit_webhook=None):
     return list(dict.fromkeys(normalized))
 
 
+def _split_discord_content(content, limit=2000):
+    """Split Discord message content into <=limit chunks.
+
+    Prefers splitting on newline boundaries, then spaces, and finally hard cuts.
+    """
+    text = str(content or '')
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    remaining = text
+    soft_floor = max(200, int(limit * 0.60))
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        split_at = remaining.rfind('\n', 0, limit + 1)
+        if split_at < soft_floor:
+            split_at = remaining.rfind(' ', 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:limit]
+        chunks.append(chunk)
+        remaining = remaining[len(chunk):].lstrip('\n ').rstrip()
+
+    return [c for c in chunks if c]
+
+
+def _build_discord_payloads(content=None, embeds=None):
+    """Build one or more Discord payloads honoring content size limits."""
+    content_chunks = _split_discord_content(content, limit=2000) if content else []
+    if not content_chunks:
+        payload = {}
+        if embeds:
+            payload['embeds'] = embeds
+        return [payload] if payload else []
+
+    payloads = []
+    for idx, chunk in enumerate(content_chunks):
+        payload = {'content': chunk}
+        # Attach embeds only on the first message to avoid duplicate cards.
+        if embeds and idx == 0:
+            payload['embeds'] = embeds
+        payloads.append(payload)
+
+    if len(payloads) > 1:
+        print(f"Discord content auto-chunked into {len(payloads)} messages.")
+    return payloads
+
+
+def _send_discord_payloads_with_retry(payloads, webhook_candidates, retries=3, silent=False):
+    """Send all payload chunks, retrying each chunk independently."""
+    for payload in payloads:
+        sent = False
+        for attempt in range(max(1, int(retries))):
+            sent = _send_discord_sync(payload, webhook_candidates, silent=silent)
+            if sent:
+                break
+            if attempt < (max(1, int(retries)) - 1):
+                time.sleep(0.5)
+        if not sent:
+            return False
+    return True
+
+
 def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send=False, retries=3):
     """Send Discord webhook message.
     
@@ -1752,13 +1878,9 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
         print("Discord webhook not configured; skipping notification.")
         return False
 
-    payload = {}
-    if content:
-        payload["content"] = content
-    if embeds:
-        payload["embeds"] = embeds
+    payloads = _build_discord_payloads(content=content, embeds=embeds)
 
-    if not payload:
+    if not payloads:
         print("Nothing to send to Discord; payload is empty.")
         return False
     
@@ -1769,33 +1891,42 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
         result_holder = {'success': False, 'error': None}
         thread = threading.Thread(
             target=_send_discord_async_tracked,
-            args=(payload, webhook_candidates, result_holder),
+            args=(payloads, webhook_candidates, result_holder, retries),
             daemon=True
         )
         thread.start()
         # Don't wait, but return True immediately (async)
         return True
 
-    # Synchronous send with retry
-    for attempt in range(retries):
-        result = _send_discord_sync(payload, webhook_candidates)
-        if result:
-            return True
-        if attempt < retries - 1:
-            time.sleep(0.5)  # Brief backoff between retries
-    return False
+    # Synchronous send with per-chunk retry.
+    return _send_discord_payloads_with_retry(
+        payloads,
+        webhook_candidates,
+        retries=retries,
+        silent=False,
+    )
 
-def _send_discord_async_tracked(payload, webhook_candidates, result_holder):
+def _send_discord_async_tracked(payloads, webhook_candidates, result_holder, retries=3):
     """Send Discord in background thread with error tracking."""
     try:
-        success = _send_discord_sync(payload, webhook_candidates, silent=False)
+        success = _send_discord_payloads_with_retry(
+            payloads,
+            webhook_candidates,
+            retries=retries,
+            silent=False,
+        )
         result_holder['success'] = success
     except Exception as e:
         result_holder['error'] = str(e)
         print(f"Async Discord send error: {e}")
         # Fallback: try one more time synchronously
         try:
-            _send_discord_sync(payload, webhook_candidates, silent=True)
+            _send_discord_payloads_with_retry(
+                payloads,
+                webhook_candidates,
+                retries=1,
+                silent=True,
+            )
         except Exception:
             pass
 
@@ -2783,8 +2914,22 @@ def build_learned_hr_pairings(live_df, days_back=60, candidate_n=36):
     work = live_df.copy()
     work['pred_hr_prob'] = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
     work['ev_percent'] = pd.to_numeric(work.get('ev_percent', 0.0), errors='coerce').fillna(0.0)
+    work['matched_book_count'] = pd.to_numeric(work.get('matched_book_count', 0), errors='coerce').fillna(0).astype(int)
+    work['book_prob_dispersion'] = pd.to_numeric(work.get('book_prob_dispersion', np.nan), errors='coerce')
+    if 'market_consensus_ok' in work.columns:
+        work['market_consensus_ok'] = work['market_consensus_ok'].fillna(False).astype(bool)
+    else:
+        work['market_consensus_ok'] = False
+
+    min_leg_prob = max(0.01, min(0.95, _env_float('PARLAY_MIN_LEG_PROB', 0.10)))
+    min_books_per_leg = max(1, _env_int('PARLAY_MIN_MATCHED_BOOKS', 2))
+    max_leg_dispersion = max(0.0, _env_float('PARLAY_MAX_BOOK_PROB_DISPERSION', 0.10))
+    min_parlay_edge_pct = _env_float('PARLAY_EDGE_MIN_PCT', 8.0)
+    same_game_corr = max(0.0, min(0.75, _env_float('SGP_BATTER_CORRELATION', 0.25)))
+
     work['signal_score'] = work['pred_hr_prob'] + np.maximum(work['ev_percent'], 0) / 250.0
     work = work.sort_values(['signal_score', 'pred_hr_prob'], ascending=False).head(max(12, int(candidate_n)))
+    work = work[work['pred_hr_prob'] >= min_leg_prob].copy()
     if len(work) < 2:
         return pd.DataFrame()
 
@@ -2805,10 +2950,45 @@ def build_learned_hr_pairings(live_df, days_back=60, candidate_n=36):
 
         learned_combo = min(0.95, max(0.0, base_combo * multi))
 
-        o1 = _american_to_decimal_safe(a.get('best_market_odds_american', np.nan))
-        o2 = _american_to_decimal_safe(b.get('best_market_odds_american', np.nan))
+        corr_boost = 0.0
+        if same_game:
+            corr_boost = same_game_corr * math.sqrt(max(0.0, p1 * (1.0 - p1) * p2 * (1.0 - p2)))
+        true_combo_prob = min(0.95, max(0.0, learned_combo + corr_boost))
+
+        offer = _best_common_book_parlay_offer(
+            a.get('raw_book_lines_json', '{}'),
+            b.get('raw_book_lines_json', '{}'),
+        )
+
+        o1 = _american_to_decimal_safe(offer.get('sportsbook_leg1_odds_american', np.nan))
+        o2 = _american_to_decimal_safe(offer.get('sportsbook_leg2_odds_american', np.nan))
         parlay_decimal = (o1 * o2) if (pd.notna(o1) and pd.notna(o2)) else np.nan
-        parlay_ev = (learned_combo * parlay_decimal - 1.0) if pd.notna(parlay_decimal) else np.nan
+        if pd.isna(parlay_decimal):
+            parlay_decimal = _safe_float(offer.get('sportsbook_parlay_decimal'), np.nan)
+        sportsbook_implied = _safe_float(offer.get('sportsbook_parlay_implied_prob'), np.nan)
+        if (sportsbook_implied is None or not np.isfinite(sportsbook_implied)) and pd.notna(parlay_decimal) and parlay_decimal > 0:
+            sportsbook_implied = float(1.0 / parlay_decimal)
+        parlay_ev = (true_combo_prob * parlay_decimal - 1.0) if pd.notna(parlay_decimal) else np.nan
+        parlay_edge_pct = (parlay_ev * 100.0) if pd.notna(parlay_ev) else np.nan
+
+        leg_a_ok = (
+            bool(a.get('market_consensus_ok', False))
+            and int(a.get('matched_book_count', 0)) >= min_books_per_leg
+            and _safe_float(a.get('book_prob_dispersion'), np.inf) <= max_leg_dispersion
+        )
+        leg_b_ok = (
+            bool(b.get('market_consensus_ok', False))
+            and int(b.get('matched_book_count', 0)) >= min_books_per_leg
+            and _safe_float(b.get('book_prob_dispersion'), np.inf) <= max_leg_dispersion
+        )
+        pair_market_consensus_ok = bool(leg_a_ok and leg_b_ok)
+
+        parlay_edge_signal = (
+            pair_market_consensus_ok
+            and int(offer.get('sportsbook_common_books', 0)) >= 1
+            and pd.notna(parlay_edge_pct)
+            and float(parlay_edge_pct) >= float(min_parlay_edge_pct)
+        )
 
         rows.append({
             'pair_leg_1': a.get('batter_name', ''),
@@ -2821,10 +3001,18 @@ def build_learned_hr_pairings(live_df, days_back=60, candidate_n=36):
             'base_combo_prob': base_combo,
             'learned_multiplier': multi,
             'combo_prob': learned_combo,
-            'leg1_odds_american': a.get('best_market_odds_american', np.nan),
-            'leg2_odds_american': b.get('best_market_odds_american', np.nan),
+            'corr_boost': corr_boost,
+            'true_combo_prob': true_combo_prob,
+            'leg1_odds_american': offer.get('sportsbook_leg1_odds_american', np.nan),
+            'leg2_odds_american': offer.get('sportsbook_leg2_odds_american', np.nan),
+            'sportsbook_book': offer.get('sportsbook_book'),
+            'sportsbook_common_books': offer.get('sportsbook_common_books', 0),
             'parlay_decimal': parlay_decimal,
+            'sportsbook_parlay_implied_prob': sportsbook_implied,
             'parlay_ev': parlay_ev,
+            'parlay_edge_pct': parlay_edge_pct,
+            'pair_market_consensus_ok': pair_market_consensus_ok,
+            'parlay_edge_signal': bool(parlay_edge_signal),
             'training_days_used': int(multipliers.get('training_days_used', 0)),
         })
 
@@ -2832,7 +3020,11 @@ def build_learned_hr_pairings(live_df, days_back=60, candidate_n=36):
     if out.empty:
         return out
 
-    out = out.sort_values(['parlay_ev', 'combo_prob'], ascending=[False, False], na_position='last').reset_index(drop=True)
+    out = out.sort_values(
+        ['parlay_edge_signal', 'parlay_edge_pct', 'true_combo_prob'],
+        ascending=[False, False, False],
+        na_position='last'
+    ).reset_index(drop=True)
     return out
 
 
@@ -3738,16 +3930,13 @@ def _build_devigged_probs_from_raw_books(player_all_odds):
         if not implied_probs:
             continue
 
-        # Normalize the implied probabilities so the market overround is removed.
-        # The true no-vig probability is the normalized share of the implied market.
-        total_implied = sum(implied_probs)
-        if total_implied <= 0:
-            continue
+        # For one-sided player props across books, probabilities should not be
+        # normalized across books (that creates artificial ~1/N baselines).
+        # Use a robust central estimate of implied probability instead.
         if len(implied_probs) == 1:
             final_prob = float(implied_probs[0])
         else:
-            no_vig = [p / total_implied for p in implied_probs]
-            final_prob = float(np.mean(no_vig))
+            final_prob = float(np.median(implied_probs))
         player_probs[name] = round(float(np.clip(final_prob, 0.0, 1.0)), 4)
     return player_probs
 
@@ -5838,6 +6027,121 @@ def _extract_positive_class_probabilities(model, features_frame):
     return np.clip(raw_pred.reshape(-1), 0.0, 1.0)
 
 
+def _downsample_majority_class(
+    X,
+    y,
+    sample_weights,
+    negative_to_positive_ratio=3.0,
+    strategy='recent',
+    random_state=42,
+):
+    """Downsample the majority class to a target negative:positive ratio."""
+    if X is None or y is None:
+        return X, y, sample_weights, {'applied': False, 'reason': 'missing_inputs'}
+
+    y_series = pd.to_numeric(pd.Series(y), errors='coerce').fillna(0).astype(int)
+    pos_idx = np.where(y_series.values == 1)[0]
+    neg_idx = np.where(y_series.values == 0)[0]
+
+    pos_count = int(len(pos_idx))
+    neg_count = int(len(neg_idx))
+    if pos_count <= 0 or neg_count <= 0:
+        return X, y, sample_weights, {
+            'applied': False,
+            'reason': 'single_class',
+            'pos_count': pos_count,
+            'neg_count': neg_count,
+        }
+
+    ratio = float(np.clip(negative_to_positive_ratio, 1.0, 10.0))
+    target_neg = int(min(neg_count, max(pos_count, round(pos_count * ratio))))
+    if target_neg >= neg_count:
+        return X, y, sample_weights, {
+            'applied': False,
+            'reason': 'already_within_ratio',
+            'pos_count': pos_count,
+            'neg_count': neg_count,
+            'target_neg': target_neg,
+        }
+
+    strategy_key = str(strategy or 'recent').strip().lower()
+    if strategy_key == 'random':
+        rng = np.random.RandomState(int(random_state))
+        kept_neg = np.sort(rng.choice(neg_idx, size=target_neg, replace=False))
+    else:
+        kept_neg = np.sort(neg_idx)[-target_neg:]
+
+    keep_idx = np.sort(np.concatenate([pos_idx, kept_neg]))
+
+    if isinstance(X, pd.DataFrame):
+        X_out = X.iloc[keep_idx].copy()
+    else:
+        X_out = np.asarray(X)[keep_idx]
+
+    if isinstance(y, pd.Series):
+        y_out = y.iloc[keep_idx].copy()
+    else:
+        y_out = pd.Series(np.asarray(y)[keep_idx]).copy()
+
+    w_arr = np.asarray(sample_weights) if sample_weights is not None else np.ones(len(y_series), dtype=float)
+    w_out = w_arr[keep_idx]
+
+    return X_out, y_out, w_out, {
+        'applied': True,
+        'strategy': strategy_key,
+        'pos_count': pos_count,
+        'neg_count': neg_count,
+        'target_neg': int(target_neg),
+        'rows_after': int(len(keep_idx)),
+        'neg_to_pos_after': float(target_neg / max(1, pos_count)),
+    }
+
+
+def _apply_prior_probability_correction(probabilities, real_pos_rate, sampled_pos_rate):
+    """Map downsampled probabilities back toward real-population prevalence.
+
+    Uses odds correction: odds_real = odds_sample * w,
+    where w = prior_odds_real / prior_odds_sample.
+    Equivalent form:
+      p_real = p_sample / (p_sample + (1 - p_sample) / w)
+    """
+    p = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1 - 1e-6)
+    r = float(real_pos_rate)
+    s = float(sampled_pos_rate)
+
+    if not np.isfinite(r) or not np.isfinite(s):
+        return p, {
+            'applied': False,
+            'reason': 'invalid_rates',
+            'weight_factor': 1.0,
+        }
+    if r <= 0 or r >= 1 or s <= 0 or s >= 1:
+        return p, {
+            'applied': False,
+            'reason': 'rates_out_of_bounds',
+            'weight_factor': 1.0,
+        }
+
+    prior_odds_real = r / (1.0 - r)
+    prior_odds_sample = s / (1.0 - s)
+    if prior_odds_sample <= 0:
+        return p, {
+            'applied': False,
+            'reason': 'invalid_sample_odds',
+            'weight_factor': 1.0,
+        }
+
+    w = float(np.clip(prior_odds_real / prior_odds_sample, 1e-4, 1e4))
+    corrected = p / (p + ((1.0 - p) / w))
+    corrected = np.clip(corrected, 0.0, 1.0)
+    return corrected, {
+        'applied': True,
+        'weight_factor': w,
+        'real_pos_rate': r,
+        'sampled_pos_rate': s,
+    }
+
+
 def print_x_today_diagnostics(live_df, feature_cols, tag='X_today', sample_rows=5):
     """Print strict diagnostics to catch static, NaN-heavy, or degenerate live feature payloads."""
     if live_df is None or live_df.empty:
@@ -7315,6 +7619,42 @@ def generate_daily_predictions():
         'sportsbook_value_score', 'pitcher_fear_factor', 'is_elite_power_batter',
         'roof_sealed',
     ]
+
+    simple_baseline_mode = str(os.getenv('SIMPLE_BASELINE_ENABLED', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    simple_baseline_model = str(os.getenv('SIMPLE_BASELINE_MODEL', 'lightgbm')).strip().lower()
+    if simple_baseline_model not in {'lightgbm', 'xgboost'}:
+        simple_baseline_model = 'lightgbm'
+
+    if simple_baseline_mode:
+        # Keep only high-signal baseline features; fall back to nearest available proxy when needed.
+        core_feature_aliases = [
+            ['bat_xslg', 'bat_iso_proxy', 'recent_batter_woba_proxy', 'bat_hr_rate'],
+            ['pitch_barrel_allowed_rate', 'pitch_30pa_barrel_allowed_rate', 'pitch_15pa_barrel_allowed_rate'],
+            ['park_factor', 'ballpark_park_factor'],
+            ['temp'],
+            ['has_platoon_advantage', 'platoon_advantage_multiplier', 'split_advantage_score'],
+        ]
+
+        resolved_features = []
+        for alias_group in core_feature_aliases:
+            chosen = next((c for c in alias_group if c in train_df.columns), None)
+            if chosen is None:
+                chosen = alias_group[0]
+                # Create neutral fallback column if no alias exists.
+                if chosen not in train_df.columns:
+                    if chosen in {'temp'}:
+                        train_df[chosen] = 72.0
+                    elif chosen in {'park_factor', 'ballpark_park_factor'}:
+                        train_df[chosen] = 100.0
+                    else:
+                        train_df[chosen] = 0.0
+            resolved_features.append(chosen)
+
+        features_train = list(dict.fromkeys(resolved_features))
+        print(
+            "SIMPLE_BASELINE_ENABLED=true -> using 5 core features: "
+            + ", ".join(features_train)
+        )
     
     # Ensure all required weather columns exist in training data
     for weather_col, default_val in [('humidity', 50.0), ('precipitation', 0.0), ('pressure', 1013.25)]:
@@ -7350,92 +7690,31 @@ def generate_daily_predictions():
         'umpire_strike_zone_impact', 'density_altitude_factor',
         'weather_extremes_multiplier', 'sportsbook_value_score'
     ]
+    if simple_baseline_mode:
+        features_live = list(features_train)
     
     X_train = train_df[features_train]
     y_train = train_df['is_hr']
 
     online_sidecar_state = None
     online_sidecar_diag = {'enabled': False, 'applied': False, 'reason': 'not_attempted'}
-    online_sidecar_state, online_sidecar_diag = update_online_sidecar_model(
-        train_df,
-        features_train,
-        sample_weights,
-    )
+    if not simple_baseline_mode:
+        online_sidecar_state, online_sidecar_diag = update_online_sidecar_model(
+            train_df,
+            features_train,
+            sample_weights,
+        )
+    else:
+        online_sidecar_diag = {'enabled': False, 'applied': False, 'reason': 'simple_baseline_mode'}
 
-    positive_count = int(pd.to_numeric(y_train, errors='coerce').fillna(0).sum())
-    negative_count = int(len(y_train) - positive_count)
-    scale_pos_weight = round(max(1.0, min(50.0, negative_count / max(positive_count, 1))), 2)
-    print(
-        "Class imbalance control: "
-        f"positive={positive_count}, negative={negative_count}, scale_pos_weight={scale_pos_weight:.2f}"
-    )
-
-    cv_splitter = TimeSeriesSplit(n_splits=3) if TimeSeriesSplit is not None else 3
-    base_models = []
-    model_names = []
-
-    if xgb is not None:
-        base_models.append(xgb.XGBClassifier(
-            n_estimators=150, max_depth=5, learning_rate=0.04,
-            objective='binary:logistic', eval_metric='logloss',
-            scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9
-        ))
-        model_names.append('XGBoost')
-
-    if lgb is not None:
-        base_models.append(lgb.LGBMClassifier(
-            n_estimators=150, max_depth=5, learning_rate=0.04,
-            objective='binary', metric='binary_logloss',
-            scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9,
-            verbose=-1
-        ))
-        model_names.append('LightGBM')
-
-    # IMPROVEMENT #7: Ensemble Diversity - Add Random Forest (different approach: bagging vs boosting)
-    if RandomForestClassifier is not None:
-        base_models.append(RandomForestClassifier(
-            n_estimators=200, max_depth=8, min_samples_split=10,
-            class_weight='balanced_subsample', random_state=42
-        ))
-        model_names.append('RandomForest')
-
-    # IMPROVEMENT #7: Add Logistic Regression (captures linear relationships)
-    # Wrapped in pipeline with SimpleImputer to handle NaN values
-    try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import Pipeline
-        from sklearn.impute import SimpleImputer
-        
-        lr_pipeline = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('lr', LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42))
-        ])
-        base_models.append(lr_pipeline)
-        model_names.append('LogisticRegression+Imputer')
-    except ImportError:
-        pass
-
-    # IMPROVEMENT #7: Add Neural Network (captures non-linear interactions)
-    # Also wrapped with imputer for NaN handling
-    try:
-        from sklearn.neural_network import MLPClassifier
-        from sklearn.pipeline import Pipeline
-        from sklearn.impute import SimpleImputer
-        
-        nn_pipeline = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('nn', MLPClassifier(hidden_layer_sizes=(128, 64, 32), max_iter=500, random_state=42, early_stopping=True))
-        ])
-        base_models.append(nn_pipeline)
-        model_names.append('NeuralNetwork+Imputer')
-    except ImportError:
-        pass
-
-    if not base_models:
-        raise ImportError("Missing required ML package: install xgboost, lightgbm, or scikit-learn.")
-
-    use_model_level_calibration = str(os.getenv('USE_MODEL_LEVEL_CALIBRATION', 'false')).strip().lower() in {'1', 'true', 'yes'}
-    use_ensemble_platt = str(os.getenv('USE_ENSEMBLE_PLATT_SCALING', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    use_model_level_calibration = str(os.getenv('USE_MODEL_LEVEL_CALIBRATION', 'true')).strip().lower() in {'1', 'true', 'yes'}
+    model_level_calibration_method = str(os.getenv('MODEL_LEVEL_CALIBRATION_METHOD', 'sigmoid')).strip().lower()
+    if model_level_calibration_method not in {'sigmoid', 'isotonic'}:
+        model_level_calibration_method = 'sigmoid'
+    use_ensemble_platt = str(os.getenv('USE_ENSEMBLE_PLATT_SCALING', 'false')).strip().lower() not in {'0', 'false', 'no'}
+    if simple_baseline_mode:
+        use_model_level_calibration = False
+        use_ensemble_platt = False
     platt_holdout_fraction = float(np.clip(float(os.getenv('PLATT_HOLDOUT_FRACTION', '0.20')), 0.10, 0.40))
     platt_min_rows = max(200, int(float(os.getenv('PLATT_MIN_ROWS', '600'))))
 
@@ -7444,8 +7723,11 @@ def generate_daily_predictions():
     sample_weights_model_fit = sample_weights
     X_platt_holdout = None
     y_platt_holdout = None
+    prior_correction_real_pos_rate = float(pd.to_numeric(y_train, errors='coerce').fillna(0).mean()) if len(y_train) else np.nan
+    prior_correction_sampled_pos_rate = prior_correction_real_pos_rate
 
-    if use_ensemble_platt and len(X_train) >= platt_min_rows:
+    use_holdout_split = (use_ensemble_platt or use_model_level_calibration)
+    if use_holdout_split and len(X_train) >= platt_min_rows:
         split_idx = int(len(X_train) * (1.0 - platt_holdout_fraction))
         split_idx = max(100, min(split_idx, len(X_train) - 100))
         if split_idx > 0 and split_idx < len(X_train):
@@ -7455,18 +7737,209 @@ def generate_daily_predictions():
             X_platt_holdout = X_train.iloc[split_idx:].copy()
             y_platt_holdout = y_train.iloc[split_idx:].copy()
             print(
-                "Platt holdout split: "
+                "Calibration holdout split: "
                 f"fit_rows={len(X_model_fit)}, holdout_rows={len(X_platt_holdout)}, "
                 f"holdout_fraction={platt_holdout_fraction:.2f}"
             )
 
+    downsample_enabled = str(os.getenv('TRAINING_DOWNSAMPLE_ENABLED', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    if simple_baseline_mode:
+        downsample_enabled = False
+    downsample_ratio = float(np.clip(_env_float('TRAINING_NEG_TO_POS_RATIO', 3.0), 1.0, 10.0))
+    downsample_strategy = str(os.getenv('TRAINING_DOWNSAMPLE_STRATEGY', 'recent')).strip().lower()
+    downsample_random_state = _env_int('TRAINING_DOWNSAMPLE_RANDOM_STATE', 42)
+    if downsample_enabled:
+        X_model_fit, y_model_fit, sample_weights_model_fit, downsample_diag = _downsample_majority_class(
+            X_model_fit,
+            y_model_fit,
+            sample_weights_model_fit,
+            negative_to_positive_ratio=downsample_ratio,
+            strategy=downsample_strategy,
+            random_state=downsample_random_state,
+        )
+        if downsample_diag.get('applied', False):
+            print(
+                "Downsampling applied: "
+                f"strategy={downsample_diag.get('strategy')}, "
+                f"pos={downsample_diag.get('pos_count')}, "
+                f"neg_before={downsample_diag.get('neg_count')}, "
+                f"neg_after={downsample_diag.get('target_neg')}, "
+                f"neg:pos={downsample_diag.get('neg_to_pos_after'):.2f}"
+            )
+        else:
+            print(
+                "Downsampling skipped: "
+                f"reason={downsample_diag.get('reason', 'unknown')}, "
+                f"pos={downsample_diag.get('pos_count', 'n/a')}, "
+                f"neg={downsample_diag.get('neg_count', 'n/a')}"
+            )
+
+    prior_correction_sampled_pos_rate = float(pd.to_numeric(y_model_fit, errors='coerce').fillna(0).mean()) if len(y_model_fit) else np.nan
+    print(
+        "Prior correction rates: "
+        f"real_pos_rate={prior_correction_real_pos_rate:.5f}, "
+        f"sampled_pos_rate={prior_correction_sampled_pos_rate:.5f}"
+    )
+
+    positive_count = int(pd.to_numeric(y_model_fit, errors='coerce').fillna(0).sum())
+    negative_count = int(len(y_model_fit) - positive_count)
+    raw_scale_pos_weight = max(1.0, min(50.0, negative_count / max(positive_count, 1)))
+    scale_pos_weight_override = os.getenv('TRAINING_SCALE_POS_WEIGHT_OVERRIDE')
+    if scale_pos_weight_override is not None and str(scale_pos_weight_override).strip() != '':
+        try:
+            scale_pos_weight = float(scale_pos_weight_override)
+            if not np.isfinite(scale_pos_weight):
+                raise ValueError("non-finite override")
+            scale_pos_weight = round(max(1.0, min(50.0, scale_pos_weight)), 2)
+            print(f"[ABLATION] Using hard scale_pos_weight override: {scale_pos_weight:.2f}")
+            print(
+                "Class imbalance control (fit set): "
+                f"positive={positive_count}, negative={negative_count}, "
+                f"raw_scale_pos_weight={raw_scale_pos_weight:.2f}, "
+                f"override={scale_pos_weight:.2f}"
+            )
+        except Exception:
+            scale_pos_weight_multiplier = float(np.clip(_env_float('TRAINING_SCALE_POS_WEIGHT_MULTIPLIER', 1.0), 0.1, 1.0))
+            scale_pos_weight = round(max(1.0, min(50.0, raw_scale_pos_weight * scale_pos_weight_multiplier)), 2)
+            print(
+                "Class imbalance control (fit set): "
+                f"positive={positive_count}, negative={negative_count}, "
+                f"raw_scale_pos_weight={raw_scale_pos_weight:.2f}, "
+                f"multiplier={scale_pos_weight_multiplier:.2f}, scale_pos_weight={scale_pos_weight:.2f}"
+            )
+    else:
+        scale_pos_weight_multiplier = float(np.clip(_env_float('TRAINING_SCALE_POS_WEIGHT_MULTIPLIER', 1.0), 0.1, 1.0))
+        scale_pos_weight = round(max(1.0, min(50.0, raw_scale_pos_weight * scale_pos_weight_multiplier)), 2)
+        print(
+            "Class imbalance control (fit set): "
+            f"positive={positive_count}, negative={negative_count}, "
+            f"raw_scale_pos_weight={raw_scale_pos_weight:.2f}, "
+            f"multiplier={scale_pos_weight_multiplier:.2f}, scale_pos_weight={scale_pos_weight:.2f}"
+        )
+
+    cv_splitter = TimeSeriesSplit(n_splits=3) if TimeSeriesSplit is not None else 3
+    base_models = []
+    model_names = []
+
+    if simple_baseline_mode:
+        if simple_baseline_model == 'lightgbm' and lgb is not None:
+            base_models.append(lgb.LGBMClassifier(
+                n_estimators=180, max_depth=5, learning_rate=0.04,
+                objective='binary', metric='binary_logloss',
+                scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9,
+                verbose=-1
+            ))
+            model_names.append('LightGBM')
+        elif simple_baseline_model == 'xgboost' and xgb is not None:
+            base_models.append(xgb.XGBClassifier(
+                n_estimators=180, max_depth=5, learning_rate=0.04,
+                objective='binary:logistic', eval_metric='logloss',
+                scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9
+            ))
+            model_names.append('XGBoost')
+        else:
+            # Fallback to whichever tree model is available.
+            if lgb is not None:
+                base_models.append(lgb.LGBMClassifier(
+                    n_estimators=180, max_depth=5, learning_rate=0.04,
+                    objective='binary', metric='binary_logloss',
+                    scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9,
+                    verbose=-1
+                ))
+                model_names.append('LightGBM')
+            elif xgb is not None:
+                base_models.append(xgb.XGBClassifier(
+                    n_estimators=180, max_depth=5, learning_rate=0.04,
+                    objective='binary:logistic', eval_metric='logloss',
+                    scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9
+                ))
+                model_names.append('XGBoost')
+    elif xgb is not None:
+        base_models.append(xgb.XGBClassifier(
+            n_estimators=150, max_depth=5, learning_rate=0.04,
+            objective='binary:logistic', eval_metric='logloss',
+            scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9
+        ))
+        model_names.append('XGBoost')
+
+    if (not simple_baseline_mode) and lgb is not None:
+        base_models.append(lgb.LGBMClassifier(
+            n_estimators=150, max_depth=5, learning_rate=0.04,
+            objective='binary', metric='binary_logloss',
+            scale_pos_weight=scale_pos_weight, subsample=0.9, colsample_bytree=0.9,
+            verbose=-1
+        ))
+        model_names.append('LightGBM')
+
+    # IMPROVEMENT #7: Ensemble Diversity - Add Random Forest (different approach: bagging vs boosting)
+    if (not simple_baseline_mode) and RandomForestClassifier is not None:
+        base_models.append(RandomForestClassifier(
+            n_estimators=200, max_depth=8, min_samples_split=10,
+            class_weight='balanced', random_state=42
+        ))
+        model_names.append('RandomForest')
+
+    # IMPROVEMENT #7: Add Logistic Regression (captures linear relationships)
+    # Wrapped in pipeline with IterativeImputer to preserve feature interactions.
+    include_linear_models = str(os.getenv('ENSEMBLE_INCLUDE_LINEAR_MODELS', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    if simple_baseline_mode:
+        include_linear_models = False
+    if include_linear_models:
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.pipeline import Pipeline
+            from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+            from sklearn.impute import IterativeImputer
+
+            lr_pipeline = Pipeline([
+                ('imputer', IterativeImputer(
+                    max_iter=12,
+                    random_state=42,
+                    initial_strategy='median',
+                    skip_complete=True,
+                )),
+                ('lr', LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42))
+            ])
+            base_models.append(lr_pipeline)
+            model_names.append('LogisticRegression+IterativeImputer')
+        except ImportError:
+            pass
+    else:
+        print("Linear models disabled: ENSEMBLE_INCLUDE_LINEAR_MODELS=false")
+
+    # IMPROVEMENT #7: Add Neural Network (captures non-linear interactions)
+    # Also wrapped with IterativeImputer for NaN handling.
+    include_mlp_model = str(os.getenv('ENSEMBLE_INCLUDE_MLP_MODEL', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    if simple_baseline_mode:
+        include_mlp_model = False
+    if include_mlp_model:
+        try:
+            from sklearn.neural_network import MLPClassifier
+            from sklearn.pipeline import Pipeline
+            from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+            from sklearn.impute import IterativeImputer
+
+            nn_pipeline = Pipeline([
+                ('imputer', IterativeImputer(
+                    max_iter=12,
+                    random_state=42,
+                    initial_strategy='median',
+                    skip_complete=True,
+                )),
+                ('nn', MLPClassifier(hidden_layer_sizes=(128, 64, 32), max_iter=500, random_state=42, early_stopping=True))
+            ])
+            base_models.append(nn_pipeline)
+            model_names.append('NeuralNetwork+IterativeImputer')
+        except ImportError:
+            pass
+    else:
+        print("MLP model disabled: ENSEMBLE_INCLUDE_MLP_MODEL=false")
+
+    if not base_models:
+        raise ImportError("Missing required ML package: install xgboost, lightgbm, or scikit-learn.")
+
     trained_models = []
     for m in base_models:
-        if use_model_level_calibration and CalibratedClassifierCV is not None:
-            # FIXED: Use 'sigmoid' (Platt scaling) instead of 'isotonic' for rare event calibration
-            # Isotonic is too aggressive for HR prediction (rare event with low base rate)
-            # Sigmoid preserves probability mass better, avoiding probability collapse
-            m = CalibratedClassifierCV(m, cv=cv_splitter, method='sigmoid')
         try:
             m.fit(X_model_fit, y_model_fit, sample_weight=sample_weights_model_fit)
         except Exception as exc:
@@ -7477,37 +7950,58 @@ def generate_daily_predictions():
                 raise
         trained_models.append(m)
 
-    print(f"Ensemble trained: {', '.join(model_names)} (TimeSeriesSplit CV)")
+    print(f"Ensemble base models trained: {', '.join(model_names)}")
+
+    inference_models = trained_models
+    member_level_calibrated_count = 0
+    if use_model_level_calibration and CalibratedClassifierCV is not None and X_platt_holdout is not None and len(X_platt_holdout) >= 100:
+        holdout_labels_for_member_cal = pd.to_numeric(y_platt_holdout, errors='coerce').fillna(0).astype(int)
+        if holdout_labels_for_member_cal.nunique() >= 2:
+            calibrated_models = []
+            for model_name, fitted_model in zip(model_names, trained_models):
+                try:
+                    # Newer sklearn uses FrozenEstimator for prefit calibration; older releases use cv='prefit'.
+                    if FrozenEstimator is not None:
+                        cal_model = CalibratedClassifierCV(FrozenEstimator(fitted_model), method=model_level_calibration_method)
+                    else:
+                        cal_model = CalibratedClassifierCV(fitted_model, method=model_level_calibration_method, cv='prefit')
+                    cal_model.fit(X_platt_holdout, holdout_labels_for_member_cal)
+                    calibrated_models.append(cal_model)
+                    member_level_calibrated_count += 1
+                except Exception as exc:
+                    calibrated_models.append(fitted_model)
+                    print(f"Member calibration fallback ({model_name}): {exc}")
+            inference_models = calibrated_models
+            print(
+                "Per-model holdout calibration complete: "
+                f"method={model_level_calibration_method}, calibrated={member_level_calibrated_count}/{len(model_names)}"
+            )
+        else:
+            print("Per-model holdout calibration skipped: holdout has single-class labels.")
+    elif use_model_level_calibration:
+        print("Per-model holdout calibration skipped: no eligible holdout split.")
 
     ensemble_weights = np.array([1.0 / max(1, len(trained_models))] * len(trained_models), dtype=float)
+    holdout_labels = None
+    holdout_per_model = None
+    weight_diag = []
 
-    platt_scaler = None
-    platt_blend = float(np.clip(float(os.getenv('PLATT_BLEND_WEIGHT', '1.00')), 0.0, 1.0))
-    if use_ensemble_platt and LogisticRegression is not None and X_platt_holdout is not None and len(X_platt_holdout) >= 100:
+    calibration_model = None
+    calibration_method = str(os.getenv('ENSEMBLE_CALIBRATION_METHOD', 'platt')).strip().lower()
+    if calibration_method not in {'none', 'platt', 'isotonic'}:
+        calibration_method = 'platt'
+    calibration_blend = float(np.clip(float(os.getenv('ENSEMBLE_CALIBRATION_BLEND', os.getenv('PLATT_BLEND_WEIGHT', '1.00'))), 0.0, 1.0))
+    if X_platt_holdout is not None and len(X_platt_holdout) >= 100:
         holdout_labels = pd.to_numeric(y_platt_holdout, errors='coerce').fillna(0).astype(int)
         if holdout_labels.nunique() >= 2:
             try:
                 holdout_per_model = [
-                    _extract_positive_class_probabilities(m, X_platt_holdout) for m in trained_models
+                    _extract_positive_class_probabilities(m, X_platt_holdout) for m in inference_models
                 ]
                 ensemble_weights, weight_diag = calculate_ensemble_weights(
                     holdout_labels,
                     holdout_per_model,
                     model_names=model_names,
-                )
-                holdout_raw = weighted_ensemble_probabilities(holdout_per_model, ensemble_weights)
-                raw_metrics = calculate_probability_metrics(holdout_labels, holdout_raw)
-
-                platt_scaler = LogisticRegression(max_iter=1000, solver='lbfgs')
-                platt_scaler.fit(np.asarray(holdout_raw).reshape(-1, 1), holdout_labels)
-                holdout_platt = platt_scaler.predict_proba(np.asarray(holdout_raw).reshape(-1, 1))[:, 1]
-                platt_metrics = calculate_probability_metrics(holdout_labels, holdout_platt)
-
-                print(
-                    "Ensemble Platt calibration: "
-                    f"raw_brier={raw_metrics['brier_score']:.5f} -> platt_brier={platt_metrics['brier_score']:.5f}, "
-                    f"raw_logloss={raw_metrics['log_loss']:.5f} -> platt_logloss={platt_metrics['log_loss']:.5f}, "
-                    f"blend={platt_blend:.2f}"
                 )
                 if weight_diag:
                     print("Ensemble weights (log-loss aware):")
@@ -7517,15 +8011,51 @@ def generate_daily_predictions():
                             f"logloss={row['log_loss']:.5f} weight={row['weight']:.3f}"
                         )
             except Exception as exc:
-                platt_scaler = None
-                print(f"Ensemble Platt calibration unavailable: {exc}")
+                print(f"Ensemble holdout weighting unavailable: {exc}")
         else:
-            print("Ensemble Platt calibration skipped: holdout has single-class labels.")
+            print("Ensemble holdout weighting skipped: holdout has single-class labels.")
+
+    if use_ensemble_platt and member_level_calibrated_count > 0:
+        print("Ensemble-level calibration skipped because per-model calibration is active.")
+    elif use_ensemble_platt and LogisticRegression is not None and holdout_labels is not None and holdout_labels.nunique() >= 2 and holdout_per_model is not None:
+        if holdout_labels.nunique() >= 2:
+            try:
+                holdout_raw = weighted_ensemble_probabilities(holdout_per_model, ensemble_weights)
+                raw_metrics = calculate_probability_metrics(holdout_labels, holdout_raw)
+
+                holdout_calibrated = None
+                if calibration_method == 'isotonic' and IsotonicRegression is not None:
+                    calibration_model = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+                    calibration_model.fit(np.asarray(holdout_raw).reshape(-1), holdout_labels)
+                    holdout_calibrated = np.asarray(calibration_model.predict(np.asarray(holdout_raw).reshape(-1)))
+                elif calibration_method == 'none':
+                    calibration_model = None
+                else:
+                    calibration_method = 'platt'
+                    calibration_model = LogisticRegression(max_iter=1000, solver='lbfgs')
+                    calibration_model.fit(np.asarray(holdout_raw).reshape(-1, 1), holdout_labels)
+                    holdout_calibrated = calibration_model.predict_proba(np.asarray(holdout_raw).reshape(-1, 1))[:, 1]
+
+                if holdout_calibrated is not None:
+                    cal_metrics = calculate_probability_metrics(holdout_labels, holdout_calibrated)
+                    print(
+                        f"Ensemble {calibration_method} calibration (holdout-only): "
+                        f"raw_brier={raw_metrics['brier_score']:.5f} -> cal_brier={cal_metrics['brier_score']:.5f}, "
+                        f"raw_logloss={raw_metrics['log_loss']:.5f} -> cal_logloss={cal_metrics['log_loss']:.5f}, "
+                        f"blend={calibration_blend:.2f}"
+                    )
+                else:
+                    print("Ensemble calibration: method=none (raw probabilities retained)")
+            except Exception as exc:
+                calibration_model = None
+                print(f"Ensemble holdout calibration unavailable: {exc}")
+        else:
+            print("Ensemble holdout calibration skipped: holdout has single-class labels.")
 
     if X_platt_holdout is None and len(X_model_fit) >= 100:
         try:
             fit_per_model = [
-                _extract_positive_class_probabilities(m, X_model_fit) for m in trained_models
+                _extract_positive_class_probabilities(m, X_model_fit) for m in inference_models
             ]
             ensemble_weights, weight_diag = calculate_ensemble_weights(
                 y_model_fit,
@@ -7544,7 +8074,7 @@ def generate_daily_predictions():
 
     try:
         train_per_model = [
-            _extract_positive_class_probabilities(m, X_model_fit) for m in trained_models
+            _extract_positive_class_probabilities(m, X_model_fit) for m in inference_models
         ]
         train_probabilities = weighted_ensemble_probabilities(train_per_model, ensemble_weights)
         train_metrics = calculate_probability_metrics(y_model_fit, train_probabilities)
@@ -7969,9 +8499,65 @@ def generate_daily_predictions():
     print_x_today_diagnostics(live, features_train, tag='X_today', sample_rows=5)
 
     X_live = live[features_train]
-    all_probs = [_extract_positive_class_probabilities(m, X_live) for m in trained_models]
+
+    # Train-serving skew diagnostics: compare numeric feature distributions at fit vs live inference.
+    try:
+        train_num = X_model_fit.apply(pd.to_numeric, errors='coerce')
+        live_num = X_live.apply(pd.to_numeric, errors='coerce')
+        skew_rows = []
+        for col in features_train:
+            t = pd.to_numeric(train_num[col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+            l = pd.to_numeric(live_num[col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+            if t.empty or l.empty:
+                continue
+            t_q01 = float(t.quantile(0.01))
+            t_q99 = float(t.quantile(0.99))
+            l_med = float(l.median())
+            l_q90 = float(l.quantile(0.90))
+            out_of_band_rate = float(((l < t_q01) | (l > t_q99)).mean())
+            skew_rows.append({
+                'feature': col,
+                'train_q01': t_q01,
+                'train_q99': t_q99,
+                'live_median': l_med,
+                'live_q90': l_q90,
+                'live_out_of_band_rate': out_of_band_rate,
+            })
+        if skew_rows:
+            skew_df = pd.DataFrame(skew_rows).sort_values('live_out_of_band_rate', ascending=False)
+            top_skew = skew_df.head(10)
+            print("Feature alignment check (train vs live): top out-of-band features")
+            print(top_skew.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    except Exception as _skew_err:
+        print(f"Feature alignment check skipped: {_skew_err}")
+
+    all_probs = [_extract_positive_class_probabilities(m, X_live) for m in inference_models]
     probs = weighted_ensemble_probabilities(all_probs, ensemble_weights)
     live['ensemble_raw_prob'] = np.asarray(probs).reshape(-1)
+
+    use_prior_correction = str(os.getenv('PRIOR_CORRECTION_ENABLED', 'true')).strip().lower() in {'1', 'true', 'yes'}
+    if use_prior_correction:
+        probs_corrected, prior_diag = _apply_prior_probability_correction(
+            probs,
+            prior_correction_real_pos_rate,
+            prior_correction_sampled_pos_rate,
+        )
+        if prior_diag.get('applied'):
+            probs = probs_corrected
+            live['ensemble_prior_corrected_prob'] = np.asarray(probs_corrected).reshape(-1)
+            live['prior_correction_weight_factor'] = float(prior_diag.get('weight_factor', 1.0))
+            live['prior_real_pos_rate'] = float(prior_diag.get('real_pos_rate', np.nan))
+            live['prior_sampled_pos_rate'] = float(prior_diag.get('sampled_pos_rate', np.nan))
+            print(
+                "Prior correction applied: "
+                f"w={prior_diag.get('weight_factor', 1.0):.5f}, "
+                f"real={prior_diag.get('real_pos_rate', np.nan):.5f}, "
+                f"sampled={prior_diag.get('sampled_pos_rate', np.nan):.5f}"
+            )
+        else:
+            print(f"Prior correction skipped: {prior_diag.get('reason', 'unknown')}")
+    if 'ensemble_prior_corrected_prob' not in live.columns:
+        live['ensemble_prior_corrected_prob'] = np.nan
 
     # =====================================================================
     # PROFESSIONAL UPGRADE 1: PA Projection + Poisson-Weighted Conversion
@@ -8115,6 +8701,8 @@ def generate_daily_predictions():
 
     # Runtime probability mode selection and blend calibration.
     prob_mode, physics_weight = resolve_probability_mode_and_weight()
+    if simple_baseline_mode:
+        prob_mode, physics_weight = 'base', 0.0
     if prob_mode == 'base':
         probs = base_model_probs
         print("Probability mode: base (ML model only)")
@@ -8215,15 +8803,19 @@ def generate_daily_predictions():
     live['stacked_boost_multiplier_final'] = capped_multiplier
 
     # Final calibration wrapper must run after all pre-model and post-model multipliers.
-    if platt_scaler is not None:
+    if calibration_model is not None:
         try:
             probs_raw = np.asarray(probs).reshape(-1)
-            probs_platt = platt_scaler.predict_proba(probs_raw.reshape(-1, 1))[:, 1]
-            probs = np.clip(((1.0 - platt_blend) * probs_raw) + (platt_blend * probs_platt), 0.0, 1.0)
-            live['ensemble_platt_prob'] = probs_platt
-            live['ensemble_platt_blend_weight'] = platt_blend
+            if calibration_method == 'isotonic':
+                probs_cal = np.asarray(calibration_model.predict(probs_raw.reshape(-1)))
+            else:
+                probs_cal = calibration_model.predict_proba(probs_raw.reshape(-1, 1))[:, 1]
+            probs = np.clip(((1.0 - calibration_blend) * probs_raw) + (calibration_blend * probs_cal), 0.0, 1.0)
+            live['ensemble_calibrated_prob'] = probs_cal
+            live['ensemble_calibration_method'] = calibration_method
+            live['ensemble_calibration_blend_weight'] = calibration_blend
         except Exception as exc:
-            print(f"Final Platt scaling skipped: {exc}")
+            print(f"Final holdout calibration skipped: {exc}")
 
     # =====================================================================
     # PROFESSIONAL UPGRADE 2: Kelly Criterion with Simulated Probabilities
@@ -8262,12 +8854,24 @@ def generate_daily_predictions():
         live['pitcher_damage_boost'] = damage_boost
 
     # Optional conservative online sidecar blend (bounded adjustment around base ensemble).
-    probs, sidecar_probs, sidecar_blend_diag = apply_online_sidecar_blend(
-        probs,
-        live,
-        features_train,
-        sidecar_state=online_sidecar_state,
-    )
+    live['pre_sidecar_prob'] = np.asarray(probs).reshape(-1)
+    if simple_baseline_mode:
+        sidecar_probs = None
+        sidecar_blend_diag = {
+            'enabled': False,
+            'applied': False,
+            'reason': 'simple_baseline_mode',
+            'blend_weight': 0.0,
+            'max_delta': 0.0,
+            'update_count': int(online_sidecar_diag.get('update_count', 0) or 0),
+        }
+    else:
+        probs, sidecar_probs, sidecar_blend_diag = apply_online_sidecar_blend(
+            probs,
+            live,
+            features_train,
+            sidecar_state=online_sidecar_state,
+        )
     if sidecar_probs is None:
         live['sidecar_online_prob'] = np.nan
     else:
@@ -8280,27 +8884,32 @@ def generate_daily_predictions():
     live['sidecar_training_update_count'] = int(online_sidecar_diag.get('update_count', 0) or 0)
 
     live['pred_hr_prob'] = probs
-    if 'game_pk' in live.columns:
-        game_count_value = int(pd.to_numeric(live['game_pk'], errors='coerce').dropna().nunique())
+    if not simple_baseline_mode:
+        if 'game_pk' in live.columns:
+            game_count_value = int(pd.to_numeric(live['game_pk'], errors='coerce').dropna().nunique())
+        else:
+            game_count_value = max(1, int(np.ceil(len(live) / 18.0)))
+        live = apply_daily_hr_volume_constraints(
+            live,
+            game_count=max(1, game_count_value),
+            avg_hr_per_game=2.5,
+        )
+        live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
+        monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.35)
+        monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.45)
+        monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.030)
+        live = apply_monotonic_prob_calibration(
+            live,
+            gamma=monotonic_gamma,
+            cap=monotonic_cap,
+            top_signal_boost=monotonic_boost,
+        )
     else:
-        game_count_value = max(1, int(np.ceil(len(live) / 18.0)))
-    live = apply_daily_hr_volume_constraints(
-        live,
-        game_count=max(1, game_count_value),
-        avg_hr_per_game=2.5,
-    )
-    live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
-    monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.35)
-    monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.45)
-    monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.030)
-    live = apply_monotonic_prob_calibration(
-        live,
-        gamma=monotonic_gamma,
-        cap=monotonic_cap,
-        top_signal_boost=monotonic_boost,
-    )
+        print("Simple baseline mode: skipped sidecar and post-model probability transforms.")
 
     use_recent_calibration = str(os.getenv('RECENT_CALIBRATION_CORRECTION_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if simple_baseline_mode:
+        use_recent_calibration = False
     if use_recent_calibration:
         recent_cal_diag = {'applied': False, 'reason': 'not_run'}
         recent_days = max(3, _env_int('RECENT_CALIBRATION_DAYS', 7))
@@ -8527,6 +9136,9 @@ def generate_daily_predictions():
             lambda x: american_to_implied_prob(x) if pd.notna(x) else np.nan
         )
         live['matched_book_count'] = raw_book_lines.apply(lambda d: int(len(d)) if isinstance(d, dict) else 0)
+        live['raw_book_lines_json'] = raw_book_lines.apply(
+            lambda d: _json.dumps(d) if isinstance(d, dict) and d else '{}'
+        )
 
         def _book_dispersion(d):
             if not isinstance(d, dict) or not d:
@@ -8556,6 +9168,28 @@ def generate_daily_predictions():
         live['book_prob_dispersion'] = raw_book_lines.apply(_book_dispersion)
         live['arbitrage_value_pct'] = raw_book_lines.apply(_arbitrage_value_pct)
 
+        consensus_min_snapshots = max(1, _env_int('MARKET_CONSENSUS_MIN_SNAPSHOTS', 2))
+        consensus_min_books = max(1, _env_int('MARKET_CONSENSUS_MIN_BOOKS', 2))
+        consensus_max_spread = max(0.0, _env_float('MARKET_CONSENSUS_MAX_IMPLIED_SPREAD', 0.08))
+        snapshots_today = _load_odds_snapshots(datetime.today().strftime('%Y-%m-%d'))
+
+        def _consensus_for_row(row):
+            return _snapshot_market_consensus(
+                snapshots_today,
+                row.get('batter_name', ''),
+                min_snapshots=consensus_min_snapshots,
+                min_books=consensus_min_books,
+                max_implied_spread=consensus_max_spread,
+            )
+
+        consensus_rows = live.apply(_consensus_for_row, axis=1)
+        live['snapshot_consensus_points'] = consensus_rows.apply(lambda x: int(x.get('snapshot_points', 0)))
+        live['snapshot_consensus_books'] = consensus_rows.apply(lambda x: int(x.get('snapshot_books', 0)))
+        live['snapshot_consensus_implied_spread'] = consensus_rows.apply(
+            lambda x: _safe_float(x.get('snapshot_implied_spread'), np.nan)
+        )
+        live['market_consensus_ok'] = consensus_rows.apply(lambda x: bool(x.get('snapshot_consensus_ok', False)))
+
         live['sharp_retail_odds_gap'] = (
             pd.to_numeric(live['retail_market_odds_american'], errors='coerce')
             - pd.to_numeric(live['sharp_market_odds_american'], errors='coerce')
@@ -8565,10 +9199,12 @@ def generate_daily_predictions():
             - pd.to_numeric(live['sharp_market_implied_prob'], errors='coerce')
         )
 
-        # Prefer devigged market prob where available, else implied from best line.
+        # Prefer explicit best-line implied probabilities over fuzzy name-matched
+        # consensus probabilities to avoid stale/ambiguous baseline assignments.
         live['market_prob'] = pd.to_numeric(live['market_prob'], errors='coerce')
-        live['market_prob'] = live['market_prob'].fillna(live['sharp_market_implied_prob'])
-        live['market_prob'] = live['market_prob'].fillna(live['best_market_implied_prob'])
+        live['market_prob'] = pd.to_numeric(live['best_market_implied_prob'], errors='coerce').combine_first(
+            pd.to_numeric(live['sharp_market_implied_prob'], errors='coerce')
+        ).combine_first(live['market_prob'])
 
         medium_no_odds_mask = (
             live['model_reliability'].astype(str).str.upper().eq('MEDIUM')
@@ -8591,23 +9227,30 @@ def generate_daily_predictions():
         # =====================================================================
         # PROFESSIONAL UPGRADE 3: Advanced EV+ Filtering & True Expected Value
         # =====================================================================
+        ev_max_model_prob = float(np.clip(_env_float('EV_MAX_MODEL_PROB', 0.20), 0.01, 0.95))
+
         def calculate_row_ev(row):
             """Calculate a conservative EV estimate using the market's implied probability."""
-            model_p = float(row['pred_hr_prob'])
-            market_p = row.get('market_prob', None)
+            raw_model_p = float(row['pred_hr_prob'])
+            model_p_capped = float(min(raw_model_p, ev_max_model_prob))
 
-            if market_p is None or pd.isna(market_p) or market_p <= 0 or market_p >= 1:
-                return 0.0, 0.0
+            market_p = _safe_float(row.get('best_market_implied_prob'), np.nan)
+            if not np.isfinite(market_p) or market_p <= 0 or market_p >= 1:
+                market_p = _safe_float(row.get('market_prob'), np.nan)
+            if (not np.isfinite(market_p) or market_p <= 0 or market_p >= 1) and pd.notna(row.get('best_market_odds_american')):
+                market_p = _safe_float(american_to_implied_prob(row.get('best_market_odds_american')), np.nan)
 
-            # Convert the market probability into a fair-odds-style decimal price.
-            # For a true +EV bet, the model's probability must exceed the market's implied probability.
+            if not np.isfinite(market_p) or market_p <= 0 or market_p >= 1:
+                return 0.0, 0.0, model_p_capped, np.nan
+
+            # EV per $1 stake using capped model probability and the best-line market baseline.
             decimal_odds = 1.0 / market_p
-            ev_value = model_p * decimal_odds - 1.0
+            ev_value = model_p_capped * decimal_odds - 1.0
             ev_percent = ev_value * 100.0
 
-            return ev_value, ev_percent
+            return ev_value, ev_percent, model_p_capped, float(market_p)
         
-        live[['ev_value', 'ev_percent']] = live.apply(
+        live[['ev_value', 'ev_percent', 'model_p_capped', 'ev_market_prob']] = live.apply(
             lambda r: pd.Series(calculate_row_ev(r)), axis=1
         )
 
@@ -8617,12 +9260,21 @@ def generate_daily_predictions():
 
         elite_edge_abs = float(os.getenv('EV_EDGE_TRIGGER_ABS', '0.03'))
         elite_ev_pct = float(os.getenv('EV_TRIGGER_PCT', '10.0'))
+        elite_min_books = max(1, _env_int('EV_MIN_MATCHED_BOOKS', 2))
+        elite_max_dispersion = max(0.0, _env_float('EV_MAX_BOOK_PROB_DISPERSION', 0.10))
         arb_min_books = max(2, int(float(os.getenv('ARB_MIN_BOOKS', '3'))))
         arb_min_value_pct = float(os.getenv('ARB_MIN_VALUE_PCT', '3.0'))
+        elite_market_consensus_ok = (
+            live['market_consensus_ok'].fillna(False)
+            & (pd.to_numeric(live['matched_book_count'], errors='coerce').fillna(0) >= elite_min_books)
+            & (pd.to_numeric(live['book_prob_dispersion'], errors='coerce').fillna(1.0) <= elite_max_dispersion)
+        )
+        live['elite_market_consensus_ok'] = elite_market_consensus_ok
         live['elite_ev_signal'] = (
             (live['prob_edge_abs'] >= elite_edge_abs) &
             (live['ev_percent'] >= elite_ev_pct) &
-            (live['market_edge_pct'] >= 0.0)
+            (live['market_edge_pct'] >= 0.0) &
+            elite_market_consensus_ok
         )
         live['positive_ev_arbitrage'] = (
             (live['ev_percent'] > 0) &
@@ -8687,6 +9339,12 @@ def generate_daily_predictions():
         live['elite_ev_signal'] = False
         live['matched_book_count'] = 0
         live['book_prob_dispersion'] = 0.0
+        live['raw_book_lines_json'] = '{}'
+        live['snapshot_consensus_points'] = 0
+        live['snapshot_consensus_books'] = 0
+        live['snapshot_consensus_implied_spread'] = np.nan
+        live['market_consensus_ok'] = False
+        live['elite_market_consensus_ok'] = False
         live['arbitrage_value_pct'] = 0.0
         live['positive_ev_arbitrage'] = False
         live['arbitrage_score'] = 0.0
@@ -8816,9 +9474,10 @@ def generate_daily_predictions():
 
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
                                     'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
-                                    'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
+                                    'pred_hr_prob', 'model_p_capped', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
                                     'projected_pas', 'pa_distribution_std', 'pa_conversion_method',
                                     'kelly_multiplier',
+                                    'ensemble_raw_prob', 'ensemble_prior_corrected_prob', 'pre_sidecar_prob',
                                     'base_model_prob', 'physics_delta', 'blend_weight_physics', 'probability_mode',
                                     'physics_uplift_cap',
                                     'reliability_prob_cap',
@@ -8831,7 +9490,7 @@ def generate_daily_predictions():
                                     'stacked_boost_multiplier_raw', 'stacked_boost_multiplier_cap',
                                     'stacked_boost_multiplier_final',
                                     'best_book', 'best_market_odds_american', 'best_market_implied_prob',
-                                    'market_prob', 'market_edge_pct',
+                                    'market_prob', 'ev_market_prob', 'market_edge_pct',
                                     'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
                                     'arbitrage_value_pct', 'book_prob_dispersion', 'matched_book_count',
                                     'positive_ev_arbitrage', 'arbitrage_score',
@@ -8851,6 +9510,9 @@ def generate_daily_predictions():
                                     'recent_calibration_multiplier', 'recent_calibration_ratio_raw',
                                     'recent_calibration_pred_mean', 'recent_calibration_actual_mean',
                                     'pitcher_damage_boost',
+                                    'sidecar_online_prob', 'sidecar_blend_applied', 'sidecar_blend_weight',
+                                    'sidecar_max_delta', 'sidecar_update_count',
+                                    'sidecar_training_applied', 'sidecar_training_update_count',
                                     'confidence_lower_95pct', 'confidence_upper_95pct', 'model_reliability', 'batter_consistency_score',
                                     'model_name', 'prediction_timestamp']])
 
@@ -9015,7 +9677,8 @@ def generate_daily_predictions():
         print("\nTop Learned 2-Leg HR Pairings (Any Game):")
         pair_view = pair_df[[
             'pair_leg_1', 'pair_leg_2', 'pair_type',
-            'combo_prob', 'parlay_ev', 'learned_multiplier', 'training_days_used'
+            'true_combo_prob', 'parlay_edge_pct', 'sportsbook_book', 'parlay_edge_signal',
+            'learned_multiplier', 'training_days_used'
         ]].head(10)
         print(pair_view.to_string(index=False))
         try:
@@ -9243,52 +9906,23 @@ def generate_daily_predictions():
         send_discord_webhook(content="\n".join(promo_lines))
         print(f"Promo/boost alerts sent: {promo_count} opportunities")
 
-    # --- Same-Game Correlated Parlay analysis ---
-    # Two batters on same team facing same pitcher have positive correlation ~0.25 (shared game state).
-    # If book prices them independently, the SGP may be +EV vs the correlated true probability.
+    # --- Same-Game Correlated Parlay analysis (consensus-gated) ---
     sgp_lines = [f"🔗 **SAME-GAME PARLAY EDGES ({target_date})**"]
     sgp_count = 0
-    sgp_min_prob = _env_float('SGP_MIN_LEG_PROB', 0.10)
-    sgp_corr = float(os.getenv('SGP_BATTER_CORRELATION', '0.25'))
-    if 'game_pk' in live.columns and 'best_market_odds_american' in live.columns:
-        sgp_df = live[
-            pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0) >= sgp_min_prob
+    if not pair_df.empty:
+        sgp_df = pair_df[
+            pair_df['pair_type'].astype(str).eq('same_game')
+            & pair_df['parlay_edge_signal'].astype(bool)
         ].copy()
-        sgp_df['pred_hr_prob'] = pd.to_numeric(sgp_df['pred_hr_prob'], errors='coerce').fillna(0)
-        sgp_df['best_market_odds_american'] = pd.to_numeric(sgp_df['best_market_odds_american'], errors='coerce')
-        sgp_df = sgp_df[sgp_df['best_market_odds_american'].notna() & (sgp_df['best_market_odds_american'] > 0)]
-
-        from itertools import combinations as _combs
-        for gpk, grp in sgp_df.groupby('game_pk'):
-            if len(grp) < 2:
-                continue
-            rows = grp.to_dict('records')
-            for a, b in _combs(rows, 2):
-                if str(a.get('game_time', '')) != str(b.get('game_time', '')):
-                    continue
-                p1 = float(a['pred_hr_prob'])
-                p2 = float(b['pred_hr_prob'])
-                o1 = float(a['best_market_odds_american'])
-                o2 = float(b['best_market_odds_american'])
-                dec1 = 1 + o1 / 100.0
-                dec2 = 1 + o2 / 100.0
-                # True parlay probability with positive correlation
-                import math as _math
-                corr_boost = sgp_corr * _math.sqrt(p1 * (1 - p1) * p2 * (1 - p2))
-                true_parlay_prob = min(0.95, p1 * p2 + corr_boost)
-                # Book prices parlay as independent: implied_parlay = (imp1 * imp2)
-                imp1 = 100.0 / (100.0 + o1) if o1 > 0 else abs(o1) / (abs(o1) + 100.0)
-                imp2 = 100.0 / (100.0 + o2) if o2 > 0 else abs(o2) / (abs(o2) + 100.0)
-                book_parlay_implied = imp1 * imp2
-                parlay_ev_pct = (true_parlay_prob / book_parlay_implied - 1.0) * 100.0
-                if parlay_ev_pct >= 8.0:
-                    sgp_lines.append(
-                        f"🔗 {a.get('batter_name','')} ({o1:+.0f}) + {b.get('batter_name','')} ({o2:+.0f}) "
-                        f"vs {a.get('pitcher_name','')}: true={true_parlay_prob*100:.1f}%, "
-                        f"book_imp={book_parlay_implied*100:.1f}%, SGP EV={parlay_ev_pct:+.1f}% "
-                        f"[{a.get('game_time','')}]"
-                    )
-                    sgp_count += 1
+        for _, row in sgp_df.head(20).iterrows():
+            sgp_lines.append(
+                f"🔗 {row.get('pair_leg_1','')} + {row.get('pair_leg_2','')} | "
+                f"book={str(row.get('sportsbook_book','n/a')).title()} | "
+                f"true={float(row.get('true_combo_prob', 0.0))*100:.1f}%, "
+                f"book_imp={float(row.get('sportsbook_parlay_implied_prob', np.nan))*100:.1f}%, "
+                f"edge={float(row.get('parlay_edge_pct', 0.0)):+.1f}%"
+            )
+            sgp_count += 1
     if sgp_count:
         send_discord_webhook(content="\n".join(sgp_lines[:20]))
         print(f"SGP correlation edges sent: {sgp_count}")
@@ -9955,6 +10589,77 @@ def _split_best_lines_by_tier(book_map):
         'retail_market_odds_american': retail_odds,
         'best_book': best_book,
         'best_market_odds_american': best_odds,
+    }
+
+
+def _coerce_book_map(value):
+    """Normalize a raw/json book map into {book_key: american_odds_float}."""
+    data = value
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return {}
+        try:
+            data = _json.loads(txt)
+        except Exception:
+            return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    out = {}
+    for bk, odds in data.items():
+        o = _safe_float(odds)
+        if o is None or not np.isfinite(o):
+            continue
+        out[str(bk).strip().lower()] = float(o)
+    return out
+
+
+def _best_common_book_parlay_offer(book_map_a, book_map_b):
+    """Return best same-book 2-leg parlay offer from two leg book maps."""
+    a = _coerce_book_map(book_map_a)
+    b = _coerce_book_map(book_map_b)
+    common = sorted(set(a.keys()) & set(b.keys()))
+    if not common:
+        return {
+            'sportsbook_book': None,
+            'sportsbook_leg1_odds_american': np.nan,
+            'sportsbook_leg2_odds_american': np.nan,
+            'sportsbook_parlay_decimal': np.nan,
+            'sportsbook_parlay_implied_prob': np.nan,
+            'sportsbook_common_books': 0,
+        }
+
+    best_book = None
+    best_leg1 = np.nan
+    best_leg2 = np.nan
+    best_parlay_dec = np.nan
+    for bk in common:
+        o1 = _safe_float(a.get(bk))
+        o2 = _safe_float(b.get(bk))
+        d1 = _american_to_decimal_safe(o1)
+        d2 = _american_to_decimal_safe(o2)
+        if pd.isna(d1) or pd.isna(d2):
+            continue
+        dec = float(d1 * d2)
+        if pd.isna(best_parlay_dec) or dec > best_parlay_dec:
+            best_parlay_dec = dec
+            best_book = bk
+            best_leg1 = float(o1)
+            best_leg2 = float(o2)
+
+    implied = np.nan
+    if pd.notna(best_parlay_dec) and best_parlay_dec > 0:
+        implied = float(1.0 / best_parlay_dec)
+
+    return {
+        'sportsbook_book': best_book,
+        'sportsbook_leg1_odds_american': best_leg1,
+        'sportsbook_leg2_odds_american': best_leg2,
+        'sportsbook_parlay_decimal': best_parlay_dec,
+        'sportsbook_parlay_implied_prob': implied,
+        'sportsbook_common_books': int(len(common)),
     }
 
 
