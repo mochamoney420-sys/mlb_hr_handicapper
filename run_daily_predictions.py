@@ -4121,6 +4121,113 @@ def evaluate_saved_predictions(date_str=None):
 # =====================================================================
 # SECTION 2: ADAPTIVE HISTORICAL FEATURES SOURCING
 # =====================================================================
+def load_historical_statcast_seasons(
+    start_year=None,
+    end_year=None,
+    hist_dir='data/historical',
+    min_year=2019,
+):
+    """Load multi-year Statcast seasons from parquet cache, fetching missing years on first run.
+
+    Files are stored as data/historical/statcast_{year}.parquet.
+    Fetching one full season via pybaseball takes ~5-15 minutes and runs once per year.
+    Set HIST_SEASONS_ENABLED=false to disable (default: enabled when cache exists).
+    """
+    enabled = str(os.getenv('HIST_SEASONS_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if not enabled:
+        return pd.DataFrame()
+
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("ℹ️ Historical seasons disabled: install pyarrow for parquet support (pip install pyarrow).")
+        return pd.DataFrame()
+
+    Path(hist_dir).mkdir(parents=True, exist_ok=True)
+    today = datetime.today()
+    if end_year is None:
+        end_year = today.year - 1  # previous complete season
+    if start_year is None:
+        start_year = max(min_year, int(os.getenv('HIST_SEASONS_START_YEAR', str(end_year - 3))))
+    start_year = max(min_year, int(start_year))
+
+    def _sanitize_for_concat(df_in):
+        """Convert extension dtypes to numpy/object to avoid concat mask blowups."""
+        if df_in is None or df_in.empty:
+            return df_in
+        df_out = df_in.copy()
+        for col in df_out.columns:
+            s = df_out[col]
+            if pd.api.types.is_extension_array_dtype(s.dtype):
+                if str(s.dtype) == 'boolean':
+                    df_out[col] = s.fillna(False).astype(bool)
+                elif pd.api.types.is_numeric_dtype(s.dtype):
+                    df_out[col] = pd.to_numeric(s, errors='coerce')
+                else:
+                    df_out[col] = s.astype('object')
+        return df_out
+
+    def _trim_year_frame(df_in, keep_rows):
+        """Keep the most recent rows from a season frame for low-memory fallback."""
+        if df_in is None or df_in.empty or len(df_in) <= keep_rows:
+            return df_in
+        if 'game_date' in df_in.columns:
+            tmp = df_in.copy()
+            tmp['game_date'] = pd.to_datetime(tmp['game_date'], errors='coerce')
+            tmp = tmp.sort_values('game_date')
+            return tmp.tail(keep_rows).copy()
+        return df_in.tail(keep_rows).copy()
+
+    frames = []
+    for year in range(start_year, end_year + 1):
+        pq_path = Path(hist_dir) / f'statcast_{year}.parquet'
+        if pq_path.exists():
+            try:
+                df_yr = pd.read_parquet(pq_path)
+                df_yr = _sanitize_for_concat(df_yr)
+                frames.append(df_yr)
+                print(f"  Historical {year}: {len(df_yr):,} rows loaded from cache")
+                continue
+            except Exception as exc:
+                print(f"  Historical {year}: cache corrupt, re-fetching ({exc})")
+
+        # One-time fetch — this is slow (~10-15 min per season) but runs once.
+        print(f"  Historical {year}: fetching from Baseball Savant (one-time, ~10-15 min)...")
+        try:
+            chunks = []
+            start_dt = f"{year}-03-01"
+            end_dt = f"{year}-11-30"
+            season_df = statcast_with_timeout(start_dt=start_dt, end_dt=end_dt, timeout_seconds=1800)
+            if season_df is not None and not season_df.empty:
+                season_df.to_parquet(pq_path, index=False)
+                season_df = _sanitize_for_concat(season_df)
+                frames.append(season_df)
+                print(f"  Historical {year}: {len(season_df):,} rows fetched and cached")
+            else:
+                print(f"  Historical {year}: no data returned")
+        except Exception as exc:
+            print(f"  Historical {year}: fetch failed ({exc})")
+
+    if not frames:
+        return pd.DataFrame()
+
+    try:
+        hist = pd.concat(frames, ignore_index=True)
+    except MemoryError:
+        fallback_rows = max(75000, int(os.getenv('HIST_FALLBACK_ROWS_PER_YEAR', '250000')))
+        print(
+            "  Warning: low memory while combining historical seasons; "
+            f"retrying with last {fallback_rows:,} rows per year"
+        )
+        trimmed_frames = [_trim_year_frame(_sanitize_for_concat(f), fallback_rows) for f in frames]
+        trimmed_frames = [f for f in trimmed_frames if f is not None and not f.empty]
+        if not trimmed_frames:
+            return pd.DataFrame()
+        hist = pd.concat(trimmed_frames, ignore_index=True)
+    print(f"✅ Historical seasons {start_year}-{end_year}: {len(hist):,} total rows loaded")
+    return hist
+
+
 def get_advanced_hr_metrics(days_back=60):
     cache_dir = "cache"
     os.makedirs(cache_dir, exist_ok=True)
@@ -4156,7 +4263,31 @@ def get_advanced_hr_metrics(days_back=60):
     if not all_days_data:
         raise ValueError("Critical Error: No Statcast training data available from cache or Baseball Savant.")
 
-    df = pd.concat(all_days_data, ignore_index=True)
+    recent_df = pd.concat(all_days_data, ignore_index=True)
+
+    # Merge multi-year historical data when available, with time-decay weighting.
+    hist_df = load_historical_statcast_seasons()
+    if not hist_df.empty:
+        # Assign sample weights: recent rows = 1.0, historical rows decay by year.
+        hist_df['game_date'] = pd.to_datetime(hist_df.get('game_date', pd.NaT), errors='coerce')
+        today_ts = pd.Timestamp(today.date())
+        days_old = (today_ts - hist_df['game_date']).dt.days.clip(lower=0).fillna(730)
+        # Half-life 180 days so last-season data retains ~50% weight.
+        hist_df['_sample_weight'] = np.exp(-np.log(2) * days_old / 180.0).clip(lower=0.10, upper=1.0)
+        recent_df['_sample_weight'] = 1.0
+        df = pd.concat([recent_df, hist_df], ignore_index=True)
+        # Deduplicate: keep the more recent copy of any (game_pk, batter, pitcher) combination.
+        for _id_col in ['game_pk', 'batter', 'pitcher']:
+            if _id_col in df.columns:
+                df[_id_col] = pd.to_numeric(df[_id_col], errors='coerce')
+        df = df.sort_values('_sample_weight', ascending=False).drop_duplicates(
+            subset=['game_pk', 'batter', 'pitcher'], keep='first'
+        ) if {'game_pk', 'batter', 'pitcher'}.issubset(df.columns) else df
+        print(f"✅ Combined dataset: {len(df):,} rows (recent + {len(hist_df):,} historical after dedup)")
+    else:
+        df = recent_df
+        df['_sample_weight'] = 1.0
+
     pitch_df = df.copy()
     pa_df = df.dropna(subset=['events']).drop_duplicates(subset=['game_pk', 'batter', 'at_bat_number']).copy()
     pa_df['has_platoon_advantage'] = (pa_df['stand'] != pa_df['p_throws']).astype(int)
@@ -8635,6 +8766,86 @@ def generate_daily_predictions():
     except Exception as _morning_exc:
         print(f"Morning market-release alert skipped: {_morning_exc}")
 
+    def _american_to_decimal(odds):
+        try:
+            o = float(odds)
+            return 1 + o / 100.0 if o > 0 else 1 + 100.0 / abs(o)
+        except Exception:
+            return None
+
+    def _build_betting_card(ev_picks_df, date_str):
+        """Return an actionable Discord betting card with book, stake, and parlay legs."""
+        if ev_picks_df is None or ev_picks_df.empty:
+            return None
+
+        card_lines = [
+            f"🎯 **MLB HR BETTING CARD — {date_str}**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "📋 **TODAY'S SINGLES** (place at the book listed)",
+        ]
+
+        singles = []
+        for i, (_, row) in enumerate(ev_picks_df.head(8).iterrows(), 1):
+            name = str(row.get('batter_name', '') or row.get('hr_probability', ''))
+            pitcher = str(row.get('pitcher_name', ''))
+            prob = float(row.get('hr_probability', row.get('pred_hr_prob', 0)) or 0) * 100
+            book = str(row.get('best_book') or 'N/A').title()
+            odds_raw = row.get('best_market_odds_american', None)
+            ev_pct = float(row.get('ev_pct', row.get('ev_percent', 0)) or 0)
+            stake = float(row.get('stake_usd', 0) or 0)
+            mkt_pct = float(row.get('market_prob', 0) or 0) * 100
+            gtime = str(row.get('game_time', ''))
+
+            if pd.isna(odds_raw):
+                continue
+            odds_i = int(float(odds_raw))
+            emoji = "1️⃣ 2️⃣ 3️⃣ 4️⃣ 5️⃣ 6️⃣ 7️⃣ 8️⃣".split()[i - 1]
+            card_lines.append(
+                f"\n{emoji} **{name}** to HR vs {pitcher}\n"
+                f"   🏦 **{book}** | **{odds_i:+d}** | 💵 Stake: **${stake:.0f}**\n"
+                f"   📊 Model {prob:.1f}% vs Market {mkt_pct:.1f}% | EV: **{ev_pct:+.0f}%**\n"
+                f"   🕐 {gtime}"
+            )
+            singles.append({'name': name, 'odds': odds_i, 'book': book, 'prob': prob / 100, 'stake': stake})
+
+        if not singles:
+            return None
+
+        # Build parlay suggestions
+        card_lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        card_lines.append("🎰 **LOTTO PARLAYS** (small stakes, big upside)")
+
+        top3 = singles[:3]
+        if len(top3) >= 2:
+            # 2-leg parlays
+            card_lines.append("\n**2-Leg Bombs (bet $5-15 each):**")
+            for a, b in [(top3[0], top3[1]), (top3[0], top3[2]) if len(top3) > 2 else (top3[0], top3[1])]:
+                dec_a = _american_to_decimal(a['odds'])
+                dec_b = _american_to_decimal(b['odds'])
+                if dec_a and dec_b:
+                    parlay_dec = dec_a * dec_b
+                    parlay_am = int((parlay_dec - 1) * 100) if parlay_dec >= 2 else int(-100 / (parlay_dec - 1))
+                    card_lines.append(
+                        f"• **{a['name']}** + **{b['name']}** "
+                        f"≈ {parlay_am:+,} | Book: {a['book']}"
+                    )
+
+        if len(top3) >= 3:
+            # 3-leg lotto
+            card_lines.append("\n**3-Leg Lotto (bet $1-5):**")
+            dec_all = [_american_to_decimal(s['odds']) for s in top3]
+            if all(d for d in dec_all):
+                p3_dec = dec_all[0] * dec_all[1] * dec_all[2]
+                p3_am = int((p3_dec - 1) * 100)
+                legs = " + ".join(s['name'].split()[0] for s in top3)
+                card_lines.append(f"• **{legs}** ≈ **{p3_am:+,}** | 🎯 True edge via correlation")
+
+        total_singles = sum(s['stake'] for s in singles)
+        card_lines.append(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        card_lines.append(f"💰 **Suggested singles exposure: ${total_singles:.0f}** | Parlays: $10-30")
+        card_lines.append("⚠️ *Line shop — check all books before placing*")
+        return "\n".join(card_lines)
+
     def _post_pick_table_batches(df, title):
         if df is None or df.empty:
             return True
@@ -8700,6 +8911,80 @@ def generate_daily_predictions():
     sent_radar = _post_pick_table_batches(radar, f"\U0001f535 HR Radar Picks (Physics Movers & Sleepers) ({len(radar)})")
     if not top_ev.empty:
         sent_ev = _post_pick_table_batches(top_ev, f"\u2705 +EV HR Picks (Top {len(top_ev)})")
+        # Send the actionable betting card right after the EV table.
+        card_msg = _build_betting_card(top_ev, target_date)
+        if card_msg:
+            send_discord_webhook(content=card_msg)
+
+    # --- Promo/Boost Detection: flag when any book is 40+ American odds better than Pinnacle ---
+    promo_lines = [f"🎁 **PROMO/BOOST ALERTS ({target_date})**"]
+    promo_count = 0
+    if 'sharp_market_odds_american' in live.columns and 'best_market_odds_american' in live.columns:
+        sharp = pd.to_numeric(live['sharp_market_odds_american'], errors='coerce')
+        best = pd.to_numeric(live['best_market_odds_american'], errors='coerce')
+        boost_mask = (best.notna() & sharp.notna() & (best > 0) & ((best - sharp) >= 40))
+        if boost_mask.any():
+            for _, row in live[boost_mask].sort_values('best_market_odds_american', ascending=False).head(6).iterrows():
+                gap = float(row['best_market_odds_american']) - float(row['sharp_market_odds_american'])
+                promo_lines.append(
+                    f"🔥 {row.get('batter_name','')} vs {row.get('pitcher_name','')}: "
+                    f"Pinnacle {int(row['sharp_market_odds_american']):+d} → {row.get('best_book','?').title()} "
+                    f"{int(row['best_market_odds_american']):+d} (gap: +{gap:.0f}) — likely promo/boost"
+                )
+                promo_count += 1
+    if promo_count:
+        send_discord_webhook(content="\n".join(promo_lines))
+        print(f"Promo/boost alerts sent: {promo_count} opportunities")
+
+    # --- Same-Game Correlated Parlay analysis ---
+    # Two batters on same team facing same pitcher have positive correlation ~0.25 (shared game state).
+    # If book prices them independently, the SGP may be +EV vs the correlated true probability.
+    sgp_lines = [f"🔗 **SAME-GAME PARLAY EDGES ({target_date})**"]
+    sgp_count = 0
+    sgp_min_prob = _env_float('SGP_MIN_LEG_PROB', 0.10)
+    sgp_corr = float(os.getenv('SGP_BATTER_CORRELATION', '0.25'))
+    if 'game_pk' in live.columns and 'best_market_odds_american' in live.columns:
+        sgp_df = live[
+            pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0) >= sgp_min_prob
+        ].copy()
+        sgp_df['pred_hr_prob'] = pd.to_numeric(sgp_df['pred_hr_prob'], errors='coerce').fillna(0)
+        sgp_df['best_market_odds_american'] = pd.to_numeric(sgp_df['best_market_odds_american'], errors='coerce')
+        sgp_df = sgp_df[sgp_df['best_market_odds_american'].notna() & (sgp_df['best_market_odds_american'] > 0)]
+
+        from itertools import combinations as _combs
+        for gpk, grp in sgp_df.groupby('game_pk'):
+            if len(grp) < 2:
+                continue
+            rows = grp.to_dict('records')
+            for a, b in _combs(rows, 2):
+                if str(a.get('game_time', '')) != str(b.get('game_time', '')):
+                    continue
+                p1 = float(a['pred_hr_prob'])
+                p2 = float(b['pred_hr_prob'])
+                o1 = float(a['best_market_odds_american'])
+                o2 = float(b['best_market_odds_american'])
+                dec1 = 1 + o1 / 100.0
+                dec2 = 1 + o2 / 100.0
+                # True parlay probability with positive correlation
+                import math as _math
+                corr_boost = sgp_corr * _math.sqrt(p1 * (1 - p1) * p2 * (1 - p2))
+                true_parlay_prob = min(0.95, p1 * p2 + corr_boost)
+                # Book prices parlay as independent: implied_parlay = (imp1 * imp2)
+                imp1 = 100.0 / (100.0 + o1) if o1 > 0 else abs(o1) / (abs(o1) + 100.0)
+                imp2 = 100.0 / (100.0 + o2) if o2 > 0 else abs(o2) / (abs(o2) + 100.0)
+                book_parlay_implied = imp1 * imp2
+                parlay_ev_pct = (true_parlay_prob / book_parlay_implied - 1.0) * 100.0
+                if parlay_ev_pct >= 8.0:
+                    sgp_lines.append(
+                        f"🔗 {a.get('batter_name','')} ({o1:+.0f}) + {b.get('batter_name','')} ({o2:+.0f}) "
+                        f"vs {a.get('pitcher_name','')}: true={true_parlay_prob*100:.1f}%, "
+                        f"book_imp={book_parlay_implied*100:.1f}%, SGP EV={parlay_ev_pct:+.1f}% "
+                        f"[{a.get('game_time','')}]"
+                    )
+                    sgp_count += 1
+    if sgp_count:
+        send_discord_webhook(content="\n".join(sgp_lines[:20]))
+        print(f"SGP correlation edges sent: {sgp_count}")
 
     sent_straight = True
     if not straight_discrepancies.empty:
@@ -8717,6 +9002,26 @@ def generate_daily_predictions():
                 f"odds={int(float(row.get('best_market_odds_american', 0))):+d}"
             )
         sent_straight = send_discord_webhook(content="\n".join(straight_lines))
+
+    # --- Conservative shortlist to Discord ---
+    try:
+        conservative_path = Path('data') / f'conservative_bet_ready_{target_date}.csv'
+        if conservative_path.exists():
+            cons = pd.read_csv(conservative_path)
+            if not cons.empty:
+                cons_lines = [f"🛡️ **CONSERVATIVE BET-READY ({target_date}) — {len(cons)} picks**"]
+                for _, row in cons.head(8).iterrows():
+                    cons_lines.append(
+                        f"- {row.get('batter_name','')} vs {row.get('pitcher_name','')}: "
+                        f"prob={float(row.get('pred_hr_prob',0))*100:.1f}%, "
+                        f"odds={int(float(row.get('best_market_odds_american',0))) if pd.notna(row.get('best_market_odds_american')) else 'N/A'}, "
+                        f"EV={float(row.get('ev_percent',0)):+.1f}%, "
+                        f"Kelly={float(row.get('kelly_fraction',0)):.3f}, "
+                        f"stake=${float(row.get('stake_usd',0)):.0f} [{row.get('game_time','')}]"
+                    )
+                send_discord_webhook(content="\n".join(cons_lines))
+    except Exception:
+        pass
 
     if not sent_prob or not sent_ev or not sent_radar or not sent_straight:
         print("Failed to transmit one or more Discord pick tables after trying configured candidates.")
