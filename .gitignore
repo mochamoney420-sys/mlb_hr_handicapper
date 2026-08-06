@@ -20,6 +20,7 @@ data/*.jsonl
 data/*.pid
 data/morning_learning_summary_sent_*.txt
 data/historical/*.parquet
+data/online_sidecar_state.pkl
 
 # Optional local logs
 *.log
