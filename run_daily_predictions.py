@@ -2117,8 +2117,10 @@ def calibrate_physics_blend_weight(days_lookback=30, default_weight=0.55):
 
     for f in sorted(Path('data').glob('predictions_*.csv')):
         try:
-            date_str = f.stem.replace('predictions_', '')
-            file_date = datetime.strptime(date_str, '%Y-%m-%d')
+            file_date = _extract_date_from_prefixed_stem(f.stem, 'predictions_')
+            if file_date is None:
+                continue
+            date_str = file_date.strftime('%Y-%m-%d')
             if file_date < cutoff:
                 continue
 
@@ -2289,7 +2291,9 @@ def run_model_self_check(days_lookback=30):
     bad_files = []
     for f in sorted(Path('data').glob('predictions_*.csv')):
         try:
-            file_date = datetime.strptime(f.stem.replace('predictions_', ''), '%Y-%m-%d')
+            file_date = _extract_date_from_prefixed_stem(f.stem, 'predictions_')
+            if file_date is None:
+                continue
             if file_date < cutoff:
                 continue
             pred_files.append(f)
@@ -2621,8 +2625,9 @@ def backfill_physics_columns(days_lookback=30):
     print(f"Backfilling physics columns for last {days_lookback} days...")
     for f in sorted(Path('data').glob('predictions_*.csv')):
         try:
-            date_str = f.stem.replace('predictions_', '')
-            file_date = datetime.strptime(date_str, '%Y-%m-%d')
+            file_date = _extract_date_from_prefixed_stem(f.stem, 'predictions_')
+            if file_date is None:
+                continue
             if file_date < cutoff:
                 continue
 
@@ -2729,7 +2734,9 @@ def print_weekly_todo(days_lookback=7):
     eval_files = []
     for f in Path('data').glob('predictions_*.csv'):
         try:
-            d = datetime.strptime(f.stem.replace('predictions_', ''), '%Y-%m-%d')
+            d = _extract_date_from_prefixed_stem(f.stem, 'predictions_')
+            if d is None:
+                continue
             if d >= cutoff:
                 pred_files.append(f)
         except Exception:
@@ -4212,45 +4219,123 @@ def save_odds_snapshot(odds_raw, date_str=None):
         f.write(_json.dumps(entry) + '\n')
 
 
+def _book_map_consensus_implied_prob(book_map, preferred_books=None):
+    """Return (median_implied_prob, count) from a sportsbook map.
+
+    Uses implied probability, not raw American-odds points, to keep math stable
+    across positive/negative line ranges.
+    """
+    if not isinstance(book_map, dict) or not book_map:
+        return None, 0
+
+    preferred = None
+    if preferred_books is not None:
+        preferred = {str(b).strip().lower() for b in preferred_books if str(b).strip()}
+
+    implied_probs = []
+    for bk, odds in book_map.items():
+        bk_norm = str(bk).strip().lower()
+        if preferred is not None and bk_norm not in preferred:
+            continue
+        o = _safe_float(odds)
+        if o is None or not np.isfinite(o):
+            continue
+        try:
+            p = float(american_to_implied_prob(o))
+        except Exception:
+            continue
+        if np.isfinite(p) and 0.0 < p < 1.0:
+            implied_probs.append(p)
+
+    if not implied_probs:
+        return None, 0
+    return float(np.median(implied_probs)), int(len(implied_probs))
+
+
+def _book_map_mean_implied_delta(curr_map, prev_map, preferred_books=None):
+    """Return (mean_delta, n_books, agreement_ratio) in implied-probability space."""
+    if not isinstance(curr_map, dict) or not isinstance(prev_map, dict):
+        return None, 0, 0.0
+
+    preferred = None
+    if preferred_books is not None:
+        preferred = {str(b).strip().lower() for b in preferred_books if str(b).strip()}
+
+    deltas = []
+    for bk, curr_odds in curr_map.items():
+        bk_norm = str(bk).strip().lower()
+        if preferred is not None and bk_norm not in preferred:
+            continue
+        if bk not in prev_map:
+            continue
+        prev_odds = prev_map.get(bk)
+        try:
+            curr_p = float(american_to_implied_prob(curr_odds))
+            prev_p = float(american_to_implied_prob(prev_odds))
+        except Exception:
+            continue
+        if not (np.isfinite(curr_p) and np.isfinite(prev_p)):
+            continue
+        deltas.append(curr_p - prev_p)
+
+    if not deltas:
+        return None, 0, 0.0
+
+    pos = sum(1 for d in deltas if d > 0)
+    neg = sum(1 for d in deltas if d < 0)
+    agreement = max(pos, neg) / max(1, len(deltas))
+    return float(np.mean(deltas)), int(len(deltas)), float(agreement)
+
+
 def detect_rlm(current_odds, previous_odds, watch_batters):
     """Detect reverse line movement or sharp/public divergence on watched batters.
     Returns list of (batter_name, sharp_move, square_move, signal) tuples."""
     alerts = []
+    rlm_min_books = max(1, _env_int('LINE_MOVE_MIN_BOOKS', 2))
+    rlm_min_sharp_delta_pts = max(0.10, _env_float('RLM_MIN_SHARP_DELTA_PTS', 1.0))
+    rlm_min_divergence_pts = max(0.20, _env_float('RLM_MIN_DIVERGENCE_PTS', 1.8))
+    steam_min_mean_delta_pts = max(0.20, _env_float('STEAM_MIN_MEAN_DELTA_PTS', 1.2))
+    steam_min_agreement = float(np.clip(_env_float('STEAM_MIN_BOOK_AGREEMENT', 0.65), 0.50, 1.0))
+
     for batter in watch_batters:
         curr = current_odds.get(batter)
         prev = previous_odds.get(batter)
         if not curr or not prev:
             continue
 
-        sharp_moves, square_moves, all_moves = [], [], []
-        for book, price in curr.items():
-            if book not in prev:
+        sharp_delta, sharp_n, _ = _book_map_mean_implied_delta(curr, prev, preferred_books=SHARP_BOOKS)
+        square_delta, square_n, _ = _book_map_mean_implied_delta(curr, prev, preferred_books=SQUARE_BOOKS)
+        all_delta, all_n, all_agreement = _book_map_mean_implied_delta(curr, prev, preferred_books=None)
+
+        if all_delta is None or all_n < rlm_min_books:
+            continue
+
+        sharp_pts = (sharp_delta or 0.0) * 100.0
+        square_pts = (square_delta or 0.0) * 100.0
+        all_pts = all_delta * 100.0
+
+        if sharp_delta is not None and square_delta is not None and sharp_n >= rlm_min_books and square_n >= rlm_min_books:
+            divergence_pts = (sharp_delta - square_delta) * 100.0
+            if (
+                (sharp_delta * square_delta) < 0
+                and abs(sharp_pts) >= rlm_min_sharp_delta_pts
+                and abs(divergence_pts) >= rlm_min_divergence_pts
+            ):
+                signal = (
+                    f"RLM — sharp Δ {sharp_pts:+.2f} pts ({sharp_n} books) | "
+                    f"public Δ {square_pts:+.2f} pts ({square_n} books) | "
+                    f"divergence {divergence_pts:+.2f} pts"
+                )
+                alerts.append((batter, sharp_pts, square_pts, signal))
                 continue
-            move = price - prev[book]
-            all_moves.append(move)
-            if book in SHARP_BOOKS:
-                sharp_moves.append(move)
-            elif book in SQUARE_BOOKS:
-                square_moves.append(move)
 
-        if not all_moves:
-            continue
-
-        max_move = max(abs(m) for m in all_moves)
-        if max_move < 3:
-            continue
-
-        sharp_avg = sum(sharp_moves) / len(sharp_moves) if sharp_moves else None
-        square_avg = sum(square_moves) / len(square_moves) if square_moves else None
-
-        if sharp_avg is not None and square_avg is not None and abs(sharp_avg) > 2 and abs(square_avg) > 2:
-            if sharp_avg * square_avg < 0:  # moving in opposite directions
-                signal = f"RLM — sharps: {sharp_avg:+.1f} / public: {square_avg:+.1f} across {len(all_moves)} books"
-                alerts.append((batter, sharp_avg, square_avg, signal))
-        elif max_move >= 8:
-            avg_move = sum(all_moves) / len(all_moves)
-            signal = f"STEAM — {avg_move:+.1f} pts avg across {len(all_moves)} books"
-            alerts.append((batter, avg_move, avg_move, signal))
+        if abs(all_pts) >= steam_min_mean_delta_pts and all_agreement >= steam_min_agreement:
+            direction = 'shortening' if all_pts > 0 else 'drifting'
+            signal = (
+                f"STEAM — consensus implied Δ {all_pts:+.2f} pts across {all_n} books "
+                f"({all_agreement*100:.0f}% agreement, {direction})"
+            )
+            alerts.append((batter, all_pts, all_pts, signal))
 
     return alerts
 
@@ -4343,6 +4428,85 @@ def _nightly_accuracy_marker_path(target_date):
     return Path('data') / f'nightly_accuracy_summary_sent_{target_date}.txt'
 
 
+def _compute_nightly_accuracy_grade(merged_df):
+    """Return nightly grade diagnostics from evaluated predictions."""
+    if merged_df is None or merged_df.empty:
+        return {
+            'grade': 'N/A',
+            'score': 0.0,
+            'brier': np.nan,
+            'log_loss': np.nan,
+            'actual_rate': np.nan,
+            'pred_rate': np.nan,
+            'calibration_gap': np.nan,
+            'top10_rate': np.nan,
+        }
+
+    work = merged_df.copy()
+    p = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 1.0)
+    y = pd.to_numeric(work.get('actual_hr', 0.0), errors='coerce').fillna(0.0).clip(0.0, 1.0)
+
+    brier = float(np.mean((p - y) ** 2)) if len(work) else np.nan
+    try:
+        log_loss_val = float(calculate_probability_metrics(y, p).get('log_loss', np.nan))
+    except Exception:
+        log_loss_val = np.nan
+
+    actual_rate = float(y.mean()) if len(work) else np.nan
+    pred_rate = float(p.mean()) if len(work) else np.nan
+    calibration_gap = float(abs(pred_rate - actual_rate)) if np.isfinite(pred_rate) and np.isfinite(actual_rate) else np.nan
+
+    top10 = work.assign(_p=p.values).sort_values('_p', ascending=False).head(10)
+    top10_rate = float(pd.to_numeric(top10.get('actual_hr', 0.0), errors='coerce').fillna(0.0).mean()) if not top10.empty else np.nan
+
+    score = 100.0
+    if np.isfinite(brier):
+        if brier > 0.12:
+            score -= 35
+        elif brier > 0.09:
+            score -= 25
+        elif brier > 0.07:
+            score -= 15
+        elif brier > 0.05:
+            score -= 8
+
+    if np.isfinite(calibration_gap):
+        if calibration_gap > 0.12:
+            score -= 30
+        elif calibration_gap > 0.08:
+            score -= 20
+        elif calibration_gap > 0.05:
+            score -= 12
+        elif calibration_gap > 0.03:
+            score -= 6
+
+    if np.isfinite(top10_rate) and np.isfinite(actual_rate) and top10_rate < actual_rate:
+        score -= 10
+
+    score = float(np.clip(score, 0.0, 100.0))
+    if score >= 90:
+        grade = 'A'
+    elif score >= 80:
+        grade = 'B'
+    elif score >= 70:
+        grade = 'C'
+    elif score >= 60:
+        grade = 'D'
+    else:
+        grade = 'F'
+
+    return {
+        'grade': grade,
+        'score': score,
+        'brier': brier,
+        'log_loss': log_loss_val,
+        'actual_rate': actual_rate,
+        'pred_rate': pred_rate,
+        'calibration_gap': calibration_gap,
+        'top10_rate': top10_rate,
+    }
+
+
 def send_nightly_accuracy_summary(date_str=None, webhook_url=None, predicted_threshold=None):
     """Send end-of-night accuracy summary with full HR list and predicted counts."""
     target_date = date_str or (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -4377,12 +4541,20 @@ def send_nightly_accuracy_summary(date_str=None, webhook_url=None, predicted_thr
     hrs = hrs.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
     hrs['predicted_flag'] = hrs['pred_hr_prob'] >= threshold
 
+    grade_diag = _compute_nightly_accuracy_grade(merged)
+
     total_hrs = int(len(hrs))
     predicted_count = int(hrs['predicted_flag'].sum())
     hit_rate = (predicted_count / total_hrs) if total_hrs > 0 else 0.0
 
     lines = [
         f"**🌙 Nightly HR Accuracy — {target_date}**",
+        f"Nightly Grade: {grade_diag.get('grade', 'N/A')} ({grade_diag.get('score', 0.0):.1f}/100)",
+        (
+            f"Brier {grade_diag.get('brier', np.nan):.4f} | "
+            f"LogLoss {grade_diag.get('log_loss', np.nan):.4f} | "
+            f"Cal Gap {grade_diag.get('calibration_gap', np.nan)*100:.2f} pts"
+        ),
         f"Total HRs: {total_hrs}",
         f"Predicted by model (>= {threshold * 100:.0f}%): {predicted_count}/{total_hrs} ({hit_rate * 100:.1f}%)",
         "Full HR list:",
@@ -9526,11 +9698,12 @@ def generate_daily_predictions():
             - pd.to_numeric(live['sharp_market_implied_prob'], errors='coerce')
         )
 
-        # Prefer explicit best-line implied probabilities over fuzzy name-matched
-        # consensus probabilities to avoid stale/ambiguous baseline assignments.
+        # Use only core sportsbook tiers (sharp/retail) as probability baseline.
+        # Do not fall back to best payout line for baseline math because outlier
+        # books/promos can produce misleading edge percentages.
         live['market_prob'] = pd.to_numeric(live['market_prob'], errors='coerce')
-        live['market_prob'] = pd.to_numeric(live['best_market_implied_prob'], errors='coerce').combine_first(
-            pd.to_numeric(live['sharp_market_implied_prob'], errors='coerce')
+        live['market_prob'] = pd.to_numeric(live['sharp_market_implied_prob'], errors='coerce').combine_first(
+            pd.to_numeric(live['retail_market_implied_prob'], errors='coerce')
         ).combine_first(live['market_prob'])
 
         medium_no_odds_mask = (
@@ -9561,11 +9734,11 @@ def generate_daily_predictions():
             raw_model_p = float(row['pred_hr_prob'])
             model_p_capped = float(min(raw_model_p, ev_max_model_prob))
 
-            market_p = _safe_float(row.get('best_market_implied_prob'), np.nan)
+            market_p = _safe_float(row.get('market_prob'), np.nan)
             if not np.isfinite(market_p) or market_p <= 0 or market_p >= 1:
-                market_p = _safe_float(row.get('market_prob'), np.nan)
-            if (not np.isfinite(market_p) or market_p <= 0 or market_p >= 1) and pd.notna(row.get('best_market_odds_american')):
-                market_p = _safe_float(american_to_implied_prob(row.get('best_market_odds_american')), np.nan)
+                market_p = _safe_float(row.get('sharp_market_implied_prob'), np.nan)
+            if not np.isfinite(market_p) or market_p <= 0 or market_p >= 1:
+                market_p = _safe_float(row.get('retail_market_implied_prob'), np.nan)
 
             if not np.isfinite(market_p) or market_p <= 0 or market_p >= 1:
                 return 0.0, 0.0, model_p_capped, np.nan
@@ -9583,7 +9756,9 @@ def generate_daily_predictions():
 
         live['fair_odds_american'] = live['pred_hr_prob'].apply(prob_to_fair_american)
         live['prob_edge_abs'] = (live['pred_hr_prob'] - live['market_prob']).fillna(0.0)
-        live['market_edge_pct'] = ((live['pred_hr_prob'] - live['market_prob']) / live['market_prob'] * 100.0).fillna(0.0)
+        safe_market_den = pd.to_numeric(live['market_prob'], errors='coerce').replace(0, np.nan).fillna(np.nan)
+        safe_market_den = safe_market_den.clip(lower=0.05)
+        live['market_edge_pct'] = ((live['pred_hr_prob'] - live['market_prob']) / safe_market_den * 100.0).fillna(0.0)
 
         elite_edge_abs = float(os.getenv('EV_EDGE_TRIGGER_ABS', '0.03'))
         elite_ev_pct = float(os.getenv('EV_TRIGGER_PCT', '10.0'))
@@ -10267,7 +10442,8 @@ def generate_daily_predictions():
                 f"- {row.get('batter_name','')} vs {row.get('pitcher_name','')}: "
                 f"model={float(row.get('pred_hr_prob', 0.0))*100:.1f}%, "
                 f"market={float(row.get('market_prob', 0.0))*100:.1f}%, "
-                f"edge={float(row.get('market_edge_pct', 0.0)):+.1f}%, "
+                f"edge_pts={float(row.get('prob_edge_abs', 0.0))*100:+.2f}, "
+                f"edge_rel={float(row.get('market_edge_pct', 0.0)):+.1f}%, "
                 f"EV={float(row.get('ev_percent', 0.0)):+.1f}%, "
                 f"odds={int(float(row.get('best_market_odds_american', 0))):+d}"
             )
@@ -10351,7 +10527,10 @@ def monitor_odds_rlm():
     }
 
     min_alert_odds = _env_int('LIVE_EV_MIN_AMERICAN_ODDS', 300)
+    max_alert_odds = max(min_alert_odds, _env_int('LIVE_EV_MAX_AMERICAN_ODDS', 2500))
     min_ev_edge_abs = _env_float('LIVE_EV_MIN_EDGE_ABS', 0.02)
+    require_sharp_market = str(os.getenv('LIVE_EV_REQUIRE_SHARP_MARKET', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    min_sharp_books = max(1, _env_int('LIVE_EV_MIN_SHARP_BOOKS', 2))
     only_positive_ev = str(os.getenv('LIVE_EV_REQUIRE_POSITIVE_EDGE', 'true')).strip().lower() not in {'0', 'false', 'no'}
     shadow_enable = str(os.getenv('SHADOW_MODEL_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
     shadow_prob_by_name = _load_shadow_model_probability_map(today_str) if shadow_enable else {}
@@ -10436,6 +10615,7 @@ def monitor_odds_rlm():
                 if not books:
                     continue
 
+                sharp_book, sharp_american = _best_line_from_book_map_with_preference(books, SHARP_BOOKS)
                 best_book, best_american = _best_line_from_book_map(books)
                 if best_american is None:
                     continue
@@ -10444,11 +10624,19 @@ def monitor_odds_rlm():
                 latest_best_odds_by_batter[norm] = int(best_american)
                 if int(best_american) < int(min_alert_odds):
                     continue
+                if int(best_american) > int(max_alert_odds):
+                    continue
 
                 model_prob = float(model_prob_by_name.get(norm, 0.0) or 0.0)
-                try:
-                    market_prob = float(american_to_implied_prob(best_american))
-                except Exception:
+
+                sharp_market_prob, sharp_count = _book_map_consensus_implied_prob(books, preferred_books=SHARP_BOOKS)
+                all_market_prob, all_count = _book_map_consensus_implied_prob(books, preferred_books=None)
+
+                if require_sharp_market and sharp_count < min_sharp_books:
+                    continue
+
+                market_prob = sharp_market_prob if sharp_count >= min_sharp_books else all_market_prob
+                if market_prob is None or not np.isfinite(market_prob):
                     continue
 
                 edge_abs = model_prob - market_prob
@@ -10457,13 +10645,25 @@ def monitor_odds_rlm():
                 if edge_abs < min_ev_edge_abs:
                     continue
 
-                ev_candidates.append((batter_name, int(best_american), model_prob, market_prob, edge_abs, odds_key, best_book))
+                ev_candidates.append((
+                    batter_name,
+                    int(best_american),
+                    model_prob,
+                    market_prob,
+                    edge_abs,
+                    odds_key,
+                    best_book,
+                    sharp_book,
+                    sharp_american,
+                    sharp_count,
+                    all_count,
+                ))
                 ev_candidate_names.add(_normalize_player_name(odds_key or batter_name))
 
             _update_clv_tracker_snapshot(today_str, latest_best_odds_by_batter, game_time_by_name)
 
             if shadow_enable and shadow_prob_by_name:
-                for batter_name, best_american, _, market_prob, _, _, _ in ev_candidates:
+                for batter_name, best_american, _, market_prob, _, _, _, _, _, _, _ in ev_candidates:
                     norm = _normalize_player_name(batter_name)
                     shadow_prob = _safe_float(shadow_prob_by_name.get(norm))
                     if shadow_prob is None:
@@ -10487,23 +10687,25 @@ def monitor_odds_rlm():
                 if not sharp_curr or not sharp_prev:
                     continue
 
-                _, sharp_curr_line = _best_line_from_book_map(sharp_curr)
-                _, sharp_prev_line = _best_line_from_book_map(sharp_prev)
-                if sharp_curr_line is None or sharp_prev_line is None:
+                sharp_delta, sharp_delta_n, _ = _book_map_mean_implied_delta(
+                    sharp_curr,
+                    sharp_prev,
+                    preferred_books=SHARP_BOOKS,
+                )
+                if sharp_delta is None or sharp_delta_n < max(1, min_sharp_books):
                     continue
 
-                try:
-                    sharp_imp_delta = float(american_to_implied_prob(sharp_curr_line) - american_to_implied_prob(sharp_prev_line))
-                except Exception:
-                    continue
+                sharp_imp_delta = float(sharp_delta)
                 if sharp_imp_delta < sharp_move_trigger:
+                    continue
+
+                sharp_curr_imp, _ = _book_map_consensus_implied_prob(sharp_curr, preferred_books=SHARP_BOOKS)
+                if sharp_curr_imp is None:
                     continue
 
                 followers = {k: v for k, v in books.items() if k in SQUARE_BOOKS}
                 if not followers:
                     continue
-
-                sharp_curr_imp = float(american_to_implied_prob(sharp_curr_line))
                 stale_hits = []
                 for fbk, fline in followers.items():
                     try:
@@ -10524,7 +10726,7 @@ def monitor_odds_rlm():
 
                 stale_msg = (
                     f"🕒 **FOLLOWER LAG — {batter_name}**\n"
-                    f"Sharp moved to {sharp_curr_line:+d} (delta implied +{sharp_imp_delta*100:.2f} pts)\n"
+                    f"Sharp consensus implied move: +{sharp_imp_delta*100:.2f} pts ({sharp_delta_n} books)\n"
                     f"Stale follower: {top_stale[0]} still {top_stale[1]:+d}\n"
                     f"Implied gap: +{top_stale[2]*100:.2f} pts"
                 )
@@ -10539,7 +10741,7 @@ def monitor_odds_rlm():
                     watch_batters_for_rlm.append(odds_key)
             watch_batters_for_rlm = list(dict.fromkeys(watch_batters_for_rlm))
 
-            for batter_name, best_american, model_prob, market_prob, edge_abs, odds_key, best_book in ev_candidates:
+            for batter_name, best_american, model_prob, market_prob, edge_abs, odds_key, best_book, sharp_book, sharp_american, sharp_count, _all_count in ev_candidates:
                 norm = _normalize_player_name(batter_name)
                 if norm in alerted_ev:
                     continue
@@ -10548,9 +10750,11 @@ def monitor_odds_rlm():
                 implied_pct = market_prob * 100.0
                 model_pct = model_prob * 100.0
                 edge_pct = edge_abs * 100.0
+                sharp_line_text = f"{int(sharp_american):+d}" if sharp_american is not None else "N/A"
                 ev_msg = (
                     f"💰 **+EV WINDOW — {batter_name}**\n"
-                    f"Best line: {best_american:+d} ({odds_key or 'market'})\n"
+                    f"Best line: {best_american:+d} ({best_book or odds_key or 'market'})\n"
+                    f"Vegas sharp ref: {sharp_line_text} from {int(sharp_count)} sharp books\n"
                     f"Model HR prob: {model_pct:.1f}%\n"
                     f"Market implied: {implied_pct:.1f}%\n"
                     f"Edge: +{edge_pct:.2f} pts"
@@ -10892,6 +11096,20 @@ def _safe_int(value, default=None):
         return default
 
 
+def _extract_date_from_prefixed_stem(stem, prefix):
+    """Extract YYYY-MM-DD from stems like prefixYYYY-MM-DD[_suffix]."""
+    try:
+        raw = str(stem or '')
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+        token = raw.split('_', 1)[0].strip()
+        if len(token) != 10:
+            return None
+        return datetime.strptime(token, '%Y-%m-%d')
+    except Exception:
+        return None
+
+
 def _normalize_player_name(name):
     return str(name or '').strip().lower()
 
@@ -10913,7 +11131,7 @@ def _best_line_from_book_map(book_map):
     return best_book, best_american
 
 
-def _best_line_from_book_map_with_preference(book_map, preferred_books=None):
+def _best_line_from_book_map_with_preference(book_map, preferred_books=None, allow_fallback_to_any=True):
     """Return the best line, preferring a specific sportsbook tier when available."""
     if not isinstance(book_map, dict) or not book_map:
         return None, None
@@ -10927,13 +11145,15 @@ def _best_line_from_book_map_with_preference(book_map, preferred_books=None):
         best_book, best_american = _best_line_from_book_map(preferred_map)
         if best_book is not None and best_american is not None:
             return best_book, best_american
-    return _best_line_from_book_map(book_map)
+    if allow_fallback_to_any:
+        return _best_line_from_book_map(book_map)
+    return None, None
 
 
 def _split_best_lines_by_tier(book_map):
     """Return sharp, retail, and all-book best lines for a matchup."""
-    sharp_book, sharp_odds = _best_line_from_book_map_with_preference(book_map, SHARP_BOOKS)
-    retail_book, retail_odds = _best_line_from_book_map_with_preference(book_map, SQUARE_BOOKS)
+    sharp_book, sharp_odds = _best_line_from_book_map_with_preference(book_map, SHARP_BOOKS, allow_fallback_to_any=False)
+    retail_book, retail_odds = _best_line_from_book_map_with_preference(book_map, SQUARE_BOOKS, allow_fallback_to_any=False)
     best_book, best_odds = _best_line_from_book_map(book_map)
     return {
         'sharp_book': sharp_book,
@@ -11202,7 +11422,7 @@ def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=Non
     human-readable shortlist reporting. The default env names are split so the
     same helper can be used without coupling to the auto-wager subsystem.
     """
-    bankroll = max(0.0, _env_float('BET_STAKE_BANKROLL_USD', bankroll_usd if bankroll_usd is not None else 1000.0))
+    bankroll = max(0.0, _env_float('BET_STAKE_BANKROLL_USD', bankroll_usd if bankroll_usd is not None else 100.0))
     stake_floor = max(0.0, _env_float('BET_STAKE_MIN_USD', min_stake_usd if min_stake_usd is not None else 5.0))
     stake_cap = max(stake_floor, _env_float('BET_STAKE_MAX_USD', max_stake_usd if max_stake_usd is not None else 50.0))
     kelly_mult = max(0.0, _env_float('BET_STAKE_KELLY_MULTIPLIER', kelly_multiplier if kelly_multiplier is not None else 0.25))
@@ -11216,7 +11436,7 @@ def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=Non
 def _estimate_auto_wager_stake(kelly_fraction):
     return _estimate_bet_stake_usd(
         kelly_fraction,
-        bankroll_usd=_env_float('AUTO_WAGER_BANKROLL_USD', 1000.0),
+        bankroll_usd=_env_float('AUTO_WAGER_BANKROLL_USD', 100.0),
         min_stake_usd=_env_float('AUTO_WAGER_MIN_STAKE_USD', 5.0),
         max_stake_usd=_env_float('AUTO_WAGER_MAX_STAKE_USD', 50.0),
         kelly_multiplier=_env_float('AUTO_WAGER_KELLY_MULTIPLIER', 0.25),
