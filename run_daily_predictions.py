@@ -2490,6 +2490,26 @@ def send_morning_learning_summary(
             except Exception:
                 continue
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    # Prefer the raw Statcast event count for yesterday's HR total.
+    verified_hr_total = None
+    try:
+        sc_df = load_or_fetch_statcast(yesterday_str)
+        if sc_df is not None and not sc_df.empty and 'events' in sc_df.columns:
+            verified_hr_total = int((sc_df['events'] == 'home_run').sum())
+    except Exception:
+        pass
+    if verified_hr_total is None:
+        feedback_file = data_dir / f'live_feedback_{yesterday_str}.csv'
+        if feedback_file.exists():
+            try:
+                fb_df = pd.read_csv(feedback_file)
+                if not fb_df.empty:
+                    actual_hr_series = pd.to_numeric(fb_df.get('actual_hr', 1), errors='coerce').fillna(1)
+                    verified_hr_total = int((actual_hr_series == 1).sum())
+            except Exception:
+                pass
+
     eval_file = data_dir / f'evaluation_{yesterday_str}.csv'
     eval_brier = None
     eval_rows = 0
@@ -2547,7 +2567,14 @@ def send_morning_learning_summary(
 
     lines = [f"**🧠 Morning Learning Summary — {today_str}**"]
     if has_hr_summary:
-        lines.append(f"Yesterday reviewed: {total_hrs} HRs | Predicted: {accurate} | Missed: {missed}")
+        if verified_hr_total is not None:
+            lines.append(
+                f"Yesterday HRs: {verified_hr_total} | Above 10% model score: {accurate} | Below 10%: {missed}"
+            )
+        else:
+            lines.append(
+                f"Yesterday HRs: unavailable | Above 10% model score: {accurate} | Below 10%: {missed}"
+            )
     else:
         lines.append("Yesterday reviewed: unavailable (no verified HR feedback loaded)")
     if eval_rows:
@@ -4310,6 +4337,69 @@ def evaluate_saved_predictions(date_str=None):
         send_discord_webhook(embeds=[embed])
 
     return merged
+
+
+def _nightly_accuracy_marker_path(target_date):
+    return Path('data') / f'nightly_accuracy_summary_sent_{target_date}.txt'
+
+
+def send_nightly_accuracy_summary(date_str=None, webhook_url=None, predicted_threshold=None):
+    """Send end-of-night accuracy summary with full HR list and predicted counts."""
+    target_date = date_str or (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+    marker = _nightly_accuracy_marker_path(target_date)
+
+    if marker.exists() and os.getenv('FORCE_NIGHTLY_ACCURACY_SUMMARY', 'false').lower() != 'true':
+        return False
+
+    threshold = float(predicted_threshold if predicted_threshold is not None else _env_float('NIGHTLY_PREDICTED_THRESHOLD', 0.15))
+    threshold = float(np.clip(threshold, 0.01, 0.50))
+
+    merged = evaluate_saved_predictions(target_date)
+    if merged is None or merged.empty:
+        print(f"Nightly summary skipped: no evaluation data for {target_date}")
+        return False
+
+    hrs = merged[merged['actual_hr'] == 1].copy()
+    if hrs.empty:
+        lines = [
+            f"**🌙 Nightly HR Accuracy — {target_date}**",
+            "Total HRs: 0",
+            "Predicted by model: 0",
+            "No home runs were recorded in the scored outcomes.",
+        ]
+        sent = send_discord_webhook(content="\n".join(lines), webhook_url=webhook_url, async_send=False)
+        if sent:
+            Path('data').mkdir(parents=True, exist_ok=True)
+            marker.write_text(datetime.now().isoformat(), encoding='utf-8')
+        return sent
+
+    hrs['pred_hr_prob'] = pd.to_numeric(hrs.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+    hrs = hrs.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
+    hrs['predicted_flag'] = hrs['pred_hr_prob'] >= threshold
+
+    total_hrs = int(len(hrs))
+    predicted_count = int(hrs['predicted_flag'].sum())
+    hit_rate = (predicted_count / total_hrs) if total_hrs > 0 else 0.0
+
+    lines = [
+        f"**🌙 Nightly HR Accuracy — {target_date}**",
+        f"Total HRs: {total_hrs}",
+        f"Predicted by model (>= {threshold * 100:.0f}%): {predicted_count}/{total_hrs} ({hit_rate * 100:.1f}%)",
+        "Full HR list:",
+    ]
+
+    for idx, row in hrs.iterrows():
+        batter = str(row.get('batter_name', 'Unknown'))
+        pitcher = str(row.get('pitcher_name', 'Unknown'))
+        prob = float(row.get('pred_hr_prob', 0.0) or 0.0)
+        status = 'PREDICTED' if bool(row.get('predicted_flag')) else 'MISSED'
+        lines.append(f"{idx + 1}. {batter} vs {pitcher} — {prob * 100:.1f}% ({status})")
+
+    sent = send_discord_webhook(content="\n".join(lines), webhook_url=webhook_url, async_send=False)
+    if sent:
+        Path('data').mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now().isoformat(), encoding='utf-8')
+    return sent
 
 # =====================================================================
 # SECTION 2: ADAPTIVE HISTORICAL FEATURES SOURCING
@@ -6670,6 +6760,104 @@ def apply_recent_calibration_correction(
         return preds_df, {'applied': False, 'reason': f'error:{exc}'}
 
 
+def apply_recent_empirical_calibration(
+    preds_df,
+    days_lookback=14,
+    blend=0.75,
+    min_rows=500,
+    min_files=3,
+    min_unique_probs=30,
+    max_delta=0.30,
+):
+    """Apply shape-aware probability recalibration from recent scored outcomes.
+
+    Unlike scalar correction, this can bend overconfident upper tails downward while
+    preserving monotonic ordering through isotonic regression.
+    """
+    try:
+        if preds_df is None:
+            return preds_df, {'applied': False, 'reason': 'preds_none'}
+        work = preds_df.copy()
+        if work.empty:
+            return work, {'applied': False, 'reason': 'preds_empty'}
+        if IsotonicRegression is None:
+            return work, {'applied': False, 'reason': 'isotonic_unavailable'}
+
+        cutoff = datetime.today() - timedelta(days=max(1, int(days_lookback)))
+        eval_files = []
+        for fp in sorted(Path('data').glob('evaluation_*.csv')):
+            try:
+                d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+                if d >= cutoff:
+                    eval_files.append(fp)
+            except Exception:
+                continue
+
+        if len(eval_files) < max(1, int(min_files)):
+            return work, {'applied': False, 'reason': 'insufficient_files', 'files': len(eval_files)}
+
+        parts = []
+        for fp in eval_files:
+            try:
+                ev = pd.read_csv(fp, usecols=['pred_hr_prob', 'actual_hr'])
+                if ev is not None and not ev.empty:
+                    parts.append(ev)
+            except Exception:
+                continue
+
+        if not parts:
+            return work, {'applied': False, 'reason': 'no_eval_rows'}
+
+        ev_all = pd.concat(parts, ignore_index=True)
+        ev_all['pred_hr_prob'] = pd.to_numeric(ev_all.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        ev_all['actual_hr'] = pd.to_numeric(ev_all.get('actual_hr', 0.0), errors='coerce').fillna(0.0).clip(0.0, 1.0)
+        ev_all = ev_all.dropna(subset=['pred_hr_prob', 'actual_hr'])
+
+        if len(ev_all) < max(100, int(min_rows)):
+            return work, {'applied': False, 'reason': 'insufficient_rows', 'rows': int(len(ev_all))}
+
+        y = ev_all['actual_hr'].astype(float).values
+        if np.unique(y).size < 2:
+            return work, {'applied': False, 'reason': 'single_class_eval'}
+
+        x = ev_all['pred_hr_prob'].astype(float).values
+        if np.unique(np.round(x, 6)).size < max(5, int(min_unique_probs)):
+            return work, {'applied': False, 'reason': 'insufficient_unique_probs'}
+
+        iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        iso.fit(x, y)
+
+        base_probs = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        iso_probs = pd.Series(iso.predict(base_probs.values), index=work.index).clip(0.0, 0.99)
+
+        blend = float(np.clip(blend, 0.0, 1.0))
+        max_delta = float(np.clip(max_delta, 0.02, 0.60))
+        delta = (iso_probs - base_probs).clip(-max_delta, max_delta)
+        calibrated = (base_probs + (blend * delta)).clip(0.0, 0.99)
+
+        work['pred_hr_prob'] = calibrated.round(6)
+        work['empirical_calibration_applied'] = 1
+        work['empirical_calibration_blend'] = blend
+        work['empirical_calibration_max_delta'] = max_delta
+        work['empirical_calibration_mean_abs_delta'] = float(np.mean(np.abs(delta.values))) if len(delta) else 0.0
+
+        diagnostics = {
+            'applied': True,
+            'days': int(days_lookback),
+            'files': int(len(eval_files)),
+            'rows': int(len(ev_all)),
+            'blend': float(blend),
+            'max_delta': float(max_delta),
+            'mean_abs_delta': float(np.mean(np.abs(delta.values))) if len(delta) else 0.0,
+            'pred_mean_before': float(base_probs.mean()) if len(base_probs) else 0.0,
+            'pred_mean_after': float(calibrated.mean()) if len(calibrated) else 0.0,
+            'actual_mean_eval': float(np.mean(y)) if len(y) else 0.0,
+        }
+        return work, diagnostics
+    except Exception as exc:
+        return preds_df, {'applied': False, 'reason': f'error:{exc}'}
+
+
 def run_post_mortem_backpropagation(days_lookback=7):
     """Closed-loop post-mortem layer that rewrites adaptive coefficients.
 
@@ -8913,10 +9101,10 @@ def generate_daily_predictions():
     if use_recent_calibration:
         recent_cal_diag = {'applied': False, 'reason': 'not_run'}
         recent_days = max(3, _env_int('RECENT_CALIBRATION_DAYS', 7))
-        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.55), 0.0, 1.0))
+        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.85), 0.0, 1.0))
         recent_min_rows = max(200, _env_int('RECENT_CALIBRATION_MIN_ROWS', 600))
         recent_min_files = max(2, _env_int('RECENT_CALIBRATION_MIN_FILES', 3))
-        recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.90), 0.5, 1.2))
+        recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.35), 0.2, 1.2))
         recent_max_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MAX_MULTIPLIER', 1.40), 1.0, 2.5))
 
         live, recent_cal_diag = apply_recent_calibration_correction(
@@ -8950,6 +9138,48 @@ def generate_daily_predictions():
         live['recent_calibration_ratio_raw'] = 1.0
         live['recent_calibration_pred_mean'] = 0.0
         live['recent_calibration_actual_mean'] = 0.0
+
+    use_empirical_calibration = str(os.getenv('EMPIRICAL_CALIBRATION_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if simple_baseline_mode:
+        use_empirical_calibration = False
+    if use_empirical_calibration:
+        empirical_days = max(5, _env_int('EMPIRICAL_CALIBRATION_DAYS', 14))
+        empirical_blend = float(np.clip(_env_float('EMPIRICAL_CALIBRATION_BLEND', 0.75), 0.0, 1.0))
+        empirical_min_rows = max(250, _env_int('EMPIRICAL_CALIBRATION_MIN_ROWS', 500))
+        empirical_min_files = max(2, _env_int('EMPIRICAL_CALIBRATION_MIN_FILES', 3))
+        empirical_unique_probs = max(10, _env_int('EMPIRICAL_CALIBRATION_MIN_UNIQUE_PROBS', 30))
+        empirical_max_delta = float(np.clip(_env_float('EMPIRICAL_CALIBRATION_MAX_DELTA', 0.30), 0.05, 0.60))
+
+        live, empirical_diag = apply_recent_empirical_calibration(
+            live,
+            days_lookback=empirical_days,
+            blend=empirical_blend,
+            min_rows=empirical_min_rows,
+            min_files=empirical_min_files,
+            min_unique_probs=empirical_unique_probs,
+            max_delta=empirical_max_delta,
+        )
+        if empirical_diag.get('applied'):
+            print(
+                "Empirical calibration applied: "
+                f"blend={empirical_diag.get('blend', 0.0):.2f}, "
+                f"mean_abs_delta={empirical_diag.get('mean_abs_delta', 0.0):.4f}, "
+                f"pred_mean={empirical_diag.get('pred_mean_before', 0.0):.4f}->"
+                f"{empirical_diag.get('pred_mean_after', 0.0):.4f}, "
+                f"eval_actual_mean={empirical_diag.get('actual_mean_eval', 0.0):.4f}"
+            )
+        else:
+            print(
+                "Empirical calibration skipped: "
+                f"{empirical_diag.get('reason', 'unknown')}"
+            )
+        live['empirical_calibration_applied'] = int(bool(empirical_diag.get('applied', False)))
+        live['empirical_calibration_blend'] = float(empirical_diag.get('blend', empirical_blend))
+        live['empirical_calibration_mean_abs_delta'] = float(empirical_diag.get('mean_abs_delta', 0.0))
+    else:
+        live['empirical_calibration_applied'] = 0
+        live['empirical_calibration_blend'] = 0.0
+        live['empirical_calibration_mean_abs_delta'] = 0.0
 
     live['edge_pct'] = ((live['pred_hr_prob'] - _market_prob) / _market_prob * 100).round(1)
     
@@ -9981,10 +10211,23 @@ def monitor_odds_rlm():
         raise RuntimeError("ODDS_API_KEY not set — required for RLM monitoring")
 
     today_str = datetime.today().strftime('%Y-%m-%d')
+    if not _claim_rlm_monitor_pidfile(today_str):
+        return
+    current_pid = os.getpid()
+    atexit.register(_release_rlm_monitor_pidfile, today_str, current_pid)
+
     pred_file = Path('data') / f'predictions_{today_str}.csv'
     if not pred_file.exists():
-        print("No predictions file found for today. Run predictions first.")
-        return
+        auto_build_preds = str(os.getenv('RLM_AUTO_BUILD_PREDICTIONS', 'true')).strip().lower() not in {'0', 'false', 'no'}
+        if auto_build_preds:
+            print("No predictions file found for today. Auto-generating predictions for RLM watcher...")
+            try:
+                generate_daily_predictions()
+            except Exception as e:
+                print(f"Could not auto-generate predictions for RLM watcher: {e}")
+        if not pred_file.exists():
+            print("No predictions file found for today. RLM monitor cannot start.")
+            return
 
     preds = pd.read_csv(pred_file)
     for col in ['pred_hr_prob', 'best_market_odds_american', 'ev_percent', 'kelly_fraction']:
@@ -10355,12 +10598,22 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
                 model_prob = float(row['pred_hr_prob'])
                 batter_id = row.get('batter')
                 pitcher_id = row.get('pitcher')
-                was_predicted = model_prob >= 0.15
-                # Most Likely Homers: all batters model thinks have >= 12% chance (not fixed top 5)
-                most_likely_threshold = 0.12
-                most_likely_names = preds[preds['pred_hr_prob'] >= most_likely_threshold]['batter_name'].str.lower().str.strip().tolist()
-                was_most_likely_homer = batter_name.lower().strip() in most_likely_names
-                model_rank = int((preds['pred_hr_prob'] > model_prob).sum() + 1)
+                high_conf_threshold = _env_float('LIVE_HR_HIGH_CONF_THRESHOLD', 0.20)
+                most_likely_top_n = max(1, _env_int('LIVE_HR_MOST_LIKELY_TOP_N', 5))
+                was_predicted = model_prob >= high_conf_threshold
+
+                preds_ranked = preds.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
+                ranked_match = preds_ranked[
+                    preds_ranked['batter_name'].str.lower().str.strip() == batter_name.lower().strip()
+                ]
+                if not ranked_match.empty:
+                    model_rank = int(ranked_match.index[0] + 1)
+
+                was_most_likely_homer = (
+                    model_rank is not None and
+                    model_rank <= most_likely_top_n and
+                    model_prob >= high_conf_threshold
+                )
         except Exception:
             pass
 
@@ -10491,14 +10744,15 @@ def backfill_unprocessed_today_home_runs(processed_home_runs, webhook_url):
             message_lines.append(f"🎯 Pitcher: {pitcher_name}")
         if model_prob is not None:
             prob_str = f"{model_prob * 100:.1f}%"
+            message_lines.append(f"📊 Pregame model score: {prob_str}")
+            if model_rank is not None:
+                message_lines.append(f"📈 Pregame rank: #{model_rank}")
             if was_most_likely_homer:
-                message_lines.append(f"✅ **Model called it!** (Prob: {prob_str}) — Most Likely Homer")
-            elif model_rank is not None:
-                message_lines.append(f"📊 Model rank: #{model_rank} (Prob: {prob_str})")
+                message_lines.append("🏷️ Tag: High-confidence Most Likely pick")
             elif was_predicted:
-                message_lines.append(f"✅ Model signaled HR risk (Prob: {prob_str})")
+                message_lines.append("🏷️ Tag: Above high-confidence threshold")
             else:
-                message_lines.append(f"⚠️ Model missed (had: {prob_str}) — logged for retraining")
+                message_lines.append("🏷️ Tag: Below high-confidence threshold (logged for retraining)")
 
         sent = send_discord_webhook(content="\n".join(message_lines), webhook_url=webhook_url, async_send=False)
         if sent:
@@ -11621,13 +11875,20 @@ def monitor_live_home_runs():
         else:
             print("Count tendency lookup unavailable (insufficient cached pitch data).")
 
-        odds_poll_seconds = max(3, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '3'), 3) or 3)  # Reduced from 5s to 3s
-        monitor_sleep_seconds = max(2, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '2'), 2) or 2)  # Reduced from 5s to 2s for faster HR detection
-        heartbeat_enabled = str(os.getenv('LIVE_HEARTBEAT_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
-        heartbeat_minutes = max(1, _safe_int(os.getenv('LIVE_HEARTBEAT_MINUTES', '10'), 10) or 10)
+        odds_poll_seconds = max(2, _safe_int(os.getenv('LIVE_ODDS_POLL_SECONDS', '2'), 2) or 2)
+        monitor_sleep_seconds = max(1, _safe_int(os.getenv('LIVE_MONITOR_POLL_SECONDS', '1'), 1) or 1)
+        heartbeat_enabled = str(os.getenv('LIVE_HEARTBEAT_ENABLED', 'false')).strip().lower() not in {'0', 'false', 'no'}
+        heartbeat_minutes = max(5, _safe_int(os.getenv('LIVE_HEARTBEAT_MINUTES', '60'), 60) or 60)
         heartbeat_every_seconds = heartbeat_minutes * 60
-        heartbeat_force_on_no_games = str(os.getenv('LIVE_HEARTBEAT_FORCE_ON_NO_GAMES', 'true')).strip().lower() not in {'0', 'false', 'no'}
-        backfill_every_seconds = max(30, _safe_int(os.getenv('LIVE_HR_BACKFILL_SECONDS', '60'), 60) or 60)
+        heartbeat_force_on_no_games = str(os.getenv('LIVE_HEARTBEAT_FORCE_ON_NO_GAMES', 'false')).strip().lower() not in {'0', 'false', 'no'}
+        backfill_every_seconds = max(10, _safe_int(os.getenv('LIVE_HR_BACKFILL_SECONDS', '15'), 15) or 15)
+        nightly_summary_enabled = str(os.getenv('NIGHTLY_ACCURACY_SUMMARY_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+        nightly_summary_hour = int(np.clip(_safe_int(os.getenv('NIGHTLY_ACCURACY_SUMMARY_HOUR', '1'), 1) or 1, 0, 23))
+        first_game_start_local = _get_first_scheduled_game_time_local(datetime.today().strftime('%m/%d/%Y'))
+        if first_game_start_local is not None:
+            print(f"First scheduled game today (local): {first_game_start_local.strftime('%Y-%m-%d %I:%M %p')}")
+            if datetime.now() < first_game_start_local:
+                print("Pregame tracking active: live monitor is running before first pitch.")
         last_heartbeat_ts = 0.0
         last_backfill_ts = 0.0
         last_odds_poll_ts = 0.0
@@ -11646,6 +11907,7 @@ def monitor_live_home_runs():
             backfill_sent,
             monitor_sleep_seconds,
             odds_poll_seconds,
+            first_game_start_local,
         )
 
         while True:
@@ -11790,16 +12052,15 @@ def monitor_live_home_runs():
                             message_lines.append(f"🎯 Pitcher: {pitcher_name}")
                         if _model_prob is not None:
                             prob_str = f"{_model_prob * 100:.1f}%"
+                            message_lines.append(f"📊 Pregame model score: {prob_str}")
+                            if _model_rank is not None:
+                                message_lines.append(f"📈 Pregame rank: #{_model_rank}")
                             if _was_most_likely_homer:
-                                message_lines.append(f"✅ **Model called it!** (Prob: {prob_str}) — Most Likely Homer")
-                            elif _model_rank is not None:
-                                message_lines.append(
-                                    f"📊 Model rank: #{_model_rank} (Prob: {prob_str}) — not in Most Likely Homers"
-                                )
+                                message_lines.append("🏷️ Tag: High-confidence Most Likely pick")
                             elif _was_predicted:
-                                message_lines.append(f"✅ Model signaled HR risk (Prob: {prob_str})")
+                                message_lines.append("🏷️ Tag: Above high-confidence threshold")
                             else:
-                                message_lines.append(f"⚠️ Model missed (had: {prob_str}) — logged for retraining")
+                                message_lines.append("🏷️ Tag: Below high-confidence threshold (logged for retraining)")
                         else:
                             message_lines.append("⚠️ Not in today's predictions — logged for retraining")
 
@@ -11856,6 +12117,20 @@ def monitor_live_home_runs():
 
                 if detected_this_loop > 0 and detected_this_loop > sent_this_loop:
                     print(f"⚠️  HR detection gap: {detected_this_loop} detected but {sent_this_loop} sent Discord alerts")
+
+                # Once per day after the configured hour, send yesterday's full HR accuracy summary.
+                if nightly_summary_enabled:
+                    now_local = datetime.now()
+                    if now_local.hour >= nightly_summary_hour:
+                        summary_date = (now_local - timedelta(days=1)).strftime('%Y-%m-%d')
+                        marker = _nightly_accuracy_marker_path(summary_date)
+                        if not marker.exists() or os.getenv('FORCE_NIGHTLY_ACCURACY_SUMMARY', 'false').lower() == 'true':
+                            try:
+                                sent_summary = send_nightly_accuracy_summary(summary_date, webhook_url=WEBHOOK_URL)
+                                if sent_summary:
+                                    print(f"Nightly accuracy summary sent for {summary_date}")
+                            except Exception as summary_err:
+                                print(f"Nightly accuracy summary failed: {summary_err}")
 
                 should_emit_heartbeat = (
                     heartbeat_enabled
@@ -11945,6 +12220,15 @@ def _live_monitor_pid_file():
     return Path('data') / 'live_monitor.pid'
 
 
+def _live_monitor_launcher_pid_file():
+    return Path('data') / 'live_monitor_launcher.pid'
+
+
+def _rlm_monitor_pid_file(day_str=None):
+    day_str = day_str or datetime.today().strftime('%Y-%m-%d')
+    return Path('data') / f'rlm_monitor_{day_str}.pid'
+
+
 def _live_monitor_log_file():
     return Path('data') / 'live_monitor.log'
 
@@ -11992,6 +12276,34 @@ def _release_live_monitor_pidfile(expected_pid=None):
         pass
 
 
+def _release_live_monitor_launcher_pidfile(expected_pid=None):
+    pid_file = _live_monitor_launcher_pid_file()
+    try:
+        if not pid_file.exists():
+            return
+        current_text = pid_file.read_text(encoding='utf-8').strip()
+        current_pid = int(current_text)
+        if expected_pid is not None and current_pid != int(expected_pid):
+            return
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _release_rlm_monitor_pidfile(day_str=None, expected_pid=None):
+    pid_file = _rlm_monitor_pid_file(day_str)
+    try:
+        if not pid_file.exists():
+            return
+        current_text = pid_file.read_text(encoding='utf-8').strip()
+        current_pid = int(current_text)
+        if expected_pid is not None and current_pid != int(expected_pid):
+            return
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _claim_live_monitor_pidfile():
     """Return True when this process successfully becomes the active live monitor."""
     pid_file = _live_monitor_pid_file()
@@ -12015,6 +12327,52 @@ def _claim_live_monitor_pidfile():
         return False
 
 
+def _claim_live_monitor_launcher_pidfile():
+    """Return True when this process becomes the active live monitor launch watcher."""
+    pid_file = _live_monitor_launcher_pid_file()
+    Path('data').mkdir(parents=True, exist_ok=True)
+    current_pid = os.getpid()
+
+    if pid_file.exists():
+        try:
+            existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
+            if existing_pid != current_pid and _is_pid_running(existing_pid):
+                print(f"Live monitor launch watcher already active under PID {existing_pid}; exiting duplicate watcher.")
+                return False
+        except Exception:
+            pass
+
+    try:
+        pid_file.write_text(str(current_pid), encoding='utf-8')
+        return True
+    except Exception as e:
+        print(f"Could not write live monitor launcher PID file: {e}")
+        return False
+
+
+def _claim_rlm_monitor_pidfile(day_str=None):
+    """Return True when this process successfully becomes the active RLM watcher."""
+    pid_file = _rlm_monitor_pid_file(day_str)
+    Path('data').mkdir(parents=True, exist_ok=True)
+    current_pid = os.getpid()
+
+    if pid_file.exists():
+        try:
+            existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
+            if existing_pid != current_pid and _is_pid_running(existing_pid):
+                print(f"RLM monitor already active under PID {existing_pid}; exiting duplicate watcher.")
+                return False
+        except Exception:
+            pass
+
+    try:
+        pid_file.write_text(str(current_pid), encoding='utf-8')
+        return True
+    except Exception as e:
+        print(f"Could not write RLM monitor PID file: {e}")
+        return False
+
+
 def _read_live_monitor_log_tail(max_lines=20):
     try:
         log_path = _live_monitor_log_file()
@@ -12026,7 +12384,121 @@ def _read_live_monitor_log_tail(max_lines=20):
         return ''
 
 
-def _send_live_monitor_startup_report(webhook_url, current_pid, processed_home_runs, backfill_sent, monitor_sleep_seconds, odds_poll_seconds):
+def _get_first_scheduled_game_time_local(today_str=None):
+    """Return earliest scheduled game datetime (local time) for today's slate."""
+    try:
+        today_str = today_str or datetime.today().strftime('%m/%d/%Y')
+        games = statsapi.schedule(date=today_str) or []
+        starts = []
+        for game in games:
+            raw_dt = game.get('game_datetime') or game.get('gameDate') or game.get('game_date')
+            if not raw_dt:
+                continue
+            try:
+                dt_text = str(raw_dt).replace('Z', '+00:00')
+                dt_val = datetime.fromisoformat(dt_text)
+                if dt_val.tzinfo is not None:
+                    dt_val = dt_val.astimezone().replace(tzinfo=None)
+                starts.append(dt_val)
+            except Exception:
+                continue
+        if starts:
+            return min(starts)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_live_monitor_launch_window(first_game_start_local):
+    """Return (window_start, window_end) for live monitor launch around first pitch."""
+    if first_game_start_local is None:
+        return None, None
+    prestart_minutes = max(0, _safe_int(os.getenv('LIVE_MONITOR_PRESTART_MINUTES', '90'), 90) or 90)
+    poststart_grace_minutes = max(0, _safe_int(os.getenv('LIVE_MONITOR_POSTSTART_GRACE_MINUTES', '30'), 30) or 30)
+    window_start = first_game_start_local - timedelta(minutes=prestart_minutes)
+    window_end = first_game_start_local + timedelta(minutes=poststart_grace_minutes)
+    return window_start, window_end
+
+
+def _should_launch_live_monitor_now(now_local, first_game_start_local):
+    """Decide whether background live monitor should autolaunch now."""
+    strict_window = str(os.getenv('LIVE_MONITOR_STRICT_WINDOW', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if not strict_window:
+        return True, None
+
+    if first_game_start_local is None:
+        return False, "No scheduled games found today; strict pregame launch skipped."
+
+    window_start, window_end = _resolve_live_monitor_launch_window(first_game_start_local)
+    if window_start <= now_local <= window_end:
+        return True, None
+
+    msg = (
+        f"Strict launch window not active. Allowed window: "
+        f"{window_start.strftime('%Y-%m-%d %I:%M %p')} to {window_end.strftime('%Y-%m-%d %I:%M %p')} "
+        f"(first game {first_game_start_local.strftime('%I:%M %p')})."
+    )
+    return False, msg
+
+
+def run_live_monitor_launch_watcher():
+    """Wait until the first-game launch window opens, then start the live monitor."""
+    if not _claim_live_monitor_launcher_pidfile():
+        return
+
+    current_pid = os.getpid()
+    atexit.register(_release_live_monitor_launcher_pidfile, current_pid)
+
+    check_seconds = max(15, _safe_int(os.getenv('LIVE_MONITOR_WINDOW_CHECK_SECONDS', '60'), 60) or 60)
+    max_hours = max(1, _safe_int(os.getenv('LIVE_MONITOR_WINDOW_WATCH_MAX_HOURS', '18'), 18) or 18)
+    deadline_ts = time.time() + (max_hours * 3600)
+
+    print(
+        f"Live monitor launch watcher active (PID {current_pid}) - "
+        f"checking every {check_seconds}s for up to {max_hours}h"
+    )
+
+    while time.time() < deadline_ts:
+        try:
+            live_pid_file = _live_monitor_pid_file()
+            if live_pid_file.exists():
+                try:
+                    existing_pid = int(live_pid_file.read_text(encoding='utf-8').strip())
+                    if _is_pid_running(existing_pid):
+                        print(f"Live monitor already running (PID {existing_pid}); launch watcher exiting.")
+                        return
+                except Exception:
+                    pass
+
+            first_game_start_local = _get_first_scheduled_game_time_local(datetime.today().strftime('%m/%d/%Y'))
+            now_local = datetime.now()
+            should_launch, reason = _should_launch_live_monitor_now(now_local, first_game_start_local)
+            if should_launch:
+                print("Launch window reached; starting live monitor now.")
+                launch_live_monitor_background(enable_window_watcher=False)
+                return
+
+            if first_game_start_local is not None:
+                window_start, _window_end = _resolve_live_monitor_launch_window(first_game_start_local)
+                if now_local > first_game_start_local:
+                    print("First game already started and launch window is closed; watcher exiting.")
+                    return
+                wait_min = max(0, int((window_start - now_local).total_seconds() // 60))
+                print(
+                    f"Waiting for launch window. First game: {first_game_start_local.strftime('%I:%M %p')} "
+                    f"| about {wait_min}m until prestart window."
+                )
+            elif reason:
+                print(reason)
+        except Exception as watcher_err:
+            print(f"Launch watcher error: {watcher_err}")
+
+        time.sleep(check_seconds)
+
+    print("Live monitor launch watcher timed out without entering launch window.")
+
+
+def _send_live_monitor_startup_report(webhook_url, current_pid, processed_home_runs, backfill_sent, monitor_sleep_seconds, odds_poll_seconds, first_game_start_local=None):
     """Send a one-time startup sanity report so ops can verify the watcher is alive."""
     lines = [
         "🟢 **LIVE MONITOR STARTED**",
@@ -12036,6 +12508,10 @@ def _send_live_monitor_startup_report(webhook_url, current_pid, processed_home_r
         f"🔁 Backfill alerts sent at startup: {int(backfill_sent or 0)}",
         f"📡 Poll rates: monitor={monitor_sleep_seconds}s, odds={odds_poll_seconds}s",
     ]
+    if first_game_start_local is not None:
+        lines.append(f"🗓️ First scheduled game (local): {first_game_start_local.strftime('%Y-%m-%d %I:%M %p')}")
+        if datetime.now() < first_game_start_local:
+            lines.append("✅ Pregame tracking is active before first pitch.")
     ok = send_discord_webhook(content="\n".join(lines), webhook_url=webhook_url, async_send=False)
     if ok:
         print("Startup sanity report sent")
@@ -12044,11 +12520,48 @@ def _send_live_monitor_startup_report(webhook_url, current_pid, processed_home_r
     return ok
 
 
-def launch_live_monitor_background():
+def launch_live_monitor_background(enable_window_watcher=True):
     """Launch one background live monitor process unless already running."""
     pid_file = _live_monitor_pid_file()
     log_file = _live_monitor_log_file()
     Path('data').mkdir(parents=True, exist_ok=True)
+
+    today_str = datetime.today().strftime('%m/%d/%Y')
+    first_game_start_local = _get_first_scheduled_game_time_local(today_str)
+    should_launch, skip_reason = _should_launch_live_monitor_now(datetime.now(), first_game_start_local)
+    if not should_launch:
+        if enable_window_watcher:
+            strict_window = str(os.getenv('LIVE_MONITOR_STRICT_WINDOW', 'true')).strip().lower() not in {'0', 'false', 'no'}
+            watcher_enabled = str(os.getenv('LIVE_MONITOR_WINDOW_WATCHER_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+            if strict_window and watcher_enabled and first_game_start_local is not None:
+                window_start, _window_end = _resolve_live_monitor_launch_window(first_game_start_local)
+                if datetime.now() < window_start:
+                    launcher_pid_file = _live_monitor_launcher_pid_file()
+                    if launcher_pid_file.exists():
+                        try:
+                            launcher_pid = int(launcher_pid_file.read_text(encoding='utf-8').strip())
+                            if _is_pid_running(launcher_pid):
+                                print(f"🕒 Live monitor launch watcher already running (PID {launcher_pid}).")
+                                print(f"📡 Live monitor autolaunch skipped for now: {skip_reason}")
+                                return
+                        except Exception:
+                            pass
+                    try:
+                        child = subprocess.Popen(
+                            [sys.executable, __file__, "--live-launcher-watch"],
+                            stdout=log_file.open('a', encoding='utf-8'),
+                            stderr=subprocess.STDOUT,
+                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+                        )
+                        time.sleep(1)
+                        if child.poll() is None:
+                            print(f"🕒 Live monitor launch watcher started (PID {child.pid}); it will trigger at game-time window.")
+                            print(f"📡 Live monitor autolaunch skipped for now: {skip_reason}")
+                            return
+                    except Exception as watcher_spawn_err:
+                        print(f"⚠️ Could not start live monitor launch watcher: {watcher_spawn_err}")
+        print(f"📡 Live monitor autolaunch skipped: {skip_reason}")
+        return
 
     if pid_file.exists():
         try:
@@ -12064,6 +12577,12 @@ def launch_live_monitor_background():
         _rotate_live_monitor_log_if_needed()
         with log_file.open('a', encoding='utf-8') as log_handle:
             log_handle.write(f"\n[{datetime.now().isoformat()}] Launching live monitor background process\n")
+            if first_game_start_local is not None:
+                window_start, window_end = _resolve_live_monitor_launch_window(first_game_start_local)
+                log_handle.write(
+                    f"[{datetime.now().isoformat()}] First game {first_game_start_local.isoformat()} | "
+                    f"window {window_start.isoformat()} -> {window_end.isoformat()}\n"
+                )
             log_handle.flush()
         child = subprocess.Popen(
             [sys.executable, __file__, "--live"],
@@ -12102,6 +12621,7 @@ def main():
     parser.add_argument("--today", action="store_true", help="Ingest Statcast data files for today's active games")
     parser.add_argument("--date", type=str, help="Ingest Statcast records using explicit format: YYYY-MM-DD")
     parser.add_argument("--live", action="store_true", help="Launch real-time Discord home run notifications watch script")
+    parser.add_argument("--live-launcher-watch", action="store_true", help="Internal: watch schedule and auto-start live monitor inside launch window")
     parser.add_argument("--rlm", action="store_true", help="Monitor all sportsbooks for reverse line movement on today's picks")
     parser.add_argument("--auto-exec", action="store_true", help="Enable direct API wager execution during live RLM/+EV monitoring")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate saved predictions against actual results")
@@ -12122,6 +12642,10 @@ def main():
 
     if args.live:
         monitor_live_home_runs()
+        return
+
+    if args.live_launcher_watch:
+        run_live_monitor_launch_watcher()
         return
 
     if args.self_check:
