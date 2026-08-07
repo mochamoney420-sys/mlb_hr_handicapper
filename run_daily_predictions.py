@@ -6858,6 +6858,62 @@ def apply_recent_empirical_calibration(
         return preds_df, {'applied': False, 'reason': f'error:{exc}'}
 
 
+def apply_daily_probability_anchor(
+    preds_df,
+    target_mean=0.095,
+    strength=0.90,
+    min_scale=0.20,
+    max_scale=1.10,
+    final_cap=0.30,
+):
+    """Rescale today's probabilities toward a realistic slate-level mean.
+
+    This prevents systematic overconfidence when stacked transforms inflate the
+    entire distribution, while preserving ranking order.
+    """
+    try:
+        if preds_df is None:
+            return preds_df, {'applied': False, 'reason': 'preds_none'}
+        work = preds_df.copy()
+        if work.empty:
+            return work, {'applied': False, 'reason': 'preds_empty'}
+
+        probs = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        current_mean = float(probs.mean()) if len(probs) else 0.0
+        if current_mean <= 1e-9:
+            return work, {'applied': False, 'reason': 'mean_zero'}
+
+        target_mean = float(np.clip(target_mean, 0.03, 0.20))
+        strength = float(np.clip(strength, 0.0, 1.0))
+        min_scale = float(np.clip(min_scale, 0.05, 2.0))
+        max_scale = float(np.clip(max_scale, min_scale, 3.0))
+        final_cap = float(np.clip(final_cap, 0.12, 0.60))
+
+        raw_scale = target_mean / current_mean
+        shrunk_scale = 1.0 + ((raw_scale - 1.0) * strength)
+        applied_scale = float(np.clip(shrunk_scale, min_scale, max_scale))
+
+        anchored = (probs * applied_scale).clip(0.0, final_cap)
+        work['pred_hr_prob'] = anchored.round(6)
+        work['daily_anchor_scale'] = applied_scale
+        work['daily_anchor_target_mean'] = target_mean
+        work['daily_anchor_pre_mean'] = current_mean
+        work['daily_anchor_post_mean'] = float(anchored.mean()) if len(anchored) else 0.0
+        work['daily_anchor_final_cap'] = final_cap
+
+        return work, {
+            'applied': True,
+            'target_mean': target_mean,
+            'pre_mean': current_mean,
+            'post_mean': float(anchored.mean()) if len(anchored) else 0.0,
+            'raw_scale': float(raw_scale),
+            'applied_scale': applied_scale,
+            'final_cap': final_cap,
+        }
+    except Exception as exc:
+        return preds_df, {'applied': False, 'reason': f'error:{exc}'}
+
+
 def run_post_mortem_backpropagation(days_lookback=7):
     """Closed-loop post-mortem layer that rewrites adaptive coefficients.
 
@@ -9083,9 +9139,9 @@ def generate_daily_predictions():
             avg_hr_per_game=2.5,
         )
         live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
-        monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.35)
-        monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.45)
-        monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.030)
+        monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.20)
+        monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.30)
+        monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.010)
         live = apply_monotonic_prob_calibration(
             live,
             gamma=monotonic_gamma,
@@ -9101,10 +9157,10 @@ def generate_daily_predictions():
     if use_recent_calibration:
         recent_cal_diag = {'applied': False, 'reason': 'not_run'}
         recent_days = max(3, _env_int('RECENT_CALIBRATION_DAYS', 7))
-        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.85), 0.0, 1.0))
+        recent_alpha = float(np.clip(_env_float('RECENT_CALIBRATION_ALPHA', 0.95), 0.0, 1.0))
         recent_min_rows = max(200, _env_int('RECENT_CALIBRATION_MIN_ROWS', 600))
         recent_min_files = max(2, _env_int('RECENT_CALIBRATION_MIN_FILES', 3))
-        recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.35), 0.2, 1.2))
+        recent_min_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MIN_MULTIPLIER', 0.25), 0.2, 1.2))
         recent_max_mult = float(np.clip(_env_float('RECENT_CALIBRATION_MAX_MULTIPLIER', 1.40), 1.0, 2.5))
 
         live, recent_cal_diag = apply_recent_calibration_correction(
@@ -9144,11 +9200,11 @@ def generate_daily_predictions():
         use_empirical_calibration = False
     if use_empirical_calibration:
         empirical_days = max(5, _env_int('EMPIRICAL_CALIBRATION_DAYS', 14))
-        empirical_blend = float(np.clip(_env_float('EMPIRICAL_CALIBRATION_BLEND', 0.75), 0.0, 1.0))
+        empirical_blend = float(np.clip(_env_float('EMPIRICAL_CALIBRATION_BLEND', 0.90), 0.0, 1.0))
         empirical_min_rows = max(250, _env_int('EMPIRICAL_CALIBRATION_MIN_ROWS', 500))
         empirical_min_files = max(2, _env_int('EMPIRICAL_CALIBRATION_MIN_FILES', 3))
         empirical_unique_probs = max(10, _env_int('EMPIRICAL_CALIBRATION_MIN_UNIQUE_PROBS', 30))
-        empirical_max_delta = float(np.clip(_env_float('EMPIRICAL_CALIBRATION_MAX_DELTA', 0.30), 0.05, 0.60))
+        empirical_max_delta = float(np.clip(_env_float('EMPIRICAL_CALIBRATION_MAX_DELTA', 0.50), 0.05, 0.60))
 
         live, empirical_diag = apply_recent_empirical_calibration(
             live,
@@ -9254,9 +9310,50 @@ def generate_daily_predictions():
 
     # Reliability-aware hard ceilings to prevent unsupported top-end inflation.
     rel_upper = live['model_reliability'].astype(str).str.upper()
-    rel_cap = np.where(rel_upper == 'HIGH', 0.74, np.where(rel_upper == 'MEDIUM', 0.64, 0.54))
+    rel_cap_high = float(np.clip(_env_float('RELIABILITY_CAP_HIGH', 0.32), 0.15, 0.80))
+    rel_cap_medium = float(np.clip(_env_float('RELIABILITY_CAP_MEDIUM', 0.26), 0.12, rel_cap_high))
+    rel_cap_low = float(np.clip(_env_float('RELIABILITY_CAP_LOW', 0.20), 0.08, rel_cap_medium))
+    rel_cap = np.where(rel_upper == 'HIGH', rel_cap_high, np.where(rel_upper == 'MEDIUM', rel_cap_medium, rel_cap_low))
     live['reliability_prob_cap'] = rel_cap
     live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), rel_cap)
+
+    hard_conf_cap_enabled = str(os.getenv('HARD_CONFIDENCE_CAP_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    hard_conf_cap = float(np.clip(_env_float('HARD_CONFIDENCE_CAP', 0.30), 0.12, 0.60))
+    if hard_conf_cap_enabled:
+        live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), hard_conf_cap)
+    live['hard_confidence_cap'] = hard_conf_cap if hard_conf_cap_enabled else np.nan
+
+    anchor_enabled = str(os.getenv('DAILY_PROBABILITY_ANCHOR_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if anchor_enabled:
+        anchor_target_mean = float(np.clip(_env_float('DAILY_PROBABILITY_TARGET_MEAN', 0.095), 0.03, 0.20))
+        anchor_strength = float(np.clip(_env_float('DAILY_PROBABILITY_ANCHOR_STRENGTH', 0.90), 0.0, 1.0))
+        anchor_min_scale = float(np.clip(_env_float('DAILY_PROBABILITY_MIN_SCALE', 0.20), 0.05, 2.0))
+        anchor_max_scale = float(np.clip(_env_float('DAILY_PROBABILITY_MAX_SCALE', 1.10), anchor_min_scale, 3.0))
+        anchor_final_cap = float(np.clip(_env_float('DAILY_PROBABILITY_FINAL_CAP', hard_conf_cap), 0.12, 0.60))
+        live, anchor_diag = apply_daily_probability_anchor(
+            live,
+            target_mean=anchor_target_mean,
+            strength=anchor_strength,
+            min_scale=anchor_min_scale,
+            max_scale=anchor_max_scale,
+            final_cap=anchor_final_cap,
+        )
+        if anchor_diag.get('applied'):
+            print(
+                "Daily probability anchor applied: "
+                f"mean={anchor_diag.get('pre_mean', 0.0):.4f}->"
+                f"{anchor_diag.get('post_mean', 0.0):.4f}, "
+                f"scale={anchor_diag.get('applied_scale', 1.0):.3f}, "
+                f"target={anchor_diag.get('target_mean', 0.0):.4f}"
+            )
+        else:
+            print(f"Daily probability anchor skipped: {anchor_diag.get('reason', 'unknown')}")
+    else:
+        live['daily_anchor_scale'] = np.nan
+        live['daily_anchor_target_mean'] = np.nan
+        live['daily_anchor_pre_mean'] = np.nan
+        live['daily_anchor_post_mean'] = np.nan
+        live['daily_anchor_final_cap'] = np.nan
     
     high_conf_count = sum(1 for r in reliability_levels if r == 'HIGH')
     print(f"✅ Calibration complete: {high_conf_count}/{len(live)} predictions HIGH confidence")
@@ -9740,6 +9837,8 @@ def generate_daily_predictions():
                                     'recent_calibration_multiplier', 'recent_calibration_ratio_raw',
                                     'recent_calibration_pred_mean', 'recent_calibration_actual_mean',
                                     'pitcher_damage_boost',
+                                    'daily_anchor_scale', 'daily_anchor_target_mean',
+                                    'daily_anchor_pre_mean', 'daily_anchor_post_mean', 'daily_anchor_final_cap',
                                     'sidecar_online_prob', 'sidecar_blend_applied', 'sidecar_blend_weight',
                                     'sidecar_max_delta', 'sidecar_update_count',
                                     'sidecar_training_applied', 'sidecar_training_update_count',
