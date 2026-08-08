@@ -205,6 +205,36 @@ class ConfidenceLabelTests(unittest.TestCase):
 
         self.assertTrue(selected.empty)
 
+    def test_filter_discord_ev_candidates_blocks_extreme_one_book_outlier(self):
+        candidates = pd.DataFrame(
+            {
+                "batter_name": ["Outlier", "Sane"],
+                "best_market_odds_american": [10000, 1200],
+                "matched_book_count": [1, 3],
+                "market_prob": [0.0099, 0.0769],
+                "elite_market_consensus_ok": [False, True],
+            }
+        )
+
+        filtered = rdp._filter_discord_ev_candidates(candidates)
+
+        self.assertEqual(filtered["batter_name"].tolist(), ["Sane"])
+
+    def test_filter_discord_ev_candidates_keeps_sane_consensus_pick(self):
+        candidates = pd.DataFrame(
+            {
+                "batter_name": ["Sane"],
+                "best_market_odds_american": [1000],
+                "matched_book_count": [2],
+                "market_prob": [0.0909],
+                "elite_market_consensus_ok": [True],
+            }
+        )
+
+        filtered = rdp._filter_discord_ev_candidates(candidates)
+
+        self.assertEqual(len(filtered), 1)
+
     def test_build_discord_snapshot_summary_reports_no_qualifying_picks(self):
         lines = rdp._build_discord_snapshot_summary(
             "2026-07-29",

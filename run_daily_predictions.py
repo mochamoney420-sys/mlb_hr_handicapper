@@ -37,9 +37,13 @@ if env_file.exists():
             key = key.strip()
             val = val.strip()
 
-            # Discord keys must come from project env file so stale shell vars
-            # do not keep pointing at deleted/rotated webhooks.
-            if key.startswith('DISCORD_'):
+            # Keys that must come from project env so stale shell vars do not
+            # override runtime behavior (webhook rotations and release windows).
+            if (
+                key.startswith('DISCORD_')
+                or key.startswith('MARKET_RELEASE_')
+                or key == 'MARKET_TIMEZONE'
+            ):
                 os.environ[key] = val
             else:
                 os.environ.setdefault(key, val)
@@ -82,7 +86,11 @@ try:
     from sklearn.frozen import FrozenEstimator
 except Exception:
     FrozenEstimator = None
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from pybaseball import statcast
 from threading import Thread
 from queue import Queue
@@ -1866,6 +1874,32 @@ def _send_discord_payloads_with_retry(payloads, webhook_candidates, retries=3, s
     return True
 
 
+def _discord_alert_audit_path(date_str=None):
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    return _repo_data_dir() / f'discord_alert_audit_{date_str}.jsonl'
+
+
+def _append_discord_alert_audit(content=None, embeds=None, async_send=False, payload_count=0):
+    """Persist outgoing Discord alert content for later review and math audits."""
+    try:
+        path = _discord_alert_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = str(content or '')
+        first_nonempty = next((ln.strip() for ln in text.splitlines() if ln.strip()), '')
+        record = {
+            'timestamp': datetime.now().isoformat(),
+            'async_send': bool(async_send),
+            'payload_count': int(payload_count or 0),
+            'title': first_nonempty[:200],
+            'content': text,
+            'embed_count': len(embeds or []),
+        }
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write(_json.dumps(record, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send=False, retries=3):
     """Send Discord webhook message.
     
@@ -1883,6 +1917,13 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
     if not payloads:
         print("Nothing to send to Discord; payload is empty.")
         return False
+
+    _append_discord_alert_audit(
+        content=content,
+        embeds=embeds,
+        async_send=async_send,
+        payload_count=len(payloads),
+    )
     
     # For live HRs, try async but with error tracking
     if async_send:
@@ -2495,7 +2536,7 @@ def send_morning_learning_summary(
                 continue
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
 
-    # Prefer the raw Statcast event count for yesterday's HR total.
+    # Capture the raw Statcast event count separately from the reviewed learning set.
     verified_hr_total = None
     try:
         sc_df = load_or_fetch_statcast(yesterday_str)
@@ -2571,14 +2612,11 @@ def send_morning_learning_summary(
 
     lines = [f"**🧠 Morning Learning Summary — {today_str}**"]
     if has_hr_summary:
-        if verified_hr_total is not None:
-            lines.append(
-                f"Yesterday HRs: {verified_hr_total} | Above 10% model score: {accurate} | Below 10%: {missed}"
-            )
-        else:
-            lines.append(
-                f"Yesterday HRs: unavailable | Above 10% model score: {accurate} | Below 10%: {missed}"
-            )
+        lines.append(
+            f"Yesterday reviewed: {total_hrs} HRs | Predicted: {accurate} | Missed: {missed}"
+        )
+        if verified_hr_total is not None and verified_hr_total != total_hrs:
+            lines.append(f"Raw Statcast HR events: {verified_hr_total}")
     else:
         lines.append("Yesterday reviewed: unavailable (no verified HR feedback loaded)")
     if eval_rows:
@@ -3964,13 +4002,18 @@ def _build_devigged_probs_from_raw_books(player_all_odds):
         if not implied_probs:
             continue
 
-        # For one-sided player props across books, probabilities should not be
-        # normalized across books (that creates artificial ~1/N baselines).
-        # Use a robust central estimate of implied probability instead.
+        # Multiple one-sided book prices still embed bookmaker margin. Use each
+        # book's share of the total implied mass as a simple cross-book devig,
+        # then take a robust central estimate.
         if len(implied_probs) == 1:
             final_prob = float(implied_probs[0])
         else:
-            final_prob = float(np.median(implied_probs))
+            total_implied = float(sum(implied_probs))
+            if total_implied > 0:
+                normalized_probs = [p / total_implied for p in implied_probs if p > 0]
+                final_prob = float(np.median(normalized_probs)) if normalized_probs else float(np.median(implied_probs))
+            else:
+                final_prob = float(np.median(implied_probs))
         player_probs[name] = round(float(np.clip(final_prob, 0.0, 1.0)), 4)
     return player_probs
 
@@ -4150,14 +4193,32 @@ def prob_to_fair_american(prob):
 
 
 def is_line_release_window_et(now_utc=None):
-    now_utc = now_utc or datetime.utcnow()
-    now_et = now_utc - timedelta(hours=4)
-    start_hour = _safe_int(os.getenv('MARKET_RELEASE_START_HOUR_ET', '9'), 9) or 9
-    end_hour = _safe_int(os.getenv('MARKET_RELEASE_END_HOUR_ET', '11'), 11) or 11
+    tz_name = str(os.getenv('MARKET_TIMEZONE', 'America/New_York')).strip() or 'America/New_York'
+    if ZoneInfo is not None:
+        try:
+            tz_et = ZoneInfo(tz_name)
+        except Exception:
+            tz_et = ZoneInfo('America/New_York')
+
+        if now_utc is None:
+            now_et = datetime.now(tz_et)
+        else:
+            dt_ref = now_utc
+            if dt_ref.tzinfo is None:
+                dt_ref = dt_ref.replace(tzinfo=timezone.utc)
+            now_et = dt_ref.astimezone(tz_et)
+    else:
+        # Fallback for environments without zoneinfo.
+        now_utc = now_utc or datetime.utcnow()
+        now_et = now_utc - timedelta(hours=4)
+
+    start_hour = _safe_int(os.getenv('MARKET_RELEASE_START_HOUR_ET', '11'), 11) or 11
+    start_minute = _safe_int(os.getenv('MARKET_RELEASE_START_MINUTE_ET', '30'), 30) or 30
+    end_hour = _safe_int(os.getenv('MARKET_RELEASE_END_HOUR_ET', '13'), 13) or 13
     end_minute = _safe_int(os.getenv('MARKET_RELEASE_END_MINUTE_ET', '0'), 0) or 0
 
     current_minutes = now_et.hour * 60 + now_et.minute
-    start_minutes = int(start_hour) * 60
+    start_minutes = int(start_hour) * 60 + int(start_minute)
     end_minutes = int(end_hour) * 60 + int(end_minute)
 
     return start_minutes <= current_minutes <= end_minutes
@@ -6552,6 +6613,38 @@ def _select_thresholded_candidates(rankings_df, min_prob, max_rows):
     return qualified.head(max_rows).reset_index(drop=True)
 
 
+def _filter_discord_ev_candidates(candidates_df):
+    """Keep only sane, consensus-backed +EV rows for Discord delivery."""
+    if candidates_df is None or getattr(candidates_df, 'empty', False):
+        return pd.DataFrame() if candidates_df is None else candidates_df.copy()
+
+    work = candidates_df.copy()
+    odds = pd.to_numeric(work.get('best_market_odds_american', np.nan), errors='coerce')
+    books = pd.to_numeric(work.get('matched_book_count', 0), errors='coerce').fillna(0)
+    market_prob = pd.to_numeric(work.get('market_prob', np.nan), errors='coerce')
+
+    min_odds = _env_int('DISCORD_EV_MIN_AMERICAN_ODDS', -300)
+    max_odds = _env_int('DISCORD_EV_MAX_AMERICAN_ODDS', 2500)
+    min_books = max(1, _env_int('DISCORD_EV_MIN_MATCHED_BOOKS', 2))
+    min_market_prob = float(np.clip(_env_float('DISCORD_EV_MIN_MARKET_PROB', 0.03), 0.0, 0.95))
+
+    keep_mask = (
+        odds.notna()
+        & (odds >= min_odds)
+        & (odds <= max_odds)
+        & (books >= min_books)
+        & market_prob.notna()
+        & (market_prob >= min_market_prob)
+    )
+
+    if 'elite_market_consensus_ok' in work.columns:
+        keep_mask &= work['elite_market_consensus_ok'].fillna(False).astype(bool)
+    elif 'market_consensus_ok' in work.columns:
+        keep_mask &= work['market_consensus_ok'].fillna(False).astype(bool)
+
+    return work[keep_mask].copy()
+
+
 def _build_discord_top_keys(frame):
     """Safely build a set of batter/pitcher key pairs for filtering Discord rows."""
     if frame is None or getattr(frame, 'empty', False):
@@ -6573,7 +6666,11 @@ def _build_discord_top_keys(frame):
 
 def _build_discord_snapshot_summary(target_date, rankings, top_prob, radar, top_ev, discord_min_prob, discord_window_1_hours, discord_window_2_hours):
     """Build a single Discord summary that matches the actual pick tables being sent."""
-    lines = [f"⚾ MLB HR MODEL SNAPSHOT ({target_date})", f"Candidates ranked: {len(rankings)}"]
+    lines = [
+        f"⚾ **MLB HR MODEL SNAPSHOT ({target_date})**",
+        f"Candidates ranked: {len(rankings)}",
+        "",
+    ]
 
     if top_prob.empty and radar.empty and top_ev.empty:
         lines.append(f"No qualifying picks met the minimum confidence threshold ({discord_min_prob * 100:.0f}%).")
@@ -6582,7 +6679,10 @@ def _build_discord_snapshot_summary(target_date, rankings, top_prob, radar, top_
         lines.append(f"Delivered radar picks: {len(radar)}")
         lines.append(f"Delivered +EV picks: {len(top_ev)}")
 
-    lines.append(f"Time windows: <= {discord_window_1_hours}h, <= {discord_window_2_hours}h, later")
+    lines.extend([
+        "",
+        f"Time windows: <= {discord_window_1_hours}h, <= {discord_window_2_hours}h, later",
+    ])
     return lines
 
 
@@ -10197,8 +10297,14 @@ def generate_daily_predictions():
     if 'is_positive_ev' in live.columns:
         positive_ev = live[live['is_positive_ev'] == True].copy()
         if not positive_ev.empty:
+            positive_ev = _filter_discord_ev_candidates(positive_ev)
+        if not positive_ev.empty:
             top_ev = _prepare_discord_rankings(
-                positive_ev[['batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability']]
+                positive_ev[[
+                    'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction',
+                    'ev_percent', 'game_time', 'model_reliability', 'market_prob', 'best_book',
+                    'best_market_odds_american', 'stake_usd', 'matched_book_count'
+                ]]
             )
             top_ev = top_ev.sort_values(
                 by=['portfolio_action_score', 'ev_pct', 'kelly_fraction', 'hr_probability'],
@@ -10247,6 +10353,19 @@ def generate_daily_predictions():
         except Exception:
             return None
 
+    def _safe_display_name(value, default='Unknown'):
+        if value is None:
+            return default
+        try:
+            if pd.isna(value):
+                return default
+        except Exception:
+            pass
+        txt = str(value).strip()
+        if not txt or txt.lower() in {'nan', 'none', 'null'}:
+            return default
+        return txt
+
     def _build_betting_card(ev_picks_df, date_str):
         """Return an actionable Discord betting card with book, stake, and parlay legs."""
         if ev_picks_df is None or ev_picks_df.empty:
@@ -10260,15 +10379,15 @@ def generate_daily_predictions():
 
         singles = []
         for i, (_, row) in enumerate(ev_picks_df.head(8).iterrows(), 1):
-            name = str(row.get('batter_name', '') or row.get('hr_probability', ''))
-            pitcher = str(row.get('pitcher_name', ''))
+            name = _safe_display_name(row.get('batter_name'), 'Unknown Batter')
+            pitcher = _safe_display_name(row.get('pitcher_name'), 'Unknown Pitcher')
             prob = float(row.get('hr_probability', row.get('pred_hr_prob', 0)) or 0) * 100
             book = str(row.get('best_book') or 'N/A').title()
             odds_raw = row.get('best_market_odds_american', None)
             ev_pct = float(row.get('ev_pct', row.get('ev_percent', 0)) or 0)
             stake = float(row.get('stake_usd', 0) or 0)
             mkt_pct = float(row.get('market_prob', 0) or 0) * 100
-            gtime = str(row.get('game_time', ''))
+            gtime = _safe_display_name(row.get('game_time'), 'TBD')
 
             if pd.isna(odds_raw):
                 continue
@@ -10324,39 +10443,54 @@ def generate_daily_predictions():
         if df is None or df.empty:
             return True
 
-        table_rows = []
+        detail_mode = {'market_prob', 'best_book', 'best_market_odds_american'}.issubset(set(df.columns))
+        blocks = []
         for _, row in df.iterrows():
             pct = f"{row['hr_probability'] * 100:.1f}%"
             edge = f"{row.get('edge_pct', 0):+.0f}%" if pd.notna(row.get('edge_pct')) else 'N/A'
             ev_str = f"{row.get('ev_pct', 0):+.1f}%" if pd.notna(row.get('ev_pct', None)) else 'N/A'
             kelly = f"{float(row.get('kelly_fraction', 0) or 0):.3f}" if pd.notna(row.get('kelly_fraction')) else 'N/A'
-            gtime = str(row.get('game_time', '')).strip()[:8]
+            gtime = _safe_display_name(row.get('game_time'), 'TBD')[:8]
             win = str(row.get('start_window', 'Later'))[:10]
-            
-            # IMPROVEMENT #10: Add confidence emoji icon
+            batter_name = _safe_display_name(row.get('batter_name'), 'Unknown')
+            pitcher_name = _safe_display_name(row.get('pitcher_name'), 'Unknown')
             confidence = str(row.get('model_reliability', 'MEDIUM')).upper()
             conf_emoji = _confidence_grade_emoji(confidence)
-            
-            table_rows.append(
-                f"| {str(row['batter_name'])[:12]:<12} | {str(row['pitcher_name'])[:12]:<12} | {gtime:<8} | {win:<10} | {pct:<6} | {conf_emoji} | {edge:<7} | {ev_str:<7} | {kelly:<6} |"
-            )
+
+            header = f"• **{batter_name}** vs {pitcher_name}"
+            if detail_mode:
+                market_pct = float(row.get('market_prob', 0.0) or 0.0) * 100.0
+                book = _safe_display_name(str(row.get('best_book') or 'N/A').title(), 'N/A')
+                odds_raw = row.get('best_market_odds_american', None)
+                odds_text = 'N/A'
+                if pd.notna(odds_raw):
+                    odds_text = f"{int(float(odds_raw)):+d}"
+                stake_val = row.get('stake_usd', None)
+                stake_text = ''
+                if stake_val is not None and pd.notna(stake_val):
+                    stake_text = f" | Stake ${float(stake_val):.0f}"
+                detail = (
+                    f"  {gtime} | {win} | Prob {pct} | Conf {conf_emoji}\n"
+                    f"  Book {book} {odds_text} | Market {market_pct:.1f}% | EV {ev_str} | Kelly {kelly}{stake_text}"
+                )
+            else:
+                detail = f"  {gtime} | {win} | Prob {pct} | Conf {conf_emoji} | Edge {edge}"
+
+            blocks.append(f"{header}\n{detail}")
 
         chunks = [
-            table_rows[i:i + discord_rows_per_message]
-            for i in range(0, len(table_rows), discord_rows_per_message)
+            blocks[i:i + discord_rows_per_message]
+            for i in range(0, len(blocks), discord_rows_per_message)
         ]
 
-        for idx, chunk_rows in enumerate(chunks, start=1):
+        for idx, chunk_blocks in enumerate(chunks, start=1):
             part_suffix = f" (Part {idx}/{len(chunks)})" if len(chunks) > 1 else ""
-            table_str = "\n".join(chunk_rows)
+            body = "\n\n".join(chunk_blocks)
+            footer = "Legend: 🔵=HIGH confidence  🟠=MEDIUM confidence  🟣=LOW confidence"
             message_content = (
-                f"**{title} ({target_date}){part_suffix}**\n"
-                "```\n"
-                f"| {'Batter':<12} | {'Pitcher':<12} | {'Time ET':<8} | {'Window':<10} | {'Prob':<6} | Conf | {'Edge':<7} | {'EV%':<7} | {'Kelly':<6} |\n"
-                f"|{'-'*14}|{'-'*14}|{'-'*10}|{'-'*12}|{'-'*8}|{'-'*6}|{'-'*9}|{'-'*9}|{'-'*8}|\n"
-                f"{table_str}\n"
-                "```\n"
-                "Legend: 🔵=HIGH confidence  🟠=MEDIUM confidence  🟣=LOW confidence"
+                f"**{title} ({target_date}){part_suffix}**\n\n"
+                f"{body}\n\n"
+                f"{footer}"
             )
             if not send_discord_webhook(content=message_content):
                 return False
@@ -10986,6 +11120,19 @@ def _build_fallback_hr_event_id(game_id, inning, half_inning, at_bat_idx, batter
     return f"{game_id}:{inning}:{_normalize_half_inning_label(half_inning)}:{at_bat_idx}:{batter_id}:{pitcher_id}:HR"
 
 
+def _count_unique_processed_hr_events(processed_ids):
+    """Count unique HR events from processed IDs, excluding auxiliary play IDs."""
+    if not processed_ids:
+        return 0
+    unique_keys = {
+        str(x) for x in processed_ids
+        if isinstance(x, str) and x.endswith(':HR') and x.count(':') >= 6
+    }
+    if unique_keys:
+        return len(unique_keys)
+    return len(set(str(x) for x in processed_ids))
+
+
 def _build_fallback_hr_event_id_from_statcast_row(row):
     game_id = _safe_int(row.get('game_pk'))
     inning = _safe_int(row.get('inning'))
@@ -11023,8 +11170,14 @@ def backfill_unprocessed_today_home_runs(processed_home_runs, webhook_url):
         if fallback_event_id in processed_home_runs:
             continue
 
-        batter_name = str(row.get('batter_name') or row.get('player_name') or row.get('batter') or 'Unknown Batter')
-        pitcher_name = str(row.get('pitcher_name') or row.get('pitcher') or 'Unknown Pitcher')
+        batter_name = row.get('batter_name') or row.get('player_name') or row.get('batter')
+        pitcher_name = row.get('pitcher_name') or row.get('pitcher')
+        batter_name = '' if batter_name is None else str(batter_name).strip()
+        pitcher_name = '' if pitcher_name is None else str(pitcher_name).strip()
+        if not batter_name or batter_name.lower() in {'nan', 'none', 'null'}:
+            batter_name = 'Unknown Batter'
+        if not pitcher_name or pitcher_name.lower() in {'nan', 'none', 'null'}:
+            pitcher_name = 'Unknown Pitcher'
         inning_half = str(row.get('inning_topbot') or row.get('half_inning') or row.get('inning_half') or '')
         num_inning = _safe_int(row.get('inning')) or 0
         game_id = _safe_int(row.get('game_pk'))
@@ -12181,7 +12334,8 @@ def monitor_live_home_runs():
         print("🚀 Monitoring started: Waiting for live MLB home run events...")
         print(f"📡 Discord webhook: {WEBHOOK_URL[:30]}...{WEBHOOK_URL[-10:] if len(WEBHOOK_URL) > 40 else ''}")
         print("⚡ Micro-signal engine enabled: release-axis tilt, odds inversion, predictable count windows")
-        processed_home_runs = load_processed_home_run_events()
+        active_processed_date = datetime.today().strftime('%Y-%m-%d')
+        processed_home_runs = load_processed_home_run_events(active_processed_date)
         micro_alert_keys = set()
 
         power_profile = load_live_power_profile()
@@ -12232,11 +12386,20 @@ def monitor_live_home_runs():
         while True:
             try:
                 today_str = datetime.today().strftime('%m/%d/%Y')
+                current_processed_date = datetime.today().strftime('%Y-%m-%d')
+                if current_processed_date != active_processed_date:
+                    active_processed_date = current_processed_date
+                    processed_home_runs = load_processed_home_run_events(active_processed_date)
+                    micro_alert_keys = set()
+                    print(f"Date rollover detected; reset processed HR event state for {active_processed_date}")
+
                 games = statsapi.schedule(date=today_str) or []
                 in_progress_games = 0
                 detected_this_loop = 0
                 sent_this_loop = 0
                 micro_signals_this_loop = 0
+                processed_unique_count = _count_unique_processed_hr_events(processed_home_runs)
+                processed_id_count = len(processed_home_runs)
 
                 now_ts = time.time()
                 if (now_ts - last_backfill_ts) >= backfill_every_seconds:
@@ -12461,7 +12624,8 @@ def monitor_live_home_runs():
                         "💓 **LIVE MONITOR HEARTBEAT**",
                         f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')}",
                         f"🎮 In-progress games: {in_progress_games}",
-                        f"⚾ Processed HR events today: {len(processed_home_runs)}",
+                        f"⚾ Processed HR events today: {processed_unique_count}",
+                        f"🧾 Stored event IDs: {processed_id_count}",
                         f"📈 Loop summary: detected={detected_this_loop}, sent={sent_this_loop}, micro={micro_signals_this_loop}",
                         f"🔁 Poll rates: monitor={monitor_sleep_seconds}s, odds={odds_poll_seconds}s",
                     ]
@@ -12480,7 +12644,9 @@ def monitor_live_home_runs():
                     'sent_events_this_loop': sent_this_loop,
                     'discord_success_rate_pct': round(discord_success_rate, 1),
                     'micro_signals_this_loop': micro_signals_this_loop,
-                    'processed_event_count': len(processed_home_runs),
+                    'processed_event_count': processed_unique_count,
+                    'processed_event_id_count': processed_id_count,
+                    'processed_event_date': active_processed_date,
                     'odds_players_tracked': len(best_odds_now),
                     'live_monitor_poll_seconds': monitor_sleep_seconds,
                     'live_odds_poll_seconds': odds_poll_seconds,
@@ -12492,15 +12658,17 @@ def monitor_live_home_runs():
                 write_live_monitor_status({
                     'mode': 'live_hr_monitor',
                     'error': str(e),
-                    'processed_event_count': len(processed_home_runs),
+                    'processed_event_count': _count_unique_processed_hr_events(processed_home_runs),
+                    'processed_event_id_count': len(processed_home_runs),
+                    'processed_event_date': active_processed_date,
                 })
                 time.sleep(2)
     finally:
         _release_live_monitor_pidfile(expected_pid=current_pid)
 
 
-def _is_pid_running(pid):
-    """Best-effort monitor liveness check with process identity verification."""
+def _is_pid_running(pid, expected_mode=None):
+    """Best-effort monitor liveness check with mode-aware process identity verification."""
     try:
         pid = int(pid)
     except Exception:
@@ -12524,7 +12692,16 @@ def _is_pid_running(pid):
             if str(pid) not in out:
                 return False
             lower = out.lower()
-            return ('run_daily_predictions.py' in lower) and ('--live' in lower)
+            if 'run_daily_predictions.py' not in lower:
+                return False
+            mode = str(expected_mode or '').strip().lower()
+            if mode == 'live':
+                return '--live' in lower and '--live-launcher-watch' not in lower
+            if mode in {'live-launcher-watch', 'launcher', 'watcher'}:
+                return '--live-launcher-watch' in lower
+            if mode == 'rlm':
+                return '--rlm' in lower
+            return True
         except Exception:
             return False
 
@@ -12632,7 +12809,7 @@ def _claim_live_monitor_pidfile():
     if pid_file.exists():
         try:
             existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
-            if existing_pid != current_pid and _is_pid_running(existing_pid):
+            if existing_pid != current_pid and _is_pid_running(existing_pid, expected_mode='live'):
                 print(f"Live monitor already active under PID {existing_pid}; exiting duplicate watcher.")
                 return False
         except Exception:
@@ -12655,7 +12832,7 @@ def _claim_live_monitor_launcher_pidfile():
     if pid_file.exists():
         try:
             existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
-            if existing_pid != current_pid and _is_pid_running(existing_pid):
+            if existing_pid != current_pid and _is_pid_running(existing_pid, expected_mode='live-launcher-watch'):
                 print(f"Live monitor launch watcher already active under PID {existing_pid}; exiting duplicate watcher.")
                 return False
         except Exception:
@@ -12678,7 +12855,7 @@ def _claim_rlm_monitor_pidfile(day_str=None):
     if pid_file.exists():
         try:
             existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
-            if existing_pid != current_pid and _is_pid_running(existing_pid):
+            if existing_pid != current_pid and _is_pid_running(existing_pid, expected_mode='rlm'):
                 print(f"RLM monitor already active under PID {existing_pid}; exiting duplicate watcher.")
                 return False
         except Exception:
@@ -12783,7 +12960,7 @@ def run_live_monitor_launch_watcher():
             if live_pid_file.exists():
                 try:
                     existing_pid = int(live_pid_file.read_text(encoding='utf-8').strip())
-                    if _is_pid_running(existing_pid):
+                    if _is_pid_running(existing_pid, expected_mode='live'):
                         print(f"Live monitor already running (PID {existing_pid}); launch watcher exiting.")
                         return
                 except Exception:
@@ -12819,11 +12996,14 @@ def run_live_monitor_launch_watcher():
 
 def _send_live_monitor_startup_report(webhook_url, current_pid, processed_home_runs, backfill_sent, monitor_sleep_seconds, odds_poll_seconds, first_game_start_local=None):
     """Send a one-time startup sanity report so ops can verify the watcher is alive."""
+    processed_unique_count = _count_unique_processed_hr_events(processed_home_runs)
+    processed_id_count = len(processed_home_runs)
     lines = [
         "🟢 **LIVE MONITOR STARTED**",
         f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p ET')}",
         f"🆔 PID: {current_pid}",
-        f"⚾ Processed HR events loaded: {len(processed_home_runs)}",
+        f"⚾ Processed HR events loaded: {processed_unique_count}",
+        f"🧾 Stored event IDs loaded: {processed_id_count}",
         f"🔁 Backfill alerts sent at startup: {int(backfill_sent or 0)}",
         f"📡 Poll rates: monitor={monitor_sleep_seconds}s, odds={odds_poll_seconds}s",
     ]
@@ -12859,7 +13039,7 @@ def launch_live_monitor_background(enable_window_watcher=True):
                     if launcher_pid_file.exists():
                         try:
                             launcher_pid = int(launcher_pid_file.read_text(encoding='utf-8').strip())
-                            if _is_pid_running(launcher_pid):
+                            if _is_pid_running(launcher_pid, expected_mode='live-launcher-watch'):
                                 print(f"🕒 Live monitor launch watcher already running (PID {launcher_pid}).")
                                 print(f"📡 Live monitor autolaunch skipped for now: {skip_reason}")
                                 return
@@ -12885,7 +13065,7 @@ def launch_live_monitor_background(enable_window_watcher=True):
     if pid_file.exists():
         try:
             existing_pid = int(pid_file.read_text(encoding='utf-8').strip())
-            if _is_pid_running(existing_pid):
+            if _is_pid_running(existing_pid, expected_mode='live'):
                 print(f"Live monitor already running (PID {existing_pid}).")
                 return
         except Exception:
@@ -13053,7 +13233,17 @@ def main():
     # Auto-launch RLM line-movement monitor if ODDS_API_KEY is configured.
     if os.getenv('ODDS_API_KEY') and str(os.getenv('RLM_AUTOLAUNCH', 'true')).strip().lower() not in {'0', 'false', 'no'}:
         _rlm_marker = Path('data') / f'rlm_monitor_{datetime.today().strftime("%Y-%m-%d")}.pid'
-        if not _rlm_marker.exists():
+        marker_active = False
+        if _rlm_marker.exists():
+            try:
+                marker_pid = int(_rlm_marker.read_text(encoding='utf-8').strip())
+                marker_active = _is_pid_running(marker_pid, expected_mode='rlm')
+            except Exception:
+                marker_active = False
+            if not marker_active:
+                _rlm_marker.unlink(missing_ok=True)
+
+        if not marker_active:
             try:
                 _rlm_log = Path('data') / 'rlm_monitor.log'
                 _rlm_proc = subprocess.Popen(

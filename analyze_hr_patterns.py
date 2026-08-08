@@ -51,6 +51,22 @@ def _safe_float(value, default=0.0):
     return float(val)
 
 
+def _build_hr_event_key(row):
+    """Build a stable per-HR event key to avoid collapsing repeat HRs."""
+    sv = row.get('sv_id')
+    if sv is not None and not pd.isna(sv) and str(sv).strip():
+        return str(sv).strip()
+
+    game_pk = row.get('game_pk')
+    batter = row.get('batter')
+    pitcher = row.get('pitcher')
+    inning = row.get('inning')
+    half = row.get('inning_topbot')
+    abn = row.get('at_bat_number')
+
+    return f"{game_pk}:{batter}:{pitcher}:{inning}:{half}:{abn}:HR"
+
+
 def _sanitize_pattern(pattern):
     clean = {}
     for key, value in pattern.items():
@@ -75,6 +91,7 @@ def load_yesterdays_home_runs():
     """Load yesterday's complete home-run outcomes from Statcast and merge with any watcher feedback."""
     yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
     feedback_file = Path('data') / f'live_feedback_{yesterday}.csv'
+    evaluation_file = Path('data') / f'evaluation_{yesterday}.csv'
     statcast_file = Path('cache') / f'statcast_{yesterday}.csv'
 
     hrs = pd.DataFrame()
@@ -86,15 +103,25 @@ def load_yesterdays_home_runs():
             if {'game_pk', 'batter', 'pitcher', 'events', 'game_date'}.issubset(statcast_df.columns):
                 statcast_df = statcast_df.dropna(subset=['game_pk', 'batter', 'pitcher', 'events']).copy()
                 statcast_df['is_hr'] = (statcast_df['events'] == 'home_run').astype(int)
-                hrs = (
-                    statcast_df[statcast_df['is_hr'] == 1]
-                    .groupby(['game_pk', 'batter', 'pitcher'], as_index=False)
-                    .agg(actual_hr=('is_hr', 'max'))
-                )
+                hr_rows = statcast_df[statcast_df['is_hr'] == 1].copy()
+                if not hr_rows.empty:
+                    hr_rows['event_key'] = hr_rows.apply(_build_hr_event_key, axis=1)
+                    hr_rows = hr_rows.drop_duplicates(subset=['event_key'], keep='last')
+
+                    if 'batter_name' not in hr_rows.columns:
+                        if 'player_name' in hr_rows.columns:
+                            hr_rows['batter_name'] = hr_rows['player_name']
+                        else:
+                            hr_rows['batter_name'] = np.nan
+                    if 'pitcher_name' not in hr_rows.columns:
+                        hr_rows['pitcher_name'] = np.nan
+
+                hrs = hr_rows[['game_pk', 'batter', 'pitcher', 'batter_name', 'pitcher_name']].copy() if not hr_rows.empty else pd.DataFrame()
+                if not hrs.empty:
+                    hrs['actual_hr'] = 1
+                    hrs['event_key'] = hr_rows['event_key'].values
                 hrs['date'] = yesterday
                 hrs['source'] = 'statcast'
-                hrs['batter_name'] = np.nan
-                hrs['pitcher_name'] = np.nan
                 hrs['model_prob'] = np.nan
                 print(f"📊 Found {len(hrs)} home runs from {yesterday} in Statcast")
         except Exception as exc:
@@ -122,9 +149,18 @@ def load_yesterdays_home_runs():
                 )
 
                 if not hrs.empty:
-                    hrs = pd.concat([hrs, fb[['date', 'batter_name', 'pitcher_name', 'batter', 'pitcher', 'game_pk', 'inning', 'model_prob', 'was_predicted', 'was_most_likely_homer', 'actual_hr']].dropna(subset=['batter_name', 'pitcher_name'])], ignore_index=True)
+                    fb_rows = fb[['date', 'batter_name', 'pitcher_name', 'batter', 'pitcher', 'game_pk', 'inning', 'model_prob', 'was_predicted', 'was_most_likely_homer', 'actual_hr']].dropna(subset=['batter_name', 'pitcher_name']).copy()
+                    fb_rows['event_key'] = fb_rows.apply(
+                        lambda r: f"{r.get('game_pk')}:{r.get('batter')}:{r.get('pitcher')}:{r.get('inning','')}:feedback",
+                        axis=1
+                    )
+                    hrs = pd.concat([hrs, fb_rows], ignore_index=True)
                 else:
                     hrs = fb[['date', 'batter_name', 'pitcher_name', 'batter', 'pitcher', 'game_pk', 'inning', 'model_prob', 'was_predicted', 'was_most_likely_homer', 'actual_hr']].dropna(subset=['batter_name', 'pitcher_name']).copy()
+                    hrs['event_key'] = hrs.apply(
+                        lambda r: f"{r.get('game_pk')}:{r.get('batter')}:{r.get('pitcher')}:{r.get('inning','')}:feedback",
+                        axis=1
+                    )
                 print(f"🧾 Added {len(fb)} watcher feedback rows for {yesterday}")
         except Exception as exc:
             print(f"⚠️  Error loading feedback file: {exc}")
@@ -149,6 +185,50 @@ def load_yesterdays_home_runs():
         )
         hrs = hrs.drop(columns=[c for c in ['batter_name_fb', 'pitcher_name_fb', 'model_prob_fb'] if c in hrs.columns])
 
+    # Fallback: use yesterday evaluation snapshot to recover model probabilities/names
+    # for HR events that never reached live feedback.
+    if evaluation_file.exists() and {'game_pk', 'batter', 'pitcher'}.issubset(hrs.columns):
+        try:
+            eval_df = pd.read_csv(evaluation_file)
+            if not eval_df.empty:
+                eval_df = eval_df.copy()
+                eval_df['game_pk'] = pd.to_numeric(eval_df.get('game_pk', np.nan), errors='coerce')
+                eval_df['batter'] = pd.to_numeric(eval_df.get('batter', np.nan), errors='coerce')
+                eval_df['pitcher'] = pd.to_numeric(eval_df.get('pitcher', np.nan), errors='coerce')
+                eval_df['pred_hr_prob'] = pd.to_numeric(eval_df.get('pred_hr_prob', np.nan), errors='coerce')
+                eval_df['batter_name'] = eval_df.get('batter_name', pd.Series(['Unknown'] * len(eval_df))).apply(_safe_name)
+                eval_df['pitcher_name'] = eval_df.get('pitcher_name', pd.Series(['Unknown'] * len(eval_df))).apply(_safe_name)
+
+                eval_enrichment = eval_df[
+                    ['game_pk', 'batter', 'pitcher', 'pred_hr_prob', 'batter_name', 'pitcher_name']
+                ].dropna(subset=['game_pk', 'batter', 'pitcher'])
+                eval_enrichment = eval_enrichment.sort_values(['game_pk', 'batter', 'pitcher']).drop_duplicates(
+                    subset=['game_pk', 'batter', 'pitcher'],
+                    keep='last'
+                )
+
+                hrs = hrs.merge(
+                    eval_enrichment,
+                    on=['game_pk', 'batter', 'pitcher'],
+                    how='left',
+                    suffixes=('', '_eval')
+                )
+
+                hrs['model_prob'] = pd.to_numeric(
+                    hrs.get('model_prob', pd.Series([np.nan] * len(hrs))).combine_first(hrs.get('pred_hr_prob')),
+                    errors='coerce'
+                )
+                hrs['batter_name'] = hrs.get('batter_name', pd.Series([np.nan] * len(hrs))).combine_first(
+                    hrs.get('batter_name_eval')
+                )
+                hrs['pitcher_name'] = hrs.get('pitcher_name', pd.Series([np.nan] * len(hrs))).combine_first(
+                    hrs.get('pitcher_name_eval')
+                )
+
+                hrs = hrs.drop(columns=[c for c in ['pred_hr_prob', 'batter_name_eval', 'pitcher_name_eval'] if c in hrs.columns])
+        except Exception as exc:
+            print(f"⚠️  Error enriching from evaluation file: {exc}")
+
     # Fall back to stable ID-based labels when names are unavailable.
     if 'batter_name' in hrs.columns:
         hrs['batter_name'] = hrs['batter_name'].apply(_safe_name)
@@ -166,6 +246,8 @@ def load_yesterdays_home_runs():
     if 'model_prob' in hrs.columns:
         hrs['model_prob'] = pd.to_numeric(hrs['model_prob'], errors='coerce').fillna(0.0)
 
+    if 'event_key' in hrs.columns:
+        return hrs.drop_duplicates(subset=['event_key'], keep='last')
     return hrs.drop_duplicates(subset=['game_pk', 'batter', 'pitcher'], keep='last')
 
 def load_training_data_for_analysis(days_back=60):
