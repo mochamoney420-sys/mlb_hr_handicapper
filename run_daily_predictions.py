@@ -43,6 +43,8 @@ if env_file.exists():
                 key.startswith('DISCORD_')
                 or key.startswith('MARKET_RELEASE_')
                 or key == 'MARKET_TIMEZONE'
+                or key == 'ODDS_API_KEY'
+                or key == 'ODDS_API_PROVIDER'
             ):
                 os.environ[key] = val
             else:
@@ -1018,36 +1020,54 @@ def get_live_weather(lat, lon):
         dict with: temp (°F), wind_speed (mph), wind_dir (°), humidity (%),
                    precipitation (in), pressure (mb)
     """
+    defaults = {
+        'temp': 70.0,
+        'wind_speed': 0.0,
+        'wind_dir': 0.0,
+        'wind_gust': 0.0,
+        'humidity': 50.0,
+        'precipitation': 0.0,
+        'pressure': 1013.25,
+        'apparent_temp': 70.0,
+        'dew_point': 50.0,
+        'cloud_cover': 50.0,
+        'weather_source': 'default',
+        'weather_is_fallback': 1,
+    }
+    if requests is None:
+        return defaults
+
     try:
         url = (
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={lat}&longitude={lon}&current_weather=true"
-            f"&temperature_unit=fahrenheit&windspeed_unit=mph"
-            f"&timezone=America/Chicago"  # Use central time as default
+            "https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            "&current=temperature_2m,apparent_temperature,dew_point_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,relative_humidity_2m,precipitation,pressure_msl,cloud_cover"
+            "&temperature_unit=fahrenheit&windspeed_unit=mph"
+            "&timezone=America/New_York"
         )
-        res = requests.get(url, timeout=5).json()
-        current = res.get('current_weather', {})
-        
-        # Try to fetch additional metrics from current API if available
-        # Note: Some metrics may require hourly/daily endpoints, so we provide sensible defaults
-        return {
-            'temp': current.get('temperature', 70),
-            'wind_speed': current.get('windspeed', 0),
-            'wind_dir': current.get('winddirection', 0),
-            'humidity': current.get('relative_humidity', 50),  # 50% default if unavailable
-            'precipitation': current.get('precipitation', 0),  # 0 in default (no precip)
-            'pressure': current.get('pressure_msl', 1013.25)  # 1013.25 mb sea-level default
+        resp = requests.get(url, timeout=7)
+        if getattr(resp, 'status_code', 200) != 200:
+            return defaults
+        payload = resp.json() or {}
+        current = payload.get('current', {}) or payload.get('current_weather', {}) or {}
+
+        out = {
+            'temp': float(pd.to_numeric(current.get('temperature_2m', current.get('temperature', defaults['temp'])), errors='coerce') or defaults['temp']),
+            'apparent_temp': float(pd.to_numeric(current.get('apparent_temperature', defaults['apparent_temp']), errors='coerce') or defaults['apparent_temp']),
+            'dew_point': float(pd.to_numeric(current.get('dew_point_2m', defaults['dew_point']), errors='coerce') or defaults['dew_point']),
+            'wind_speed': float(pd.to_numeric(current.get('wind_speed_10m', current.get('windspeed', defaults['wind_speed'])), errors='coerce') or defaults['wind_speed']),
+            'wind_dir': float(pd.to_numeric(current.get('wind_direction_10m', current.get('winddirection', defaults['wind_dir'])), errors='coerce') or defaults['wind_dir']),
+            'wind_gust': float(pd.to_numeric(current.get('wind_gusts_10m', defaults['wind_gust']), errors='coerce') or defaults['wind_gust']),
+            'humidity': float(pd.to_numeric(current.get('relative_humidity_2m', defaults['humidity']), errors='coerce') or defaults['humidity']),
+            'precipitation': float(pd.to_numeric(current.get('precipitation', defaults['precipitation']), errors='coerce') or defaults['precipitation']),
+            'pressure': float(pd.to_numeric(current.get('pressure_msl', defaults['pressure']), errors='coerce') or defaults['pressure']),
+            'cloud_cover': float(pd.to_numeric(current.get('cloud_cover', defaults['cloud_cover']), errors='coerce') or defaults['cloud_cover']),
+            'weather_source': 'open-meteo-current',
+            'weather_is_fallback': 0,
         }
+        return out
     except Exception:
-        # Fallback to sensible defaults (60°F, moderate wind, 50% humidity, no precip, sea-level pressure)
-        return {
-            'temp': 70,
-            'wind_speed': 0,
-            'wind_dir': 0,
-            'humidity': 50,
-            'precipitation': 0,
-            'pressure': 1013.25
-        }
+        return defaults
 
 
 def _historical_weather_cache_path():
@@ -3720,6 +3740,102 @@ def _fetch_hr_props_raw_from_sharpapi(api_key):
     return out
 
 
+def _fetch_no_hr_props_raw_from_sharpapi(api_key):
+    """Fetch MLB NO-HR side props (under 0.5) from sharpapi.io /odds endpoint."""
+    if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
+        return {}
+    if requests is None:
+        return {}
+
+    headers = {'X-API-Key': str(api_key or '').strip()}
+    base_url = 'https://api.sharpapi.io/api/v1/odds'
+    limit = 200
+    max_pages = max(1, int(float(os.getenv('SHARPAPI_MAX_PAGES', '10'))))
+
+    raw_rows = []
+    offset = 0
+    cursor = None
+    for _ in range(max_pages):
+        params = {
+            'sport': 'baseball',
+            'league': 'MLB',
+            'market': 'player_home_runs',
+            'is_main_line': 'true',
+            'is_active': 'true',
+            'limit': str(limit),
+        }
+        if cursor:
+            params['cursor'] = cursor
+        else:
+            params['offset'] = str(offset)
+        try:
+            resp = requests.get(base_url, headers=headers, params=params, timeout=15)
+        except Exception as exc:
+            print(f"SharpAPI no-HR fetch error: {exc}")
+            break
+
+        if resp.status_code in (401, 403):
+            body = (resp.text or '')[:200]
+            _set_odds_invalid_key_cooldown(reason_text=body)
+            print(f"SharpAPI invalid key ({resp.status_code}): {body}")
+            return {}
+        if resp.status_code == 429:
+            _set_rate_limit_cooldown()
+            break
+        if resp.status_code != 200:
+            print(f"SharpAPI no-HR returned {resp.status_code}: {resp.text[:200]}")
+            break
+
+        payload = resp.json()
+        batch = payload.get('data') or []
+        raw_rows.extend(batch)
+        pagination = payload.get('pagination', {})
+        cursor = pagination.get('next_cursor')
+        if not pagination.get('has_more') or not cursor:
+            break
+        offset += limit
+
+    if not raw_rows:
+        return {}
+
+    out = {}
+    today_local = datetime.today().date()
+    allowed_dates = {today_local, today_local + timedelta(days=1)}
+    for row in raw_rows:
+        if not row.get('is_active', True):
+            continue
+        side = str(row.get('selection_type', '')).lower()
+        if side not in {'under', 'no'}:
+            continue
+        player = str(row.get('player_name') or row.get('selection') or '').strip()
+        book = str(row.get('sportsbook') or 'unknown').strip().lower()
+        odds_raw = row.get('odds_american')
+        if not player or odds_raw is None:
+            continue
+        try:
+            odds_i = int(round(float(odds_raw)))
+        except Exception:
+            continue
+        if odds_i == 0 or abs(odds_i) < 50 or abs(odds_i) > 20000:
+            continue
+        start_raw = row.get('event_start_time', '')
+        if start_raw:
+            try:
+                ev_date = datetime.fromisoformat(start_raw.replace('Z', '+00:00')).date()
+                if ev_date not in allowed_dates:
+                    continue
+            except Exception:
+                pass
+        out.setdefault(player, {})[book] = odds_i
+
+    if out:
+        n_pairs = sum(len(v) for v in out.values())
+        print(f"SharpAPI no-HR props: {n_pairs} book-player pairs across {len(out)} players")
+    else:
+        print("SharpAPI returned no recognized no-HR outcomes in current slate.")
+    return out
+
+
 def _filter_current_slate_odds_events(events_payload, source_label='odds'):
     """Keep only current-slate odds events and reject stale historical events.
 
@@ -5070,18 +5186,37 @@ def get_today_matchups():
             return None
         probable_home_pitcher_id = _resolve_pitcher_id(probable_home_pitcher)
         probable_away_pitcher_id = _resolve_pitcher_id(probable_away_pitcher)
-        # Pull geolocation data via venue metadata or fallback to baseline coordinate mappings
+        # Pull geolocation data via venue metadata first.
         venue_id = game.get('venue_id', 0)
         venue_data = statsapi.get('venue', {'venueIds': str(venue_id)})
+        weather = None
         try:
-            coords = venue_data['venues'][0]['location']
-            lat, lon = coords['latitude'], coords['longitude']
-            weather = get_live_weather(lat, lon)
+            venues = venue_data.get('venues', []) if isinstance(venue_data, dict) else []
+            loc = venues[0].get('location', {}) if venues else {}
+            lat = loc.get('latitude')
+            lon = loc.get('longitude')
+            if lat is not None and lon is not None:
+                weather = get_live_weather(float(lat), float(lon))
         except Exception:
-            weather = {'temp': 71, 'wind_speed': 5, 'wind_dir': 0}
+            weather = None
         cf_bearing = STADIUM_CF_BEARING.get(team_abbrev, 0)
-        _wind_angle = math.radians(weather.get('wind_dir', 0) - cf_bearing)
-        wind_out_component = round(weather.get('wind_speed', 0) * math.cos(_wind_angle), 2)
+        if not isinstance(weather, dict):
+            weather = {
+                'temp': 71.0,
+                'wind_speed': 5.0,
+                'wind_dir': 0.0,
+                'wind_gust': 6.0,
+                'humidity': 50.0,
+                'precipitation': 0.0,
+                'pressure': 1013.25,
+                'apparent_temp': 71.0,
+                'dew_point': 50.0,
+                'cloud_cover': 50.0,
+                'weather_source': 'hard-default',
+                'weather_is_fallback': 1,
+            }
+        _wind_angle = math.radians(float(weather.get('wind_dir', 0.0) or 0.0) - cf_bearing)
+        wind_out_component = round(float(weather.get('wind_speed', 0.0) or 0.0) * math.cos(_wind_angle), 2)
 
         try:
             boxscore = statsapi.boxscore_data(game_id) or {}
@@ -5116,6 +5251,56 @@ def get_today_matchups():
                         away_team_abbr = statsapi.lookup_team(game.get('away_name', ''))[0].get('abbreviation', '')
                 except Exception:
                     away_team_abbr = ''
+
+            # If venue geolocation weather failed, try home-team stadium coordinates,
+            # then same-date historical archive weather for that ballpark.
+            if int(weather.get('weather_is_fallback', 1)) == 1:
+                try:
+                    alt_coords = _get_stadium_coords_for_team(home_team_abbr)
+                except Exception:
+                    alt_coords = None
+                if alt_coords is not None:
+                    live_retry = get_live_weather(alt_coords[0], alt_coords[1])
+                    if int(live_retry.get('weather_is_fallback', 1)) == 0:
+                        weather = live_retry
+
+            if int(weather.get('weather_is_fallback', 1)) == 1:
+                team_candidates = []
+                for candidate in [home_team_abbr, team_abbrev]:
+                    c = str(candidate or '').strip().upper()
+                    if c:
+                        team_candidates.append(c)
+                try:
+                    lookup = statsapi.lookup_team(game.get('home_name', ''))
+                    if lookup:
+                        c = str(lookup[0].get('abbreviation', '') or '').strip().upper()
+                        if c:
+                            team_candidates.append(c)
+                except Exception:
+                    pass
+                # Preserve order while removing duplicates.
+                dedup_candidates = list(dict.fromkeys(team_candidates))
+                hist_weather = None
+                for team_key in dedup_candidates:
+                    hist_weather = _fetch_historical_weather_for_team_date(team_key, today_str)
+                    if isinstance(hist_weather, dict):
+                        break
+                if isinstance(hist_weather, dict):
+                    if 'apparent_temp' not in hist_weather:
+                        hist_weather['apparent_temp'] = float(hist_weather.get('temp', 71.0) or 71.0)
+                    if 'dew_point' not in hist_weather:
+                        hist_weather['dew_point'] = 50.0
+                    if 'wind_gust' not in hist_weather:
+                        hist_weather['wind_gust'] = float(hist_weather.get('wind_speed', 5.0) or 5.0)
+                    if 'cloud_cover' not in hist_weather:
+                        hist_weather['cloud_cover'] = 50.0
+                    hist_weather['weather_source'] = 'open-meteo-archive'
+                    hist_weather['weather_is_fallback'] = 0
+                    weather = hist_weather
+
+            cf_bearing = STADIUM_CF_BEARING.get(home_team_abbr or team_abbrev, 0)
+            _wind_angle = math.radians(float(weather.get('wind_dir', 0.0) or 0.0) - cf_bearing)
+            wind_out_component = round(float(weather.get('wind_speed', 0.0) or 0.0) * math.cos(_wind_angle), 2)
 
             roof_status, roof_sealed = infer_roof_status(venue_name, raw_game_payload=raw_game, weather=weather)
             if roof_sealed:
@@ -5220,10 +5405,16 @@ def get_today_matchups():
                         'wind_out_component': wind_out_component,
                         'park_factor': handed_park_factor,
                         'temp': weather['temp'],
+                        'apparent_temp': weather.get('apparent_temp', weather.get('temp', 71.0)),
+                        'dew_point': weather.get('dew_point', 50.0),
                         'wind_speed': weather['wind_speed'],
+                        'wind_gust': weather.get('wind_gust', weather.get('wind_speed', 0.0)),
                         'humidity': weather.get('humidity', 50),
                         'precipitation': weather.get('precipitation', 0),
                         'pressure': weather.get('pressure', 1013.25),
+                        'cloud_cover': weather.get('cloud_cover', 50.0),
+                        'weather_source': weather.get('weather_source', 'unknown'),
+                        'weather_is_fallback': int(weather.get('weather_is_fallback', 1)),
                         'roof_status': roof_status,
                         'roof_sealed': roof_sealed,
                     })
@@ -5827,6 +6018,36 @@ def _load_cached_statcast_window(end_date, days_back=21):
         return pd.DataFrame()
 
 
+def build_local_statcast_history_pool(base_statcast_df=None, days_back=365):
+    """Build a wider local Statcast pool from recent cache files plus in-memory training slice."""
+    frames = []
+    if base_statcast_df is not None and not getattr(base_statcast_df, 'empty', True):
+        frames.append(base_statcast_df.copy())
+
+    cached = _load_cached_statcast_window(datetime.today(), days_back=max(30, int(days_back)))
+    if not cached.empty:
+        frames.append(cached)
+
+    if not frames:
+        return pd.DataFrame()
+
+    try:
+        pool = pd.concat(frames, ignore_index=True)
+    except Exception:
+        return base_statcast_df.copy() if base_statcast_df is not None else pd.DataFrame()
+
+    for col in ['game_pk', 'batter', 'pitcher', 'inning', 'at_bat_number', 'pitch_number']:
+        if col in pool.columns:
+            pool[col] = pd.to_numeric(pool[col], errors='coerce')
+
+    dedupe_cols = [c for c in ['game_pk', 'batter', 'pitcher', 'inning', 'at_bat_number', 'pitch_number'] if c in pool.columns]
+    if dedupe_cols:
+        pool = pool.drop_duplicates(subset=dedupe_cols)
+    else:
+        pool = pool.drop_duplicates()
+    return pool
+
+
 def _pitch_mix_vector(df):
     if df is None or df.empty or 'pitch_type' not in df.columns:
         return {}
@@ -5991,6 +6212,103 @@ def build_batter_recent_hr_features(statcast_df, rows_df, short_days=7, long_day
                           'batter_hr_rate_7d': rate7, 'batter_hr_rate_14d': rate14})
 
     return rows_df.apply(_score, axis=1).astype(float)
+
+
+def build_matchup_history_features(statcast_df, rows_df, lookback_days=365):
+    """Create batter-vs-pitcher and batter-in-park HR history features with smoothing."""
+    if rows_df is None or getattr(rows_df, 'empty', True):
+        return pd.DataFrame(index=getattr(rows_df, 'index', pd.RangeIndex(0)))
+
+    out = pd.DataFrame(index=rows_df.index)
+    out['batter_vs_pitcher_hr_count'] = 0.0
+    out['batter_vs_pitcher_pa_count'] = 0.0
+    out['batter_vs_pitcher_hr_rate'] = 0.033
+    out['batter_in_park_hr_count'] = 0.0
+    out['batter_in_park_pa_count'] = 0.0
+    out['batter_in_park_hr_rate'] = 0.033
+
+    if statcast_df is None or getattr(statcast_df, 'empty', True):
+        return out
+
+    needed = {'batter', 'pitcher'}
+    if not needed.issubset(set(statcast_df.columns)):
+        return out
+
+    work = statcast_df.copy()
+    try:
+        if 'game_date' in work.columns:
+            work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+            cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=max(30, int(lookback_days)))
+            work = work[work['game_date'] >= cutoff]
+    except Exception:
+        pass
+
+    work['batter'] = pd.to_numeric(work['batter'], errors='coerce')
+    work['pitcher'] = pd.to_numeric(work['pitcher'], errors='coerce')
+    work = work.dropna(subset=['batter', 'pitcher']).copy()
+    if work.empty:
+        return out
+
+    if 'events' in work.columns:
+        work['is_hr'] = work['events'].astype(str).str.lower().eq('home_run').astype(int)
+    else:
+        work['is_hr'] = 0
+
+    pair = work.groupby(['batter', 'pitcher'], as_index=False).agg(
+        pair_pa=('is_hr', 'count'),
+        pair_hr=('is_hr', 'sum'),
+    )
+    if not pair.empty:
+        pair['pair_rate'] = (pair['pair_hr'] + 1.0) / (pair['pair_pa'] + 30.0)
+        pair_map_hr = {(int(r['batter']), int(r['pitcher'])): float(r['pair_hr']) for _, r in pair.iterrows()}
+        pair_map_pa = {(int(r['batter']), int(r['pitcher'])): float(r['pair_pa']) for _, r in pair.iterrows()}
+        pair_map_rate = {(int(r['batter']), int(r['pitcher'])): float(r['pair_rate']) for _, r in pair.iterrows()}
+    else:
+        pair_map_hr = {}
+        pair_map_pa = {}
+        pair_map_rate = {}
+
+    park_map_hr = {}
+    park_map_pa = {}
+    park_map_rate = {}
+    if 'home_team' in work.columns and 'home_team' in rows_df.columns:
+        work['home_team'] = work['home_team'].astype(str).str.upper().str.strip()
+        park = work.groupby(['batter', 'home_team'], as_index=False).agg(
+            park_pa=('is_hr', 'count'),
+            park_hr=('is_hr', 'sum'),
+        )
+        if not park.empty:
+            park['park_rate'] = (park['park_hr'] + 1.0) / (park['park_pa'] + 40.0)
+            park_map_hr = {(int(r['batter']), str(r['home_team'])): float(r['park_hr']) for _, r in park.iterrows()}
+            park_map_pa = {(int(r['batter']), str(r['home_team'])): float(r['park_pa']) for _, r in park.iterrows()}
+            park_map_rate = {(int(r['batter']), str(r['home_team'])): float(r['park_rate']) for _, r in park.iterrows()}
+
+    row_bat = pd.to_numeric(rows_df.get('batter', np.nan), errors='coerce')
+    row_pit = pd.to_numeric(rows_df.get('pitcher', np.nan), errors='coerce')
+    row_team = rows_df.get('home_team', pd.Series([''] * len(rows_df), index=rows_df.index)).astype(str).str.upper().str.strip()
+
+    for idx in rows_df.index:
+        try:
+            b = int(row_bat.loc[idx]) if pd.notna(row_bat.loc[idx]) else None
+            p = int(row_pit.loc[idx]) if pd.notna(row_pit.loc[idx]) else None
+        except Exception:
+            b = None
+            p = None
+        if b is not None and p is not None:
+            k = (b, p)
+            out.at[idx, 'batter_vs_pitcher_hr_count'] = pair_map_hr.get(k, 0.0)
+            out.at[idx, 'batter_vs_pitcher_pa_count'] = pair_map_pa.get(k, 0.0)
+            out.at[idx, 'batter_vs_pitcher_hr_rate'] = pair_map_rate.get(k, 0.033)
+
+        if b is not None:
+            t = str(row_team.loc[idx])
+            if t:
+                pk = (b, t)
+                out.at[idx, 'batter_in_park_hr_count'] = park_map_hr.get(pk, 0.0)
+                out.at[idx, 'batter_in_park_pa_count'] = park_map_pa.get(pk, 0.0)
+                out.at[idx, 'batter_in_park_hr_rate'] = park_map_rate.get(pk, 0.033)
+
+    return out
 
 
 def build_recent_batter_woba_proxy(statcast_df, rows_df, lookback_days=45, min_sample=4):
@@ -7446,9 +7764,13 @@ def build_matchup_weather_features(df):
     pitch_hr_fb_allowed = _safe_num(out.get('pitch_hr_fb_allowed_rate', 0.12), 0.12)
     pitch_fb_allowed = _safe_num(out.get('pitch_fb_allowed_rate', 0.35), 0.35)
     temp = _safe_num(out.get('temp', 72.0), 72.0)
+    apparent_temp = _safe_num(out.get('apparent_temp', temp), 72.0)
+    dew_point = _safe_num(out.get('dew_point', 55.0), 55.0)
     wind_out = _safe_num(out.get('wind_out_component', 0.0), 0.0)
+    wind_gust = _safe_num(out.get('wind_gust', 0.0), 0.0)
     pressure = _safe_num(out.get('pressure', 1013.25), 1013.25)
     humidity = _safe_num(out.get('humidity', 50.0), 50.0)
+    cloud_cover = _safe_num(out.get('cloud_cover', 50.0), 50.0)
     lineup_slot = _safe_num(out.get('batting_order_slot', 5.0), 5.0)
     release_flag = _safe_num(out.get('line_release_window_flag', 0.0), 0.0)
 
@@ -7543,6 +7865,25 @@ def build_matchup_weather_features(df):
     out['hot_streak_contact_score'] = np.clip(hot_streak, 0.0, 1.0)
     out['arsenal_vulnerability_score'] = np.clip(arsenal_vuln, 0.0, 1.0)
     out['game_total_context_score'] = np.clip(total_context, 0.0, 1.0)
+
+    weather_carry = (
+        1.0
+        + ((apparent_temp - 72.0) / 26.0) * 0.06
+        + ((dew_point - 55.0) / 24.0) * 0.03
+        + (wind_out / 10.0) * 0.05
+        - ((wind_gust - np.maximum(wind_out, 0.0)) / 24.0) * 0.03
+        + np.maximum(0.0, (1013.25 - pressure) / 14.0) * 0.02
+        - np.maximum(0.0, (cloud_cover - 55.0) / 45.0) * 0.01
+        - np.maximum(0.0, (out.get('precipitation', 0.0) - 0.05) / 0.20) * 0.03
+    )
+    weather_penalty = (
+        np.maximum(0.0, (wind_gust - 18.0) / 20.0) * 0.30
+        + np.maximum(0.0, (pressure - 1018.0) / 18.0) * 0.20
+        + np.maximum(0.0, (cloud_cover - 75.0) / 25.0) * 0.20
+        + np.maximum(0.0, (out.get('precipitation', 0.0) - 0.10) / 0.25) * 0.30
+    )
+    out['weather_hr_impact_score'] = np.clip(weather_carry, 0.82, 1.22)
+    out['weather_hr_penalty_score'] = np.clip(weather_penalty, 0.0, 1.0)
 
     # If the slate provides an actual total, blend it into the context score.
     if 'game_total' in out.columns:
@@ -7996,6 +8337,12 @@ def generate_daily_predictions():
     _drop_all = list(set(_b_drop + _p_drop))
     train_df = raw_pa.drop(columns=_drop_all, errors='ignore').merge(b_stats, on='batter', how='inner')
     train_df = train_df.merge(p_stats, on='pitcher', how='inner')
+    history_lookback_days = max(60, _env_int('MATCHUP_HISTORY_LOOKBACK_DAYS', 365))
+    history_statcast_df = build_local_statcast_history_pool(statcast_df, days_back=history_lookback_days)
+    if not history_statcast_df.empty:
+        print(f"Historical matchup pool rows: {len(history_statcast_df):,} (lookback_days={history_lookback_days})")
+    else:
+        print("Historical matchup pool unavailable; proceeding with recent-only history.")
     train_df = build_matchup_weather_features(train_df)
     train_df['batter_pitch_mix_matchup_score'] = build_batter_pitch_mix_matchup_feature(
         statcast_df,
@@ -8020,6 +8367,13 @@ def generate_daily_predictions():
     _train_recent_hr = build_batter_recent_hr_features(statcast_df, train_df[['batter', 'pitcher']])
     for _rh_col in _train_recent_hr.columns:
         train_df[_rh_col] = _train_recent_hr[_rh_col].values
+    _train_history = build_matchup_history_features(
+        history_statcast_df if not history_statcast_df.empty else statcast_df,
+        train_df[['batter', 'pitcher', 'home_team']] if 'home_team' in train_df.columns else train_df[['batter', 'pitcher']],
+        lookback_days=history_lookback_days,
+    )
+    for _mh_col in _train_history.columns:
+        train_df[_mh_col] = _train_history[_mh_col].values
 
     professional_default_cols = {
         'platoon_advantage_multiplier': 1.0,
@@ -8066,6 +8420,26 @@ def generate_daily_predictions():
             if ERROR_TRACKER:
                 log_error("evaluation", f"evaluate_saved_predictions({yesterday_str})", _e, "WARNING")
 
+
+
+    def fetch_no_hr_prop_odds_raw():
+        """Fetch NO-HR side props from configured odds provider.
+
+        Currently implemented for SharpAPI where player_home_runs includes over/under side.
+        """
+        api_key = os.getenv('ODDS_API_KEY')
+        provider = _odds_provider_name()
+        if not api_key:
+            return {}
+        if _odds_invalid_key_cooldown_active() or _rate_limit_cooldown_active():
+            return {}
+        try:
+            if provider == 'sharpapi' or provider in {'auto', 'fallback'}:
+                return _fetch_no_hr_props_raw_from_sharpapi(api_key)
+            return {}
+        except Exception as e:
+            print(f"No-HR odds fetch failed ({provider}): {e}")
+            return {}
     sample_weights = load_feedback_weights(train_df)
     recent_minibatch_weights = build_recent_minibatch_weights(train_df)
     sample_weights = np.clip(np.asarray(sample_weights) * recent_minibatch_weights, 0.5, 15.0)
@@ -8112,8 +8486,9 @@ def generate_daily_predictions():
         'pitch_barrel_trend_delta', 'pitch_hard_hit_trend_delta',
         
         # Stadium & Weather Features
-        'park_factor', 'temp', 'wind_speed', 'wind_out_component',
-        'humidity', 'precipitation', 'pressure',  # NEW: Enhanced weather tracking
+        'park_factor', 'temp', 'apparent_temp', 'dew_point', 'wind_speed', 'wind_gust', 'wind_out_component',
+        'humidity', 'precipitation', 'pressure', 'cloud_cover',
+        'weather_hr_impact_score', 'weather_hr_penalty_score',
 
         # Matchup & weather edge features
         'ppci_dominance_score', 'dynamic_matchup_grade', 'pitch_arsenal_matchup_score',
@@ -8122,6 +8497,8 @@ def generate_daily_predictions():
         'arsenal_vulnerability_score', 'game_total_context_score',
         'batter_pitch_mix_matchup_score', 'recent_batter_woba_proxy', 'recent_pitcher_damage_proxy',
         'batter_hr_last_7d', 'batter_hr_last_14d', 'batter_hr_rate_7d', 'batter_hr_rate_14d',
+        'batter_vs_pitcher_hr_count', 'batter_vs_pitcher_pa_count', 'batter_vs_pitcher_hr_rate',
+        'batter_in_park_hr_count', 'batter_in_park_pa_count', 'batter_in_park_hr_rate',
         'bat_hr_rate_vs_rhp', 'bat_hr_rate_vs_lhp', 'bat_days_since_last_hr',
 
         # Professional features used in live scoring and calibration
@@ -8144,7 +8521,8 @@ def generate_daily_predictions():
     if simple_baseline_mode:
         # Keep only high-signal baseline features; fall back to nearest available proxy when needed.
         core_feature_aliases = [
-            ['bat_xslg', 'bat_iso_proxy', 'recent_batter_woba_proxy', 'bat_hr_rate'],
+            # Prioritize recent wOBA proxy so baseline mode always includes contact-quality run value.
+            ['recent_batter_woba_proxy', 'bat_xslg', 'bat_iso_proxy', 'bat_hr_rate'],
             ['pitch_barrel_allowed_rate', 'pitch_30pa_barrel_allowed_rate', 'pitch_15pa_barrel_allowed_rate'],
             ['park_factor', 'ballpark_park_factor'],
             ['temp'],
@@ -8672,6 +9050,13 @@ def generate_daily_predictions():
     _recent_hr_cols = build_batter_recent_hr_features(statcast_df, live[['batter', 'pitcher']])
     for _rh_col in _recent_hr_cols.columns:
         live[_rh_col] = _recent_hr_cols[_rh_col].values
+    _live_history = build_matchup_history_features(
+        history_statcast_df if 'history_statcast_df' in locals() and not history_statcast_df.empty else statcast_df,
+        live[['batter', 'pitcher', 'home_team']] if 'home_team' in live.columns else live[['batter', 'pitcher']],
+        lookback_days=history_lookback_days,
+    )
+    for _mh_col in _live_history.columns:
+        live[_mh_col] = _live_history[_mh_col].values
     if pitch_mix_vuln_debug.get('pitchers_seen', 0) > 0:
         print(
             "Pregame pitch-mix vulnerability proxy: "
@@ -8708,10 +9093,22 @@ def generate_daily_predictions():
 
     live['park_factor'] = live['park_factor'].fillna(100)
     live['temp'] = live['temp'].fillna(71.0)
+    live['apparent_temp'] = pd.to_numeric(live.get('apparent_temp', live['temp']), errors='coerce').fillna(live['temp'])
+    live['dew_point'] = pd.to_numeric(live.get('dew_point', 50.0), errors='coerce').fillna(50.0)
     live['wind_speed'] = live['wind_speed'].fillna(5.0)
+    live['wind_gust'] = pd.to_numeric(live.get('wind_gust', live['wind_speed']), errors='coerce').fillna(live['wind_speed'])
     live['humidity'] = live['humidity'].fillna(50.0)  # League average humidity
     live['precipitation'] = live['precipitation'].fillna(0.0)  # No precip by default
     live['pressure'] = live['pressure'].fillna(1013.25)  # Sea-level standard pressure
+    live['cloud_cover'] = pd.to_numeric(live.get('cloud_cover', 50.0), errors='coerce').fillna(50.0)
+    if 'weather_source' not in live.columns:
+        live['weather_source'] = 'unknown'
+    else:
+        live['weather_source'] = live['weather_source'].fillna('unknown').astype(str)
+    if 'weather_is_fallback' not in live.columns:
+        live['weather_is_fallback'] = 1
+    else:
+        live['weather_is_fallback'] = pd.to_numeric(live['weather_is_fallback'], errors='coerce').fillna(1).astype(int)
     live = build_matchup_weather_features(live)
     live['bat_hr_fb_rate'] = live['bat_hr_fb_rate'].fillna(0.12)
     live['pitch_hr_fb_allowed_rate'] = live['pitch_hr_fb_allowed_rate'].fillna(0.12)
@@ -8734,6 +9131,18 @@ def generate_daily_predictions():
     for _rh_col in ['batter_hr_rate_7d', 'batter_hr_rate_14d']:
         if _rh_col in live.columns:
             live[_rh_col] = live[_rh_col].fillna(0.033)
+    for _col, _default in [
+        ('batter_vs_pitcher_hr_count', 0.0),
+        ('batter_vs_pitcher_pa_count', 0.0),
+        ('batter_vs_pitcher_hr_rate', 0.033),
+        ('batter_in_park_hr_count', 0.0),
+        ('batter_in_park_pa_count', 0.0),
+        ('batter_in_park_hr_rate', 0.033),
+    ]:
+        if _col in live.columns:
+            live[_col] = pd.to_numeric(live[_col], errors='coerce').fillna(_default)
+        else:
+            live[_col] = _default
     for _col, _default in [('bat_hr_rate_vs_rhp', 0.033), ('bat_hr_rate_vs_lhp', 0.033),
                             ('bat_days_since_last_hr', 30.0)]:
         if _col in live.columns:
@@ -9648,6 +10057,7 @@ def generate_daily_predictions():
     if not market_odds_raw and snapshot_odds_raw:
         market_odds_raw = snapshot_odds_raw
     market_odds = _build_devigged_probs_from_raw_books(market_odds_raw)
+    no_hr_market_odds_raw = fetch_no_hr_prop_odds_raw()
 
     def _match_raw_best_line(bname):
         if not market_odds_raw:
@@ -9673,12 +10083,12 @@ def generate_daily_predictions():
                     continue
         return best_book, best_odds
 
-    def _match_raw_book_lines(bname):
-        if not market_odds_raw:
+    def _match_raw_book_lines_from_source(raw_source, bname):
+        if not raw_source:
             return {}
         bname_lower = str(bname).lower().strip()
         matched_books = {}
-        for key, book_map in market_odds_raw.items():
+        for key, book_map in raw_source.items():
             key_lower = str(key).lower().strip()
             if not (bname_lower in key_lower or key_lower in bname_lower or bname_lower.split()[-1] in key_lower):
                 continue
@@ -9697,6 +10107,9 @@ def generate_daily_predictions():
                 except Exception:
                     continue
         return matched_books
+
+    def _match_raw_book_lines(bname):
+        return _match_raw_book_lines_from_source(market_odds_raw, bname)
 
     if market_odds or market_odds_raw:
         def _match_odds(bname):
@@ -9916,6 +10329,61 @@ def generate_daily_predictions():
             edge = row['pred_hr_prob'] * b - (1 - row['pred_hr_prob'])
             return max(round(edge / b * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
         live['kelly_fraction'] = live.apply(_kelly_real, axis=1)
+
+        # NO-HR side markets (under 0.5) for dedicated no-HR card.
+        no_hr_book_lines = live['batter_name'].apply(lambda n: _match_raw_book_lines_from_source(no_hr_market_odds_raw, n))
+
+        def _best_no_hr_line(d):
+            if not isinstance(d, dict) or not d:
+                return pd.Series([np.nan, np.nan])
+            best_book = None
+            best_odds = None
+            best_decimal = -1.0
+            for bk, odds in d.items():
+                try:
+                    o = float(odds)
+                    dec = (1 + (o / 100.0)) if o > 0 else (1 + (100.0 / abs(o)))
+                    if dec > best_decimal:
+                        best_decimal = dec
+                        best_odds = int(round(o))
+                        best_book = bk
+                except Exception:
+                    continue
+            return pd.Series([best_book, best_odds])
+
+        no_hr_best = no_hr_book_lines.apply(_best_no_hr_line)
+        live['no_hr_best_book'] = no_hr_best.iloc[:, 0]
+        live['no_hr_best_market_odds_american'] = pd.to_numeric(no_hr_best.iloc[:, 1], errors='coerce')
+        live['no_hr_market_prob'] = live['no_hr_best_market_odds_american'].apply(
+            lambda x: american_to_implied_prob(x) if pd.notna(x) else np.nan
+        )
+        live['no_hr_model_prob'] = (1.0 - pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0)).clip(0.0, 1.0)
+        live['no_hr_fair_odds_american'] = live['no_hr_model_prob'].apply(prob_to_fair_american)
+
+        def _no_hr_ev(row):
+            mp = _safe_float(row.get('no_hr_market_prob'), np.nan)
+            model_p = _safe_float(row.get('no_hr_model_prob'), 0.0)
+            if not np.isfinite(mp) or mp <= 0 or mp >= 1:
+                return 0.0, 0.0
+            dec = 1.0 / mp
+            ev_val = model_p * dec - 1.0
+            return float(ev_val), float(ev_val * 100.0)
+
+        live[['no_hr_ev_value', 'no_hr_ev_percent']] = live.apply(
+            lambda r: pd.Series(_no_hr_ev(r)), axis=1
+        )
+
+        def _no_hr_kelly(row):
+            mp = _safe_float(row.get('no_hr_market_prob'), np.nan)
+            p = _safe_float(row.get('no_hr_model_prob'), 0.0)
+            if not np.isfinite(mp) or mp <= 0 or mp >= 1:
+                return 0.0
+            b = (1 - mp) / mp
+            edge = p * b - (1 - p)
+            return max(round((edge / b) * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
+
+        live['no_hr_kelly_fraction'] = live.apply(_no_hr_kelly, axis=1)
+        live['no_hr_has_market_odds'] = live['no_hr_market_prob'].notna()
     else:
         # No real odds: mark EV as zero
         medium_mask = live['model_reliability'].astype(str).str.upper().eq('MEDIUM')
@@ -9951,6 +10419,15 @@ def generate_daily_predictions():
         live['positive_ev_arbitrage'] = False
         live['arbitrage_score'] = 0.0
         live['release_window_sniper_signal'] = False
+        live['no_hr_best_book'] = np.nan
+        live['no_hr_best_market_odds_american'] = np.nan
+        live['no_hr_market_prob'] = np.nan
+        live['no_hr_model_prob'] = (1.0 - pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0)).clip(0.0, 1.0)
+        live['no_hr_fair_odds_american'] = live['no_hr_model_prob'].apply(prob_to_fair_american)
+        live['no_hr_ev_value'] = 0.0
+        live['no_hr_ev_percent'] = 0.0
+        live['no_hr_kelly_fraction'] = 0.0
+        live['no_hr_has_market_odds'] = False
 
     physics_output_defaults = {
         'physics_hr_prob': 0.0,
@@ -10075,7 +10552,10 @@ def generate_daily_predictions():
         live['pitcher_damage_boost'] = np.nan
 
     persist_daily_predictions(live[['game_pk', 'game_time', 'batter', 'batter_name', 'pitcher', 'pitcher_name',
-                                    'has_platoon_advantage', 'park_factor', 'temp', 'wind_speed',
+                                    'has_platoon_advantage', 'park_factor', 'temp', 'apparent_temp', 'dew_point',
+                                    'wind_speed', 'wind_gust', 'wind_out_component', 'humidity', 'precipitation',
+                                    'pressure', 'cloud_cover', 'weather_source', 'weather_is_fallback',
+                                    'weather_hr_impact_score', 'weather_hr_penalty_score',
                                     'pred_hr_prob', 'model_p_capped', 'edge_pct', 'kelly_fraction', 'ev_value', 'ev_percent',
                                     'projected_pas', 'pa_distribution_std', 'pa_conversion_method',
                                     'kelly_multiplier',
@@ -10093,6 +10573,9 @@ def generate_daily_predictions():
                                     'stacked_boost_multiplier_final',
                                     'best_book', 'best_market_odds_american', 'best_market_implied_prob',
                                     'market_prob', 'ev_market_prob', 'market_edge_pct',
+                                    'no_hr_best_book', 'no_hr_best_market_odds_american', 'no_hr_market_prob',
+                                    'no_hr_model_prob', 'no_hr_fair_odds_american', 'no_hr_ev_value', 'no_hr_ev_percent',
+                                    'no_hr_kelly_fraction', 'no_hr_has_market_odds',
                                     'fair_odds_american', 'prob_edge_abs', 'elite_ev_signal',
                                     'arbitrage_value_pct', 'book_prob_dispersion', 'matched_book_count',
                                     'positive_ev_arbitrage', 'arbitrage_score',
