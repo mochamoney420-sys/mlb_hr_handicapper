@@ -310,6 +310,17 @@ TEAM_ABBR_TO_STADIUM_KEY = {
     'STL': 'Cardinals', 'TB': 'Rays', 'TEX': 'Rangers', 'TOR': 'Blue Jays', 'WSH': 'Nationals'
 }
 
+# Feed-specific abbreviation aliases that occasionally appear in live APIs.
+TEAM_ABBR_TO_STADIUM_KEY.update({
+    'CHW': 'White Sox',
+    'KCR': 'Royals',
+    'SDP': 'Padres',
+    'SFG': 'Giants',
+    'TBR': 'Rays',
+    'WSN': 'Nationals',
+    'LADG': 'Dodgers',
+})
+
 # Sportsbook tiers for RLM detection and sharp consensus weighting
 SHARP_BOOKS = {'pinnacle', 'circasports', 'betonlineag', 'betus', 'betrivers', 'pointsbetusn', 'lowvig', 'bookmaker'}
 SQUARE_BOOKS = {'fanduel', 'draftkings', 'betmgm', 'williamhill_us', 'barstool', 'unibet_us', 'mybookieag', 'bovada', 'caesars', 'wynnbet', 'betfred', 'superbook'}
@@ -1038,6 +1049,87 @@ def get_live_weather(lat, lon):
         return defaults
 
     try:
+        def _cardinal_to_degrees(card):
+            mapping = {
+                'N': 0.0, 'NNE': 22.5, 'NE': 45.0, 'ENE': 67.5,
+                'E': 90.0, 'ESE': 112.5, 'SE': 135.0, 'SSE': 157.5,
+                'S': 180.0, 'SSW': 202.5, 'SW': 225.0, 'WSW': 247.5,
+                'W': 270.0, 'WNW': 292.5, 'NW': 315.0, 'NNW': 337.5,
+            }
+            key = str(card or '').strip().upper()
+            return mapping.get(key, defaults['wind_dir'])
+
+        def _parse_mph(value):
+            text = str(value or '').strip().lower()
+            m = re.search(r'([0-9]+(?:\.[0-9]+)?)', text)
+            if not m:
+                return float(defaults['wind_speed'])
+            return float(m.group(1))
+
+        def _to_fahrenheit(value_c):
+            try:
+                return (float(value_c) * 9.0 / 5.0) + 32.0
+            except Exception:
+                return float(defaults['dew_point'])
+
+        def _coerce_weather_out(payload):
+            payload = payload or {}
+            current = payload.get('current', {}) or payload.get('current_weather', {}) or {}
+            return {
+                'temp': float(pd.to_numeric(current.get('temperature_2m', current.get('temperature', defaults['temp'])), errors='coerce') or defaults['temp']),
+                'apparent_temp': float(pd.to_numeric(current.get('apparent_temperature', defaults['apparent_temp']), errors='coerce') or defaults['apparent_temp']),
+                'dew_point': float(pd.to_numeric(current.get('dew_point_2m', defaults['dew_point']), errors='coerce') or defaults['dew_point']),
+                'wind_speed': float(pd.to_numeric(current.get('wind_speed_10m', current.get('windspeed', defaults['wind_speed'])), errors='coerce') or defaults['wind_speed']),
+                'wind_dir': float(pd.to_numeric(current.get('wind_direction_10m', current.get('winddirection', defaults['wind_dir'])), errors='coerce') or defaults['wind_dir']),
+                'wind_gust': float(pd.to_numeric(current.get('wind_gusts_10m', defaults['wind_gust']), errors='coerce') or defaults['wind_gust']),
+                'humidity': float(pd.to_numeric(current.get('relative_humidity_2m', defaults['humidity']), errors='coerce') or defaults['humidity']),
+                'precipitation': float(pd.to_numeric(current.get('precipitation', defaults['precipitation']), errors='coerce') or defaults['precipitation']),
+                'pressure': float(pd.to_numeric(current.get('pressure_msl', defaults['pressure']), errors='coerce') or defaults['pressure']),
+                'cloud_cover': float(pd.to_numeric(current.get('cloud_cover', defaults['cloud_cover']), errors='coerce') or defaults['cloud_cover']),
+                'weather_source': 'open-meteo-current',
+                'weather_is_fallback': 0,
+            }
+
+        def _weathergov_live_out(lat_val, lon_val):
+            headers = {'User-Agent': 'mlb-hr-handicapper/1.0 (weather validation)'}
+            points_url = f"https://api.weather.gov/points/{lat_val},{lon_val}"
+            points_resp = requests.get(points_url, timeout=7, headers=headers)
+            if getattr(points_resp, 'status_code', 0) != 200:
+                return None
+            points_payload = points_resp.json() or {}
+            hourly_url = ((points_payload.get('properties') or {}).get('forecastHourly') or '').strip()
+            if not hourly_url:
+                return None
+            hourly_resp = requests.get(hourly_url, timeout=7, headers=headers)
+            if getattr(hourly_resp, 'status_code', 0) != 200:
+                return None
+            hourly_payload = hourly_resp.json() or {}
+            periods = (((hourly_payload.get('properties') or {}).get('periods')) or [])
+            if not periods:
+                return None
+            cur = periods[0] or {}
+
+            humidity = ((cur.get('relativeHumidity') or {}).get('value'))
+            precip = ((cur.get('probabilityOfPrecipitation') or {}).get('value'))
+            dew_val = ((cur.get('dewpoint') or {}).get('value'))
+            pressure_pa = ((cur.get('barometricPressure') or {}).get('value'))
+
+            return {
+                'temp': float(pd.to_numeric(cur.get('temperature', defaults['temp']), errors='coerce') or defaults['temp']),
+                'apparent_temp': float(pd.to_numeric(cur.get('temperature', defaults['apparent_temp']), errors='coerce') or defaults['apparent_temp']),
+                'dew_point': _to_fahrenheit(dew_val) if dew_val is not None else defaults['dew_point'],
+                'wind_speed': _parse_mph(cur.get('windSpeed', defaults['wind_speed'])),
+                'wind_dir': _cardinal_to_degrees(cur.get('windDirection', defaults['wind_dir'])),
+                'wind_gust': _parse_mph(cur.get('windSpeed', defaults['wind_gust'])),
+                'humidity': float(pd.to_numeric(humidity, errors='coerce') if humidity is not None else defaults['humidity']),
+                'precipitation': float(pd.to_numeric(precip, errors='coerce') if precip is not None else defaults['precipitation']) / 100.0,
+                'pressure': float(pd.to_numeric(pressure_pa, errors='coerce') / 100.0) if pressure_pa is not None else defaults['pressure'],
+                'cloud_cover': float(defaults['cloud_cover']),
+                'weather_source': 'weather-gov-current',
+                'weather_is_fallback': 0,
+            }
+
+        # Primary path: richer current payload.
         url = (
             "https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}"
@@ -1046,26 +1138,26 @@ def get_live_weather(lat, lon):
             "&timezone=America/New_York"
         )
         resp = requests.get(url, timeout=7)
-        if getattr(resp, 'status_code', 200) != 200:
-            return defaults
-        payload = resp.json() or {}
-        current = payload.get('current', {}) or payload.get('current_weather', {}) or {}
+        if getattr(resp, 'status_code', 200) == 200:
+            return _coerce_weather_out(resp.json())
 
-        out = {
-            'temp': float(pd.to_numeric(current.get('temperature_2m', current.get('temperature', defaults['temp'])), errors='coerce') or defaults['temp']),
-            'apparent_temp': float(pd.to_numeric(current.get('apparent_temperature', defaults['apparent_temp']), errors='coerce') or defaults['apparent_temp']),
-            'dew_point': float(pd.to_numeric(current.get('dew_point_2m', defaults['dew_point']), errors='coerce') or defaults['dew_point']),
-            'wind_speed': float(pd.to_numeric(current.get('wind_speed_10m', current.get('windspeed', defaults['wind_speed'])), errors='coerce') or defaults['wind_speed']),
-            'wind_dir': float(pd.to_numeric(current.get('wind_direction_10m', current.get('winddirection', defaults['wind_dir'])), errors='coerce') or defaults['wind_dir']),
-            'wind_gust': float(pd.to_numeric(current.get('wind_gusts_10m', defaults['wind_gust']), errors='coerce') or defaults['wind_gust']),
-            'humidity': float(pd.to_numeric(current.get('relative_humidity_2m', defaults['humidity']), errors='coerce') or defaults['humidity']),
-            'precipitation': float(pd.to_numeric(current.get('precipitation', defaults['precipitation']), errors='coerce') or defaults['precipitation']),
-            'pressure': float(pd.to_numeric(current.get('pressure_msl', defaults['pressure']), errors='coerce') or defaults['pressure']),
-            'cloud_cover': float(pd.to_numeric(current.get('cloud_cover', defaults['cloud_cover']), errors='coerce') or defaults['cloud_cover']),
-            'weather_source': 'open-meteo-current',
-            'weather_is_fallback': 0,
-        }
-        return out
+        # Backup path: leaner request in case provider rejects richer field set.
+        backup_url = (
+            "https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            "&current_weather=true"
+            "&temperature_unit=fahrenheit&windspeed_unit=mph"
+            "&timezone=America/New_York"
+        )
+        backup_resp = requests.get(backup_url, timeout=7)
+        if getattr(backup_resp, 'status_code', 200) == 200:
+            return _coerce_weather_out(backup_resp.json())
+
+        # Secondary real-time provider fallback for US venues.
+        wg = _weathergov_live_out(lat, lon)
+        if isinstance(wg, dict):
+            return wg
+        return defaults
     except Exception:
         return defaults
 
@@ -5438,6 +5530,31 @@ def get_today_matchups():
     schedule = statsapi.schedule(date=today_str)
     print(f"Schedule: {len(schedule)} games for {today_str}")
     matchups = []
+    require_realtime_weather = str(os.getenv('REQUIRE_REALTIME_WEATHER_ALL_GAMES', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    realtime_weather_retries = max(0, _env_int('REALTIME_WEATHER_MAX_RETRIES', 2))
+    realtime_weather_retry_sleep = max(0.0, _env_float('REALTIME_WEATHER_RETRY_SLEEP_SECONDS', 1.5))
+    realtime_weather_failures = []
+
+    def _is_realtime_weather_payload(payload):
+        if not isinstance(payload, dict):
+            return False
+        source = str(payload.get('weather_source', '') or '').strip().lower()
+        fallback_raw = pd.to_numeric(payload.get('weather_is_fallback', 1), errors='coerce')
+        fallback = 1 if pd.isna(fallback_raw) else int(fallback_raw)
+        return source.endswith('current') and fallback == 0
+
+    def _fetch_live_weather_with_retries(lat, lon):
+        if lat is None or lon is None:
+            return None
+        last = None
+        for attempt in range(realtime_weather_retries + 1):
+            candidate = get_live_weather(float(lat), float(lon))
+            last = candidate
+            if _is_realtime_weather_payload(candidate):
+                return candidate
+            if attempt < realtime_weather_retries and realtime_weather_retry_sleep > 0:
+                time.sleep(realtime_weather_retry_sleep)
+        return last
 
     for game in schedule:
         if game.get('status') in ['Cancelled', 'Postponed']:
@@ -5488,7 +5605,7 @@ def get_today_matchups():
             lat = loc.get('latitude')
             lon = loc.get('longitude')
             if lat is not None and lon is not None:
-                weather = get_live_weather(float(lat), float(lon))
+                weather = _fetch_live_weather_with_retries(lat, lon)
         except Exception:
             weather = None
         cf_bearing = STADIUM_CF_BEARING.get(team_abbrev, 0)
@@ -5547,14 +5664,33 @@ def get_today_matchups():
             # If venue geolocation weather failed, try home-team stadium coordinates,
             # then same-date historical archive weather for that ballpark.
             if int(weather.get('weather_is_fallback', 1)) == 1:
-                try:
-                    alt_coords = _get_stadium_coords_for_team(home_team_abbr)
-                except Exception:
-                    alt_coords = None
-                if alt_coords is not None:
-                    live_retry = get_live_weather(alt_coords[0], alt_coords[1])
-                    if int(live_retry.get('weather_is_fallback', 1)) == 0:
+                alt_coord_candidates = []
+                for candidate_team in [home_team_abbr, team_abbrev]:
+                    c_team = str(candidate_team or '').strip().upper()
+                    if not c_team:
+                        continue
+                    try:
+                        alt_coords = _get_stadium_coords_for_team(c_team)
+                    except Exception:
+                        alt_coords = None
+                    if alt_coords is not None:
+                        alt_coord_candidates.append(alt_coords)
+
+                # Preserve order while removing duplicate coordinate pairs.
+                seen_coords = set()
+                dedup_alt_coords = []
+                for coords in alt_coord_candidates:
+                    key = (round(float(coords[0]), 5), round(float(coords[1]), 5))
+                    if key in seen_coords:
+                        continue
+                    seen_coords.add(key)
+                    dedup_alt_coords.append(coords)
+
+                for coords in dedup_alt_coords:
+                    live_retry = _fetch_live_weather_with_retries(coords[0], coords[1])
+                    if _is_realtime_weather_payload(live_retry):
                         weather = live_retry
+                        break
 
             if int(weather.get('weather_is_fallback', 1)) == 1:
                 team_candidates = []
@@ -5587,8 +5723,23 @@ def get_today_matchups():
                     if 'cloud_cover' not in hist_weather:
                         hist_weather['cloud_cover'] = 50.0
                     hist_weather['weather_source'] = 'open-meteo-archive'
-                    hist_weather['weather_is_fallback'] = 0
+                    hist_weather['weather_is_fallback'] = 1
                     weather = hist_weather
+
+            if require_realtime_weather and not _is_realtime_weather_payload(weather):
+                realtime_weather_failures.append({
+                    'game_pk': game_id,
+                    'home': game.get('home_name', ''),
+                    'away': game.get('away_name', ''),
+                    'venue': venue_name,
+                    'weather_source': weather.get('weather_source', 'unknown') if isinstance(weather, dict) else 'none',
+                })
+                print(
+                    f"Realtime weather missing for game {game_id} "
+                    f"({game.get('away_name','?')} @ {game.get('home_name','?')}) "
+                    f"source={weather.get('weather_source', 'unknown') if isinstance(weather, dict) else 'none'}"
+                )
+                continue
 
             cf_bearing = STADIUM_CF_BEARING.get(home_team_abbr or team_abbrev, 0)
             _wind_angle = math.radians(float(weather.get('wind_dir', 0.0) or 0.0) - cf_bearing)
@@ -5713,6 +5864,17 @@ def get_today_matchups():
         except Exception as e:
             print(f"Warning: failed to build matchups for game {game_id}: {e}")
             continue
+
+    if require_realtime_weather and realtime_weather_failures:
+        fail_preview = ", ".join([
+            f"{x.get('away', '?')}@{x.get('home', '?')}[{x.get('weather_source', 'unknown')}]"
+            for x in realtime_weather_failures[:8]
+        ])
+        raise RuntimeError(
+            f"Real-time weather requirement failed for {len(realtime_weather_failures)} games on {today_str}. "
+            f"Examples: {fail_preview}. "
+            "Set REQUIRE_REALTIME_WEATHER_ALL_GAMES=false to allow fallback weather."
+        )
 
     return pd.DataFrame(matchups)
 
