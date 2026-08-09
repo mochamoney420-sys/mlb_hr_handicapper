@@ -10782,12 +10782,16 @@ def generate_daily_predictions():
         if not positive_ev.empty:
             positive_ev = _filter_discord_ev_candidates(positive_ev)
         if not positive_ev.empty:
+            if 'stake_usd' not in positive_ev.columns:
+                positive_ev['stake_usd'] = positive_ev.get('kelly_fraction', pd.Series([0.0] * len(positive_ev), index=positive_ev.index)).apply(_estimate_bet_stake_usd)
+            ev_cols = [
+                'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction',
+                'ev_percent', 'game_time', 'model_reliability', 'market_prob', 'best_book',
+                'best_market_odds_american', 'stake_usd', 'matched_book_count'
+            ]
+            ev_cols = [c for c in ev_cols if c in positive_ev.columns]
             top_ev = _prepare_discord_rankings(
-                positive_ev[[
-                    'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct', 'kelly_fraction',
-                    'ev_percent', 'game_time', 'model_reliability', 'market_prob', 'best_book',
-                    'best_market_odds_american', 'stake_usd', 'matched_book_count'
-                ]]
+                positive_ev[ev_cols]
             )
             top_ev = top_ev.sort_values(
                 by=['portfolio_action_score', 'ev_pct', 'kelly_fraction', 'hr_probability'],
