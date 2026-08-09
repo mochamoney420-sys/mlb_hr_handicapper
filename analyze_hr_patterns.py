@@ -51,6 +51,14 @@ def _safe_float(value, default=0.0):
     return float(val)
 
 
+def _learning_hit_threshold(default=0.08):
+    """Probability threshold used to classify a HR as predicted."""
+    try:
+        return float(np.clip(float(os.getenv('LEARNING_HR_HIT_THRESHOLD', str(default))), 0.01, 0.50))
+    except Exception:
+        return float(default)
+
+
 def _build_hr_event_key(row):
     """Build a stable per-HR event key to avoid collapsing repeat HRs."""
     sv = row.get('sv_id')
@@ -93,6 +101,34 @@ def load_yesterdays_home_runs():
     feedback_file = Path('data') / f'live_feedback_{yesterday}.csv'
     evaluation_file = Path('data') / f'evaluation_{yesterday}.csv'
     statcast_file = Path('cache') / f'statcast_{yesterday}.csv'
+
+    # Canonical source: yesterday evaluation file when available.
+    # This keeps pattern-learning counts aligned with scoring metrics.
+    if evaluation_file.exists():
+        try:
+            ev = pd.read_csv(evaluation_file)
+            if not ev.empty and {'actual_hr', 'pred_hr_prob'}.issubset(ev.columns):
+                ev = ev.copy()
+                ev['actual_hr'] = pd.to_numeric(ev.get('actual_hr', 0), errors='coerce').fillna(0).astype(int)
+                ev = ev[ev['actual_hr'] == 1].copy()
+                if not ev.empty:
+                    ev['date'] = yesterday
+                    ev['model_prob'] = pd.to_numeric(ev.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+                    ev['batter_name'] = ev.get('batter_name', pd.Series(['Unknown'] * len(ev))).apply(_safe_name)
+                    ev['pitcher_name'] = ev.get('pitcher_name', pd.Series(['Unknown'] * len(ev))).apply(_safe_name)
+                    for col in ['game_pk', 'batter', 'pitcher']:
+                        if col in ev.columns:
+                            ev[col] = pd.to_numeric(ev[col], errors='coerce')
+                    # Match evaluation dedupe granularity exactly.
+                    dedupe_cols = [c for c in ['game_pk', 'batter', 'pitcher'] if c in ev.columns]
+                    if dedupe_cols:
+                        ev = ev.sort_values(by=dedupe_cols).drop_duplicates(subset=dedupe_cols, keep='last')
+                    ev['source'] = 'evaluation_canonical'
+                    keep_cols = [c for c in ['date', 'game_pk', 'batter', 'pitcher', 'batter_name', 'pitcher_name', 'model_prob', 'source'] if c in ev.columns]
+                    print(f"📊 Found {len(ev)} home runs from {yesterday} in evaluation")
+                    return ev[keep_cols].reset_index(drop=True)
+        except Exception as exc:
+            print(f"⚠️  Error loading evaluation file: {exc}")
 
     hrs = pd.DataFrame()
     fb_enrichment = pd.DataFrame()
@@ -368,13 +404,28 @@ def build_learning_insights_from_evaluation(eval_df):
     eval_df['actual_hr'] = pd.to_numeric(eval_df.get('actual_hr', 0), errors='coerce').fillna(0).astype(int)
     eval_df['pred_hr_prob'] = pd.to_numeric(eval_df.get('pred_hr_prob', 0), errors='coerce').fillna(0.0)
 
+    # Prefer the outcome date if present; fallback to yesterday.
+    analysis_date = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+    for date_col in ['date', 'event_date', 'game_date']:
+        if date_col in eval_df.columns:
+            try:
+                dvals = pd.to_datetime(eval_df[date_col], errors='coerce').dropna()
+                if not dvals.empty:
+                    analysis_date = dvals.iloc[0].strftime('%Y-%m-%d')
+                    break
+            except Exception:
+                pass
+
     patterns = []
     summary_stats = {}
+    hit_threshold = _learning_hit_threshold(0.08)
     for _, row in eval_df[eval_df['actual_hr'] == 1].iterrows():
+        model_prob = _safe_float(row.get('pred_hr_prob', 0.0), 0.0)
         pattern = {
             'batter_name': _safe_name(row.get('batter_name', 'Unknown')),
             'pitcher_name': _safe_name(row.get('pitcher_name', 'Unknown')),
-            'model_prob': _safe_float(row.get('pred_hr_prob', 0.0), 0.0),
+            'model_prob': model_prob,
+            'prediction_category': 'PREDICTED' if model_prob >= hit_threshold else 'MISSED',
         }
         patterns.append(pattern)
         summary_stats[str(pattern['batter_name'])] = summary_stats.get(str(pattern['batter_name']), 0) + 1
@@ -383,16 +434,19 @@ def build_learning_insights_from_evaluation(eval_df):
         return None
 
     insights = {
-        'analysis_date': datetime.today().strftime('%Y-%m-%d'),
+        'analysis_date': analysis_date,
         'total_hrs_analyzed': len(patterns),
         'unique_batters': len(summary_stats),
-        'missed_predictions': int(sum(1 for p in patterns if p.get('model_prob', 0) < 0.10)),
-        'accurate_predictions': int(sum(1 for p in patterns if p.get('model_prob', 0) >= 0.10)),
+        'missed_predictions': int(sum(1 for p in patterns if p.get('model_prob', 0) < hit_threshold)),
+        'accurate_predictions': int(sum(1 for p in patterns if p.get('model_prob', 0) >= hit_threshold)),
         'patterns': patterns,
         'key_findings': [],
     }
 
-    insights['key_findings'].append(f"⚠️  Model missed {insights['missed_predictions']}/{insights['total_hrs_analyzed']} HRs (need to upweight these batters)")
+    insights['key_findings'].append(
+        f"⚠️  Model missed {insights['missed_predictions']}/{insights['total_hrs_analyzed']} HRs "
+        f"(threshold={hit_threshold:.2f})"
+    )
     return insights
 
 
@@ -403,7 +457,7 @@ def generate_learning_insights(patterns, summary_stats):
         return None
     
     insights = {
-        'analysis_date': datetime.today().strftime('%Y-%m-%d'),
+        'analysis_date': (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d'),
         'total_hrs_analyzed': len(patterns),
         'unique_batters': len(summary_stats),
         'missed_predictions': 0,
@@ -412,17 +466,20 @@ def generate_learning_insights(patterns, summary_stats):
         'key_findings': []
     }
     
+    hit_threshold = _learning_hit_threshold(0.08)
+    near_hit_floor = max(0.01, hit_threshold - 0.03)
+
     # Analyze each pattern
     for pattern in patterns:
         model_prob = pattern.get('model_prob', 0)
         
         # Categorize prediction accuracy
-        if model_prob < 0.10:
+        if model_prob < near_hit_floor:
             insights['missed_predictions'] += 1
             pattern['prediction_category'] = 'MISSED (low prob)'
-        elif model_prob < 0.20:
+        elif model_prob < hit_threshold:
             insights['missed_predictions'] += 1
-            pattern['prediction_category'] = 'MISSED (medium prob)'
+            pattern['prediction_category'] = 'MISSED (near hit threshold)'
         else:
             insights['accurate_predictions'] += 1
             pattern['prediction_category'] = 'PREDICTED'
@@ -434,7 +491,10 @@ def generate_learning_insights(patterns, summary_stats):
     insights['key_findings'].append(f"🔥 Hottest batters: {', '.join([f'{name} ({count} HRs)' for name, count in batter_hot])}")
     
     missed = sum(1 for p in patterns if p['prediction_category'].startswith('MISSED'))
-    insights['key_findings'].append(f"⚠️  Model missed {missed}/{len(patterns)} HRs (need to upweight these batters)")
+    insights['key_findings'].append(
+        f"⚠️  Model missed {missed}/{len(patterns)} HRs "
+        f"(threshold={hit_threshold:.2f})"
+    )
     
     avg_exit_velo = np.mean([p.get('batter_recent_avg_exit_velo', 0) for p in patterns if p.get('batter_recent_avg_exit_velo')])
     if avg_exit_velo > 90:
@@ -531,6 +591,22 @@ def analyze_yesterdays_hrs_and_learn():
     
     # Step 1: Load yesterday's actual HRs
     actual_hrs = load_yesterdays_home_runs()
+
+    # If canonical evaluation rows were loaded, build report directly so
+    # learning counts stay aligned with evaluation metrics.
+    if not actual_hrs.empty and 'source' in actual_hrs.columns:
+        src = actual_hrs['source'].astype(str).str.lower().fillna('')
+        if src.str.contains('evaluation').all() or src.str.contains('fallback').all():
+            eval_like = actual_hrs.copy()
+            eval_like['actual_hr'] = 1
+            eval_like['pred_hr_prob'] = pd.to_numeric(eval_like.get('model_prob', 0.0), errors='coerce').fillna(0.0)
+            insights = build_learning_insights_from_evaluation(eval_like)
+            if insights:
+                report_file = save_learning_report(insights)
+                if report_file:
+                    print(f"✅ Learning report saved from canonical evaluation source: {report_file}")
+                print_learning_report(insights)
+                return {'insights': insights, 'feedback_boost': {}, 'patterns': insights.get('patterns', [])}
     
     if actual_hrs.empty:
         yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')

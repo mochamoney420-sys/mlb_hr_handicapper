@@ -2314,6 +2314,61 @@ def resolve_kelly_multiplier(days_lookback=14, default_multiplier=0.60):
     return float(mult)
 
 
+def resolve_daily_probability_target_mean(days_lookback=14, default_target=0.055):
+    """Resolve daily HR probability anchor target from env or recent realized rates.
+
+    If DAILY_PROBABILITY_TARGET_MEAN is set, honor it. Otherwise infer a realistic
+    target from recent evaluation files and apply a small uplift so we don't
+    under-rank true top-end hitters.
+    """
+    raw = os.getenv('DAILY_PROBABILITY_TARGET_MEAN')
+    if raw is not None and str(raw).strip() != '':
+        try:
+            val = float(np.clip(float(raw), 0.03, 0.20))
+            print(f"Daily probability target override from DAILY_PROBABILITY_TARGET_MEAN: {val:.4f}")
+            return val
+        except Exception:
+            pass
+
+    cutoff = datetime.today() - timedelta(days=max(3, int(days_lookback)))
+    actual_rates = []
+    pred_rates = []
+
+    for fp in sorted(Path('data').glob('evaluation_*.csv')):
+        try:
+            d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+            if d < cutoff:
+                continue
+            ev = pd.read_csv(fp, usecols=['pred_hr_prob', 'actual_hr'])
+            if ev is None or ev.empty:
+                continue
+            actual = pd.to_numeric(ev.get('actual_hr', 0.0), errors='coerce').fillna(0.0)
+            pred = pd.to_numeric(ev.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+            if len(actual):
+                actual_rates.append(float(actual.mean()))
+                pred_rates.append(float(pred.mean()))
+        except Exception:
+            continue
+
+    if not actual_rates:
+        target = float(np.clip(default_target, 0.03, 0.20))
+        print(f"Daily probability target: no recent evaluations; using default {target:.4f}")
+        return target
+
+    actual_mean = float(np.mean(actual_rates))
+    pred_mean = float(np.mean(pred_rates)) if pred_rates else actual_mean
+    # Keep target close to realized base rate with mild uplift, but never above
+    # the recent model mean when model is already overconfident.
+    target = min(actual_mean * 1.12, max(actual_mean, pred_mean))
+    target = float(np.clip(target, 0.035, 0.11))
+    print(
+        "Daily probability target auto-resolved: "
+        f"target={target:.4f}, recent_actual={actual_mean:.4f}, recent_pred={pred_mean:.4f}, "
+        f"days={len(actual_rates)}"
+    )
+    return target
+
+
 def _file_contains_text(path, needle):
     try:
         p = Path(path)
@@ -2425,15 +2480,20 @@ def run_model_self_check(days_lookback=30):
 
     # 5. Check evaluation pipeline (learning data)
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-    eval_file = Path('data') / f'evaluation_{yesterday_str}.csv'
-    if eval_file.exists():
-        try:
-            eval_df = pd.read_csv(eval_file)
-            print(f"✅ Learning evaluation ready: {len(eval_df)} rows")
-        except Exception as e:
-            print(f"⚠️  Evaluation file corrupted: {e}")
+    eval_status = ensure_evaluation_file_for_date(yesterday_str, auto_repair=True)
+    if bool(eval_status.get('exists')):
+        print(f"✅ Learning evaluation ready: {int(eval_status.get('rows', 0))} rows")
     else:
-        print(f"ℹ️  No evaluation for {yesterday_str} yet")
+        if bool(eval_status.get('predictions_exist')):
+            msg = (
+                f"Missing evaluation for {yesterday_str} despite existing predictions "
+                f"(auto-repair failed: {eval_status.get('reason', 'unknown')})"
+            )
+            print(f"❌ {msg}")
+            silent_failures.append(msg)
+            issues_found += 1
+        else:
+            print(f"ℹ️  No evaluation for {yesterday_str} yet (no predictions file)")
 
     # 6. Check recent closed-loop miss-rate trend for underprediction collapse.
     try:
@@ -2515,6 +2575,64 @@ def _repo_data_dir():
     if candidate.exists():
         return candidate
     return Path('data')
+
+
+def ensure_evaluation_file_for_date(date_str, auto_repair=True):
+    """Ensure evaluation_YYYY-MM-DD.csv exists when predictions exist.
+
+    This prevents silent learning gaps by attempting evaluation generation, and
+    allows fallback evaluation from live feedback when Statcast is delayed.
+    """
+    data_dir = _repo_data_dir()
+    pred_file = data_dir / f'predictions_{date_str}.csv'
+    eval_file = data_dir / f'evaluation_{date_str}.csv'
+
+    status = {
+        'date': date_str,
+        'predictions_exist': bool(pred_file.exists()),
+        'exists': bool(eval_file.exists()),
+        'rows': 0,
+        'source': 'existing' if eval_file.exists() else 'missing',
+        'reason': 'ok' if eval_file.exists() else 'missing_eval',
+    }
+
+    if eval_file.exists():
+        try:
+            status['rows'] = int(len(pd.read_csv(eval_file)))
+        except Exception:
+            status['rows'] = 0
+        return status
+
+    if not pred_file.exists():
+        status['reason'] = 'missing_predictions'
+        return status
+
+    if not auto_repair:
+        status['reason'] = 'auto_repair_disabled'
+        return status
+
+    # If we already have live feedback, clear stale empty Statcast marker once
+    # so evaluate_saved_predictions can retry and then use fallback if needed.
+    try:
+        feedback_file = data_dir / f'live_feedback_{date_str}.csv'
+        empty_marker = Path('cache') / f'statcast_{date_str}.empty'
+        if feedback_file.exists() and empty_marker.exists():
+            empty_marker.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    try:
+        eval_df = evaluate_saved_predictions(date_str)
+        status['exists'] = bool(eval_file.exists())
+        status['rows'] = int(len(eval_df)) if eval_df is not None else 0
+        status['source'] = 'repaired' if status['exists'] else 'repair_failed'
+        status['reason'] = 'ok' if status['exists'] else 'evaluate_returned_empty'
+    except Exception as exc:
+        status['exists'] = bool(eval_file.exists())
+        status['source'] = 'repair_exception'
+        status['reason'] = f'evaluate_error:{exc}'
+
+    return status
 
 
 def send_morning_learning_summary(
@@ -4530,20 +4648,115 @@ def evaluate_saved_predictions(date_str=None):
         return pd.DataFrame()
 
     actual = load_or_fetch_statcast(date_str)
+    evaluation_source = 'statcast'
+    feedback_rows_for_reconcile = None
     if actual is None or actual.empty:
-        print(f"Unable to load actual Statcast outcomes for {date_str}.")
-        return pd.DataFrame()
+        feedback_file = Path('data') / f'live_feedback_{date_str}.csv'
+        if feedback_file.exists():
+            try:
+                fb = pd.read_csv(feedback_file)
+                required_feedback_cols = {'game_pk', 'batter', 'pitcher', 'actual_hr'}
+                if fb is not None and not fb.empty and required_feedback_cols.issubset(set(fb.columns)):
+                    fb = fb.dropna(subset=['game_pk', 'batter', 'pitcher']).copy()
+                    fb['actual_hr'] = pd.to_numeric(fb.get('actual_hr', 1), errors='coerce').fillna(1).clip(0, 1)
+                    fb['is_hr'] = (fb['actual_hr'] > 0).astype(int)
+                    fb['game_pk'] = pd.to_numeric(fb['game_pk'], errors='coerce')
+                    fb['batter'] = pd.to_numeric(fb['batter'], errors='coerce')
+                    fb['pitcher'] = pd.to_numeric(fb['pitcher'], errors='coerce')
+                    fb = fb.dropna(subset=['game_pk', 'batter', 'pitcher'])
+                    feedback_rows_for_reconcile = fb.copy()
+                    actual = fb.groupby(['game_pk', 'batter', 'pitcher'], as_index=False).agg(
+                        actual_hr=('is_hr', 'max'),
+                        plate_apps=('is_hr', 'size')
+                    )
+                    evaluation_source = 'live_feedback_fallback'
+                    print(
+                        f"Statcast unavailable for {date_str}; "
+                        f"falling back to live feedback rows={len(actual)}"
+                    )
+                else:
+                    print(
+                        f"Unable to load actual outcomes for {date_str}: "
+                        "Statcast empty and feedback file missing required columns."
+                    )
+                    return pd.DataFrame()
+            except Exception as exc:
+                print(
+                    f"Unable to load actual outcomes for {date_str}: "
+                    f"Statcast empty and feedback fallback failed ({exc})."
+                )
+                return pd.DataFrame()
+        else:
+            print(f"Unable to load actual outcomes for {date_str}.")
+            return pd.DataFrame()
+    else:
+        actual = actual.dropna(subset=['game_pk', 'batter', 'pitcher', 'events']).copy()
+        actual['is_hr'] = (actual['events'] == 'home_run').astype(int)
+        actual = actual.groupby(['game_pk', 'batter', 'pitcher'], as_index=False).agg(
+            actual_hr=('is_hr', 'max'),
+            plate_apps=('is_hr', 'size')
+        )
 
-    actual = actual.dropna(subset=['game_pk', 'batter', 'pitcher', 'events']).copy()
-    actual['is_hr'] = (actual['events'] == 'home_run').astype(int)
-    actual = actual.groupby(['game_pk', 'batter', 'pitcher'], as_index=False).agg(
-        actual_hr=('is_hr', 'max'),
-        plate_apps=('is_hr', 'size')
-    )
+        # Drift diagnostic: compare watcher HR rows to canonical Statcast outcomes.
+        feedback_file = Path('data') / f'live_feedback_{date_str}.csv'
+        if feedback_file.exists():
+            try:
+                fb = pd.read_csv(feedback_file)
+                if not fb.empty:
+                    fb['actual_hr'] = pd.to_numeric(fb.get('actual_hr', 0), errors='coerce').fillna(0)
+                    fb = fb[fb['actual_hr'] > 0].copy()
+                    fb['game_pk'] = pd.to_numeric(fb.get('game_pk', np.nan), errors='coerce')
+                    fb['batter'] = pd.to_numeric(fb.get('batter', np.nan), errors='coerce')
+                    fb = fb.dropna(subset=['game_pk', 'batter'])
+
+                    stat_hr = actual[actual['actual_hr'] > 0].copy()
+                    stat_hr['game_pk'] = pd.to_numeric(stat_hr.get('game_pk', np.nan), errors='coerce')
+                    stat_hr['batter'] = pd.to_numeric(stat_hr.get('batter', np.nan), errors='coerce')
+
+                    fb_keys = fb[['game_pk', 'batter']].drop_duplicates()
+                    st_keys = stat_hr[['game_pk', 'batter']].drop_duplicates()
+                    drift = fb_keys.merge(st_keys, on=['game_pk', 'batter'], how='left', indicator=True)
+                    unmatched = int((drift['_merge'] == 'left_only').sum())
+                    if unmatched > 0:
+                        print(
+                            f"Feedback/Statcast drift: {unmatched} feedback HR rows were not found in Statcast "
+                            f"for {date_str} (using Statcast as canonical source)"
+                        )
+            except Exception:
+                pass
 
     merged = preds.merge(actual, on=['game_pk', 'batter', 'pitcher'], how='left')
     merged['actual_hr'] = merged['actual_hr'].fillna(0).astype(int)
     merged['plate_apps'] = merged['plate_apps'].fillna(0).astype(int)
+    merged['evaluation_source'] = evaluation_source
+
+    # Reconcile fallback misses where watcher captured a HR but pitcher ID drifted.
+    # This preserves HR outcomes by game+batter key when exact matchup key misses.
+    if evaluation_source == 'live_feedback_fallback' and feedback_rows_for_reconcile is not None and not feedback_rows_for_reconcile.empty:
+        try:
+            fb_hr = feedback_rows_for_reconcile[
+                pd.to_numeric(feedback_rows_for_reconcile.get('actual_hr', 0), errors='coerce').fillna(0) > 0
+            ].copy()
+            fb_hr['game_pk'] = pd.to_numeric(fb_hr.get('game_pk', np.nan), errors='coerce')
+            fb_hr['batter'] = pd.to_numeric(fb_hr.get('batter', np.nan), errors='coerce')
+            fb_hr = fb_hr.dropna(subset=['game_pk', 'batter'])
+            fb_hr = fb_hr[['game_pk', 'batter']].drop_duplicates().copy()
+            fb_hr['fb_hr_flag'] = 1
+
+            merged = merged.merge(fb_hr, on=['game_pk', 'batter'], how='left')
+            rescue_mask = merged['actual_hr'].eq(0) & merged['fb_hr_flag'].eq(1)
+            rescued = int(rescue_mask.sum())
+            if rescued > 0:
+                merged.loc[rescue_mask, 'actual_hr'] = 1
+                merged.loc[rescue_mask, 'plate_apps'] = np.maximum(
+                    pd.to_numeric(merged.loc[rescue_mask, 'plate_apps'], errors='coerce').fillna(0).astype(int),
+                    1,
+                )
+                merged.loc[rescue_mask, 'evaluation_source'] = 'live_feedback_fallback_reconciled'
+                print(f"Fallback reconciliation: rescued {rescued} HR rows by game+batter key")
+            merged = merged.drop(columns=['fb_hr_flag'])
+        except Exception as exc:
+            print(f"Fallback reconciliation skipped: {exc}")
 
     merged['brier_error'] = (merged['pred_hr_prob'] - merged['actual_hr']) ** 2
     brier_score = merged['brier_error'].mean()
@@ -7504,6 +7717,77 @@ def apply_daily_probability_anchor(
         return preds_df, {'applied': False, 'reason': f'error:{exc}'}
 
 
+def apply_top_probability_tie_breaker(
+    preds_df,
+    top_n=30,
+    max_spread=0.004,
+):
+    """Spread tied top probabilities using secondary signal ranks.
+
+    Keeps the same general range while preventing large tie blocks that reduce
+    ranking quality in Most-Likely outputs.
+    """
+    try:
+        if preds_df is None:
+            return preds_df, {'applied': False, 'reason': 'preds_none'}
+        work = preds_df.copy()
+        if work.empty or 'pred_hr_prob' not in work.columns:
+            return work, {'applied': False, 'reason': 'preds_empty'}
+
+        probs = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        n = min(max(5, int(top_n)), len(work))
+        top_idx = probs.nlargest(n).index
+        top_probs = probs.loc[top_idx]
+        uniq_top = int(top_probs.nunique())
+        if uniq_top >= max(4, int(n * 0.5)):
+            return work, {'applied': False, 'reason': 'top_already_diverse', 'unique_top': uniq_top}
+
+        score = pd.Series(0.0, index=top_idx, dtype=float)
+        weight_used = 0.0
+
+        def _add_rank_signal(col, weight):
+            nonlocal score, weight_used
+            if col in work.columns:
+                s = pd.to_numeric(work.loc[top_idx, col], errors='coerce')
+                if s.notna().sum() >= 2:
+                    score = score + (s.rank(method='average', pct=True).fillna(0.5) * float(weight))
+                    weight_used += float(weight)
+
+        _add_rank_signal('recent_batter_woba_proxy', 0.45)
+        _add_rank_signal('bat_barrel_rate', 0.20)
+        _add_rank_signal('pitch_barrel_allowed_rate', 0.20)
+        _add_rank_signal('park_factor', 0.10)
+        _add_rank_signal('temp', 0.05)
+
+        if weight_used <= 0:
+            # Deterministic fallback using stable key ordering.
+            key_series = work.loc[top_idx, 'batter'].astype(str) if 'batter' in work.columns else work.loc[top_idx].index.astype(str)
+            score = key_series.rank(method='first', pct=True)
+        else:
+            score = score / weight_used
+
+        centered = score - float(score.mean())
+        max_abs = float(centered.abs().max()) if len(centered) else 0.0
+        if max_abs <= 1e-12:
+            return work, {'applied': False, 'reason': 'no_secondary_variance'}
+
+        max_spread = float(np.clip(max_spread, 0.0005, 0.02))
+        offsets = (centered / max_abs) * max_spread
+        adjusted = (top_probs + offsets).clip(0.0, 0.99)
+
+        work.loc[top_idx, 'pred_hr_prob'] = adjusted.round(6)
+
+        return work, {
+            'applied': True,
+            'top_n': int(n),
+            'unique_top_before': int(uniq_top),
+            'unique_top_after': int(pd.to_numeric(work.loc[top_idx, 'pred_hr_prob'], errors='coerce').nunique()),
+            'max_spread': max_spread,
+        }
+    except Exception as exc:
+        return preds_df, {'applied': False, 'reason': f'error:{exc}'}
+
+
 def run_post_mortem_backpropagation(days_lookback=7):
     """Closed-loop post-mortem layer that rewrites adaptive coefficients.
 
@@ -8274,6 +8558,23 @@ def generate_daily_predictions():
     print("="*70)
     learning_result = {}
     try:
+        yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+        pre_eval_status = ensure_evaluation_file_for_date(yesterday_str, auto_repair=True)
+        if pre_eval_status.get('exists'):
+            print(
+                "Phase-0 evaluation guardrail: "
+                f"{yesterday_str} ready (rows={int(pre_eval_status.get('rows', 0))}, "
+                f"source={pre_eval_status.get('source', 'unknown')})"
+            )
+        else:
+            print(
+                "Phase-0 evaluation guardrail warning: "
+                f"{yesterday_str} missing (reason={pre_eval_status.get('reason', 'unknown')})"
+            )
+    except Exception as _pre_eval_exc:
+        print(f"Phase-0 evaluation guardrail skipped: {_pre_eval_exc}")
+
+    try:
         from analyze_hr_patterns import analyze_yesterdays_hrs_and_learn
         learning_result = analyze_yesterdays_hrs_and_learn()
         if learning_result and learning_result.get('insights'):
@@ -8410,15 +8711,23 @@ def generate_daily_predictions():
 
     # Auto-evaluate yesterday's predictions to feed the learning loop
     yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-    if (Path('data') / f'predictions_{yesterday_str}.csv').exists() and \
-       not (Path('data') / f'evaluation_{yesterday_str}.csv').exists():
-        print(f"Auto-evaluating {yesterday_str} predictions for learning feedback...")
-        try:
-            evaluate_saved_predictions(yesterday_str)
-        except Exception as _e:
-            print(f"Auto-evaluation skipped: {_e}")
-            if ERROR_TRACKER:
-                log_error("evaluation", f"evaluate_saved_predictions({yesterday_str})", _e, "WARNING")
+    eval_backfill = ensure_evaluation_file_for_date(yesterday_str, auto_repair=True)
+    if eval_backfill.get('exists'):
+        print(
+            f"Evaluation guardrail: {yesterday_str} ready "
+            f"(rows={int(eval_backfill.get('rows', 0))}, source={eval_backfill.get('source', 'unknown')})"
+        )
+    else:
+        print(
+            f"Evaluation guardrail warning: {yesterday_str} missing "
+            f"(reason={eval_backfill.get('reason', 'unknown')})"
+        )
+        if ERROR_TRACKER and bool(eval_backfill.get('predictions_exist')):
+            log_warning(
+                "evaluation",
+                "ensure_evaluation_file_for_date",
+                f"Missing evaluation for {yesterday_str} with predictions present: {eval_backfill.get('reason', 'unknown')}"
+            )
 
 
 
@@ -10006,7 +10315,10 @@ def generate_daily_predictions():
 
     anchor_enabled = str(os.getenv('DAILY_PROBABILITY_ANCHOR_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
     if anchor_enabled:
-        anchor_target_mean = float(np.clip(_env_float('DAILY_PROBABILITY_TARGET_MEAN', 0.095), 0.03, 0.20))
+        anchor_target_mean = resolve_daily_probability_target_mean(
+            days_lookback=max(5, _env_int('DAILY_PROBABILITY_TARGET_LOOKBACK_DAYS', 14)),
+            default_target=float(np.clip(_env_float('DAILY_PROBABILITY_TARGET_FALLBACK', 0.055), 0.03, 0.20)),
+        )
         anchor_strength = float(np.clip(_env_float('DAILY_PROBABILITY_ANCHOR_STRENGTH', 0.90), 0.0, 1.0))
         anchor_min_scale = float(np.clip(_env_float('DAILY_PROBABILITY_MIN_SCALE', 0.20), 0.05, 2.0))
         anchor_max_scale = float(np.clip(_env_float('DAILY_PROBABILITY_MAX_SCALE', 1.10), anchor_min_scale, 3.0))
@@ -10035,6 +10347,26 @@ def generate_daily_predictions():
         live['daily_anchor_pre_mean'] = np.nan
         live['daily_anchor_post_mean'] = np.nan
         live['daily_anchor_final_cap'] = np.nan
+
+    tie_breaker_enabled = str(os.getenv('TOP_PROB_TIE_BREAKER_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if tie_breaker_enabled:
+        tie_top_n = max(10, _env_int('TOP_PROB_TIE_BREAKER_TOP_N', 30))
+        tie_spread = float(np.clip(_env_float('TOP_PROB_TIE_BREAKER_MAX_SPREAD', 0.004), 0.0005, 0.02))
+        live, tie_diag = apply_top_probability_tie_breaker(
+            live,
+            top_n=tie_top_n,
+            max_spread=tie_spread,
+        )
+        if tie_diag.get('applied'):
+            print(
+                "Top-probability tie-breaker applied: "
+                f"top_n={int(tie_diag.get('top_n', tie_top_n))}, "
+                f"unique={int(tie_diag.get('unique_top_before', 0))}->"
+                f"{int(tie_diag.get('unique_top_after', 0))}, "
+                f"spread={float(tie_diag.get('max_spread', tie_spread)):.4f}"
+            )
+        else:
+            print(f"Top-probability tie-breaker skipped: {tie_diag.get('reason', 'unknown')}")
     
     high_conf_count = sum(1 for r in reliability_levels if r == 'HIGH')
     print(f"✅ Calibration complete: {high_conf_count}/{len(live)} predictions HIGH confidence")
