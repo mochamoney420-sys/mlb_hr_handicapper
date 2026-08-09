@@ -1899,6 +1899,69 @@ def _discord_alert_audit_path(date_str=None):
     return _repo_data_dir() / f'discord_alert_audit_{date_str}.jsonl'
 
 
+def _discord_dedupe_path(date_str=None):
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    return _repo_data_dir() / f'discord_dedupe_{date_str}.jsonl'
+
+
+def _discord_message_fingerprint(content=None, embeds=None):
+    payload = {
+        'content': str(content or ''),
+        'embeds': embeds or [],
+    }
+    raw = _json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def _is_recent_duplicate_discord_message(fingerprint, title='', window_minutes=240):
+    try:
+        fp = _discord_dedupe_path()
+        if not fp.exists():
+            return False
+
+        now = datetime.now()
+        for line in reversed(fp.read_text(encoding='utf-8', errors='ignore').splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = _json.loads(line)
+            except Exception:
+                continue
+
+            if str(rec.get('fingerprint', '')) != str(fingerprint):
+                continue
+
+            ts = rec.get('timestamp')
+            if not ts:
+                return True
+            try:
+                age_min = (now - datetime.fromisoformat(str(ts))).total_seconds() / 60.0
+            except Exception:
+                return True
+            if age_min <= max(1, int(window_minutes)):
+                return True
+            return False
+    except Exception:
+        return False
+    return False
+
+
+def _remember_discord_message_fingerprint(fingerprint, title=''):
+    try:
+        fp = _discord_dedupe_path()
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            'timestamp': datetime.now().isoformat(),
+            'fingerprint': str(fingerprint),
+            'title': str(title or '')[:200],
+        }
+        with fp.open('a', encoding='utf-8') as handle:
+            handle.write(_json.dumps(rec, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def _append_discord_alert_audit(content=None, embeds=None, async_send=False, payload_count=0):
     """Persist outgoing Discord alert content for later review and math audits."""
     try:
@@ -1920,7 +1983,7 @@ def _append_discord_alert_audit(content=None, embeds=None, async_send=False, pay
         pass
 
 
-def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send=False, retries=3):
+def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send=False, retries=3, dedupe=True):
     """Send Discord webhook message.
     
     Args:
@@ -1937,6 +2000,18 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
     if not payloads:
         print("Nothing to send to Discord; payload is empty.")
         return False
+
+    first_nonempty = next((ln.strip() for ln in str(content or '').splitlines() if ln.strip()), '')
+    dedupe_enabled = bool(dedupe) and str(os.getenv('DISCORD_DEDUPE_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    dedupe_window = max(1, _env_int('DISCORD_DEDUPE_WINDOW_MINUTES', 240))
+    fingerprint = _discord_message_fingerprint(content=content, embeds=embeds)
+
+    if dedupe_enabled and _is_recent_duplicate_discord_message(fingerprint, title=first_nonempty, window_minutes=dedupe_window):
+        print(
+            "Discord duplicate suppressed: "
+            f"title='{first_nonempty[:90]}' within {dedupe_window}m window"
+        )
+        return True
 
     _append_discord_alert_audit(
         content=content,
@@ -1957,15 +2032,19 @@ def send_discord_webhook(content=None, embeds=None, webhook_url=None, async_send
         )
         thread.start()
         # Don't wait, but return True immediately (async)
+        _remember_discord_message_fingerprint(fingerprint, title=first_nonempty)
         return True
 
     # Synchronous send with per-chunk retry.
-    return _send_discord_payloads_with_retry(
+    ok = _send_discord_payloads_with_retry(
         payloads,
         webhook_candidates,
         retries=retries,
         silent=False,
     )
+    if ok:
+        _remember_discord_message_fingerprint(fingerprint, title=first_nonempty)
+    return ok
 
 def _send_discord_async_tracked(payloads, webhook_candidates, result_holder, retries=3):
     """Send Discord in background thread with error tracking."""
@@ -11007,6 +11086,7 @@ def generate_daily_predictions():
 
         now = datetime.now()
         out = df.copy()
+        include_started = str(os.getenv('DISCORD_INCLUDE_STARTED_GAMES', 'false')).strip().lower() in {'1', 'true', 'yes'}
 
         def _minutes_until(value):
             try:
@@ -11016,9 +11096,6 @@ def generate_daily_predictions():
                 t = datetime.strptime(raw, '%I:%M %p').time()
                 target = datetime.combine(now.date(), t)
                 mins = int((target - now).total_seconds() // 60)
-                # Treat times that already passed as next-day starts if far enough behind.
-                if mins < -90:
-                    mins += 24 * 60
                 return mins
             except Exception:
                 return 99999
@@ -11026,6 +11103,8 @@ def generate_daily_predictions():
         def _window_label(mins):
             if mins == 99999:
                 return 'Unknown'
+            if mins < -15:
+                return 'Started'
             if mins <= (discord_window_1_hours * 60):
                 return f'<= {discord_window_1_hours}h'
             if mins <= (discord_window_2_hours * 60):
@@ -11034,6 +11113,8 @@ def generate_daily_predictions():
 
         out['__minutes_until_start'] = out['game_time'].apply(_minutes_until)
         out['start_window'] = out['__minutes_until_start'].apply(_window_label)
+        if not include_started:
+            out = out[out['start_window'] != 'Started'].copy()
         out = out.sort_values(
             by=['__minutes_until_start', 'hr_probability', 'ev_pct', 'kelly_fraction'],
             ascending=[True, False, False, False]
