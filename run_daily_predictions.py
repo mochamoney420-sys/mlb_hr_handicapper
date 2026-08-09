@@ -7255,6 +7255,100 @@ def _filter_discord_ev_candidates(candidates_df):
     return work[keep_mask].copy()
 
 
+def _select_balanced_pick_set(candidates_df, mode='prob'):
+    """Select a balanced pick set: not too tight, not too loose.
+
+    Strategy:
+    - Start from slightly strict quality thresholds.
+    - Relax in small steps until a minimum count is reached.
+    - Cap final output to a maximum count and rank by quality score.
+    """
+    if candidates_df is None or getattr(candidates_df, 'empty', False):
+        return pd.DataFrame() if candidates_df is None else candidates_df.copy()
+
+    work = candidates_df.copy()
+    work['hr_probability'] = pd.to_numeric(work.get('hr_probability', 0.0), errors='coerce').fillna(0.0)
+    work['ev_pct'] = pd.to_numeric(work.get('ev_pct', work.get('ev_percent', 0.0)), errors='coerce').fillna(0.0)
+    work['edge_pct'] = pd.to_numeric(work.get('edge_pct', 0.0), errors='coerce').fillna(0.0)
+    work['kelly_fraction'] = pd.to_numeric(work.get('kelly_fraction', 0.0), errors='coerce').fillna(0.0)
+    work['portfolio_action_score'] = pd.to_numeric(work.get('portfolio_action_score', 0.0), errors='coerce').fillna(0.0)
+
+    reliability = work.get('model_reliability', pd.Series(['MEDIUM'] * len(work), index=work.index)).astype(str).str.upper()
+    rel_bonus = reliability.map({'HIGH': 1.0, 'MEDIUM': 0.5, 'LOW': 0.0}).fillna(0.5)
+
+    # Unified quality score used for balanced selection.
+    work['balanced_quality_score'] = (
+        work['portfolio_action_score']
+        + work['ev_pct'].clip(lower=0.0) * 0.45
+        + work['edge_pct'].clip(lower=0.0) * 0.30
+        + (work['kelly_fraction'].clip(lower=0.0) * 100.0) * 0.25
+        + rel_bonus * 8.0
+    )
+
+    if mode == 'ev':
+        target_min = max(2, _env_int('BALANCED_EV_TARGET_MIN', 4))
+        target_max = max(target_min, _env_int('BALANCED_EV_TARGET_MAX', 8))
+        base_prob = max(0.01, _env_float('BALANCED_EV_MIN_PROB', 0.018))
+        base_ev = _env_float('BALANCED_EV_MIN_EV_PCT', 6.0)
+        base_edge = _env_float('BALANCED_EV_MIN_EDGE_PCT', 3.0)
+        base_kelly = _env_float('BALANCED_EV_MIN_KELLY', 0.010)
+        prob_step = _env_float('BALANCED_EV_RELAX_PROB_STEP', 0.0015)
+        ev_step = _env_float('BALANCED_EV_RELAX_EV_STEP', 1.0)
+        edge_step = _env_float('BALANCED_EV_RELAX_EDGE_STEP', 0.7)
+        kelly_step = _env_float('BALANCED_EV_RELAX_KELLY_STEP', 0.002)
+    else:
+        target_min = max(8, _env_int('BALANCED_TOP_TARGET_MIN', 16))
+        target_max = max(target_min, _env_int('BALANCED_TOP_TARGET_MAX', 26))
+        base_prob = max(0.01, _env_float('BALANCED_TOP_MIN_PROB', 0.02))
+        base_ev = _env_float('BALANCED_TOP_MIN_EV_PCT', 1.0)
+        base_edge = _env_float('BALANCED_TOP_MIN_EDGE_PCT', 0.5)
+        base_kelly = _env_float('BALANCED_TOP_MIN_KELLY', 0.0)
+        prob_step = _env_float('BALANCED_TOP_RELAX_PROB_STEP', 0.0010)
+        ev_step = _env_float('BALANCED_TOP_RELAX_EV_STEP', 0.5)
+        edge_step = _env_float('BALANCED_TOP_RELAX_EDGE_STEP', 0.4)
+        kelly_step = _env_float('BALANCED_TOP_RELAX_KELLY_STEP', 0.001)
+
+    quality_floor = _env_float('BALANCED_PICK_QUALITY_FLOOR', 10.0)
+    quality_relax = _env_float('BALANCED_PICK_QUALITY_RELAX_STEP', 1.0)
+    max_relax_steps = max(0, _env_int('BALANCED_PICK_MAX_RELAX_STEPS', 6))
+
+    prob_thr = float(base_prob)
+    ev_thr = float(base_ev)
+    edge_thr = float(base_edge)
+    kelly_thr = float(base_kelly)
+    quality_thr = float(quality_floor)
+
+    selected = pd.DataFrame()
+    for _ in range(max_relax_steps + 1):
+        mask = (
+            (work['hr_probability'] >= prob_thr)
+            & (work['ev_pct'] >= ev_thr)
+            & (work['edge_pct'] >= edge_thr)
+            & (work['kelly_fraction'] >= kelly_thr)
+            & (work['balanced_quality_score'] >= quality_thr)
+        )
+        selected = work[mask].copy()
+        if len(selected) >= target_min:
+            break
+        prob_thr = max(0.005, prob_thr - prob_step)
+        ev_thr = max(-2.0, ev_thr - ev_step)
+        edge_thr = max(-1.0, edge_thr - edge_step)
+        kelly_thr = max(0.0, kelly_thr - kelly_step)
+        quality_thr = max(2.0, quality_thr - quality_relax)
+
+    if selected.empty:
+        selected = work.sort_values(
+            ['balanced_quality_score', 'hr_probability', 'ev_pct', 'kelly_fraction'],
+            ascending=[False, False, False, False]
+        ).head(target_min).copy()
+
+    selected = selected.sort_values(
+        ['balanced_quality_score', 'hr_probability', 'ev_pct', 'kelly_fraction'],
+        ascending=[False, False, False, False]
+    ).head(target_max).reset_index(drop=True)
+    return selected
+
+
 def _build_discord_top_keys(frame):
     """Safely build a set of batter/pitcher key pairs for filtering Discord rows."""
     if frame is None or getattr(frame, 'empty', False):
@@ -11044,7 +11138,8 @@ def generate_daily_predictions():
     prob_pool = prob_pool[
         pd.to_numeric(prob_pool.get('hr_probability', 0.0), errors='coerce').fillna(0.0) >= discord_min_prob
     ].copy()
-    top_prob = _select_thresholded_candidates(prob_pool, discord_min_prob, discord_top_prob_n)
+    top_prob = _select_balanced_pick_set(prob_pool, mode='prob')
+    top_prob = top_prob.head(discord_top_prob_n).reset_index(drop=True)
     if top_prob.empty:
         print(f"No predictions met the minimum Discord confidence threshold ({discord_min_prob * 100:.0f}%).")
 
@@ -11209,7 +11304,9 @@ def generate_daily_predictions():
             top_ev = top_ev.sort_values(
                 by=['portfolio_action_score', 'ev_pct', 'kelly_fraction', 'hr_probability'],
                 ascending=[False, False, False, False]
-            ).head(discord_top_ev_n).reset_index(drop=True)
+            ).reset_index(drop=True)
+            top_ev = _select_balanced_pick_set(top_ev, mode='ev')
+            top_ev = top_ev.head(discord_top_ev_n).reset_index(drop=True)
             print(f"\n✅ +EV PREMIUM PICKS (Expected Value > 0%):")
             print(top_ev.to_string(index=False))
     top_ev = _annotate_time_windows(top_ev)
@@ -11266,7 +11363,7 @@ def generate_daily_predictions():
             return default
         return txt
 
-    def _build_betting_card(ev_picks_df, date_str):
+    def _build_betting_card(ev_picks_df, date_str, pair_candidates=None):
         """Return an actionable Discord betting card with book, stake, and parlay legs."""
         if ev_picks_df is None or ev_picks_df.empty:
             return None
@@ -11306,36 +11403,111 @@ def generate_daily_predictions():
 
         # Build parlay suggestions
         card_lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        card_lines.append("🎰 **LOTTO PARLAYS** (small stakes, big upside)")
+        card_lines.append("🎰 **LOTTO PARLAYS (CURATED)** (small stakes, big upside)")
 
-        top3 = singles[:3]
-        if len(top3) >= 2:
-            # 2-leg parlays
-            card_lines.append("\n**2-Leg Bombs (bet $5-15 each):**")
-            for a, b in [(top3[0], top3[1]), (top3[0], top3[2]) if len(top3) > 2 else (top3[0], top3[1])]:
-                dec_a = _american_to_decimal(a['odds'])
-                dec_b = _american_to_decimal(b['odds'])
-                if dec_a and dec_b:
-                    parlay_dec = dec_a * dec_b
+        lotto_max_2leg = max(1, _env_int('LOTTO_MAX_2LEG', 3))
+        lotto_max_3leg = max(0, _env_int('LOTTO_MAX_3LEG', 1))
+        lotto_min_true_combo_prob = max(0.003, _env_float('LOTTO_MIN_TRUE_COMBO_PROB', 0.012))
+        lotto_min_edge_pct = _env_float('LOTTO_MIN_EDGE_PCT', 8.0)
+
+        single_by_name = {str(s['name']): s for s in singles}
+        curated_pairs = []
+        if pair_candidates is not None and not pair_candidates.empty:
+            p = pair_candidates.copy()
+            p['true_combo_prob'] = pd.to_numeric(p.get('true_combo_prob', np.nan), errors='coerce')
+            p['parlay_edge_pct'] = pd.to_numeric(p.get('parlay_edge_pct', np.nan), errors='coerce')
+            p['sportsbook_common_books'] = pd.to_numeric(p.get('sportsbook_common_books', 0), errors='coerce').fillna(0).astype(int)
+            p = p[
+                p['pair_leg_1'].astype(str).isin(single_by_name.keys())
+                & p['pair_leg_2'].astype(str).isin(single_by_name.keys())
+                & p['parlay_edge_signal'].astype(bool)
+                & (p['sportsbook_common_books'] >= 1)
+                & (p['true_combo_prob'] >= lotto_min_true_combo_prob)
+                & (p['parlay_edge_pct'] >= lotto_min_edge_pct)
+            ].copy()
+            if not p.empty:
+                p['lotto_score'] = (
+                    p['parlay_edge_pct'].clip(lower=-100, upper=200) * 0.65
+                    + (p['true_combo_prob'].clip(lower=0, upper=1) * 100.0) * 0.35
+                )
+                p = p.sort_values(['lotto_score', 'parlay_edge_pct', 'true_combo_prob'], ascending=[False, False, False])
+                used_legs = set()
+                for _, row in p.iterrows():
+                    a_name = str(row.get('pair_leg_1', ''))
+                    b_name = str(row.get('pair_leg_2', ''))
+                    if not a_name or not b_name or a_name == b_name:
+                        continue
+                    if a_name in used_legs or b_name in used_legs:
+                        continue
+                    curated_pairs.append(row)
+                    used_legs.update([a_name, b_name])
+                    if len(curated_pairs) >= lotto_max_2leg:
+                        break
+
+        if curated_pairs:
+            card_lines.append("\n**2-Leg Curated Lottos (bet $3-10 each):**")
+            for row in curated_pairs:
+                a_name = str(row.get('pair_leg_1', ''))
+                b_name = str(row.get('pair_leg_2', ''))
+                s1 = single_by_name.get(a_name)
+                s2 = single_by_name.get(b_name)
+                dec_a = _american_to_decimal((s1 or {}).get('odds'))
+                dec_b = _american_to_decimal((s2 or {}).get('odds'))
+                parlay_dec = (dec_a * dec_b) if (dec_a and dec_b) else float(row.get('parlay_decimal', np.nan) or np.nan)
+                if pd.notna(parlay_dec) and parlay_dec > 1:
                     parlay_am = int((parlay_dec - 1) * 100) if parlay_dec >= 2 else int(-100 / (parlay_dec - 1))
-                    card_lines.append(
-                        f"• **{a['name']}** + **{b['name']}** "
-                        f"≈ {parlay_am:+,} | Book: {a['book']}"
-                    )
+                    odds_txt = f"{parlay_am:+,}"
+                else:
+                    odds_txt = "N/A"
+                edge_txt = f"{float(row.get('parlay_edge_pct', 0.0)):+.1f}%"
+                true_txt = f"{float(row.get('true_combo_prob', 0.0)) * 100:.2f}%"
+                book_txt = _safe_display_name(str(row.get('sportsbook_book', 'N/A')).title(), 'N/A')
+                card_lines.append(
+                    f"• **{a_name}** + **{b_name}** ≈ {odds_txt} | true {true_txt} | edge {edge_txt} | Book: {book_txt}"
+                )
+        else:
+            top3 = singles[:3]
+            if len(top3) >= 2:
+                card_lines.append("\n**2-Leg Curated Lottos (fallback):**")
+                fallback_pairs = [(top3[0], top3[1])]
+                if len(top3) > 2:
+                    fallback_pairs.append((top3[0], top3[2]))
+                for a, b in fallback_pairs[:lotto_max_2leg]:
+                    dec_a = _american_to_decimal(a['odds'])
+                    dec_b = _american_to_decimal(b['odds'])
+                    if dec_a and dec_b:
+                        parlay_dec = dec_a * dec_b
+                        parlay_am = int((parlay_dec - 1) * 100) if parlay_dec >= 2 else int(-100 / (parlay_dec - 1))
+                        joint = float(a['prob']) * float(b['prob']) * 100.0
+                        card_lines.append(
+                            f"• **{a['name']}** + **{b['name']}** ≈ {parlay_am:+,} | est hit {joint:.2f}%"
+                        )
 
-        if len(top3) >= 3:
-            # 3-leg lotto
-            card_lines.append("\n**3-Leg Lotto (bet $1-5):**")
-            dec_all = [_american_to_decimal(s['odds']) for s in top3]
-            if all(d for d in dec_all):
-                p3_dec = dec_all[0] * dec_all[1] * dec_all[2]
-                p3_am = int((p3_dec - 1) * 100)
-                legs = " + ".join(s['name'].split()[0] for s in top3)
-                card_lines.append(f"• **{legs}** ≈ **{p3_am:+,}** | 🎯 True edge via correlation")
+        if lotto_max_3leg > 0:
+            trio_pool = singles[:min(6, len(singles))]
+            trio_candidates = []
+            for a, b, c in combinations(trio_pool, 3):
+                dec_vals = [_american_to_decimal(a['odds']), _american_to_decimal(b['odds']), _american_to_decimal(c['odds'])]
+                if not all(dec_vals):
+                    continue
+                joint = float(a['prob']) * float(b['prob']) * float(c['prob'])
+                if joint < max(0.0015, lotto_min_true_combo_prob * 0.25):
+                    continue
+                trio_dec = dec_vals[0] * dec_vals[1] * dec_vals[2]
+                trio_score = joint * 100.0 + ((a['stake'] + b['stake'] + c['stake']) / 100.0)
+                trio_candidates.append((trio_score, joint, trio_dec, a, b, c))
+
+            if trio_candidates:
+                card_lines.append("\n**3-Leg Longshot (max 1-2 tickets, $1-3):**")
+                trio_candidates.sort(key=lambda x: x[0], reverse=True)
+                for _, joint, trio_dec, a, b, c in trio_candidates[:lotto_max_3leg]:
+                    trio_am = int((trio_dec - 1) * 100) if trio_dec >= 2 else int(-100 / (trio_dec - 1))
+                    legs = " + ".join([a['name'].split()[0], b['name'].split()[0], c['name'].split()[0]])
+                    card_lines.append(f"• **{legs}** ≈ **{trio_am:+,}** | est hit {joint * 100:.2f}%")
 
         total_singles = sum(s['stake'] for s in singles)
         card_lines.append(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        card_lines.append(f"💰 **Suggested singles exposure: ${total_singles:.0f}** | Parlays: $10-30")
+        card_lines.append(f"💰 **Suggested singles exposure: ${total_singles:.0f}** | Parlays: $5-20")
         card_lines.append("⚠️ *Line shop — check all books before placing*")
         return "\n".join(card_lines)
 
@@ -11420,7 +11592,7 @@ def generate_daily_predictions():
     if not top_ev.empty:
         sent_ev = _post_pick_table_batches(top_ev, f"\u2705 +EV HR Picks (Top {len(top_ev)})")
         # Send the actionable betting card right after the EV table.
-        card_msg = _build_betting_card(top_ev, target_date)
+        card_msg = _build_betting_card(top_ev, target_date, pair_df)
         if card_msg:
             send_discord_webhook(content=card_msg)
 
