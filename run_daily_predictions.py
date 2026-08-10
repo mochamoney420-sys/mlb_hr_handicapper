@@ -1091,43 +1091,46 @@ def get_live_weather(lat, lon):
             }
 
         def _weathergov_live_out(lat_val, lon_val):
-            headers = {'User-Agent': 'mlb-hr-handicapper/1.0 (weather validation)'}
-            points_url = f"https://api.weather.gov/points/{lat_val},{lon_val}"
-            points_resp = requests.get(points_url, timeout=7, headers=headers)
-            if getattr(points_resp, 'status_code', 0) != 200:
-                return None
-            points_payload = points_resp.json() or {}
-            hourly_url = ((points_payload.get('properties') or {}).get('forecastHourly') or '').strip()
-            if not hourly_url:
-                return None
-            hourly_resp = requests.get(hourly_url, timeout=7, headers=headers)
-            if getattr(hourly_resp, 'status_code', 0) != 200:
-                return None
-            hourly_payload = hourly_resp.json() or {}
-            periods = (((hourly_payload.get('properties') or {}).get('periods')) or [])
-            if not periods:
-                return None
-            cur = periods[0] or {}
+            try:
+                headers = {'User-Agent': 'mlb-hr-handicapper/1.0 (weather validation)'}
+                points_url = f"https://api.weather.gov/points/{lat_val},{lon_val}"
+                points_resp = requests.get(points_url, timeout=7, headers=headers)
+                if getattr(points_resp, 'status_code', 0) != 200:
+                    return None
+                points_payload = points_resp.json() or {}
+                hourly_url = ((points_payload.get('properties') or {}).get('forecastHourly') or '').strip()
+                if not hourly_url:
+                    return None
+                hourly_resp = requests.get(hourly_url, timeout=7, headers=headers)
+                if getattr(hourly_resp, 'status_code', 0) != 200:
+                    return None
+                hourly_payload = hourly_resp.json() or {}
+                periods = (((hourly_payload.get('properties') or {}).get('periods')) or [])
+                if not periods:
+                    return None
+                cur = periods[0] or {}
 
-            humidity = ((cur.get('relativeHumidity') or {}).get('value'))
-            precip = ((cur.get('probabilityOfPrecipitation') or {}).get('value'))
-            dew_val = ((cur.get('dewpoint') or {}).get('value'))
-            pressure_pa = ((cur.get('barometricPressure') or {}).get('value'))
+                humidity = ((cur.get('relativeHumidity') or {}).get('value'))
+                precip = ((cur.get('probabilityOfPrecipitation') or {}).get('value'))
+                dew_val = ((cur.get('dewpoint') or {}).get('value'))
+                pressure_pa = ((cur.get('barometricPressure') or {}).get('value'))
 
-            return {
-                'temp': float(pd.to_numeric(cur.get('temperature', defaults['temp']), errors='coerce') or defaults['temp']),
-                'apparent_temp': float(pd.to_numeric(cur.get('temperature', defaults['apparent_temp']), errors='coerce') or defaults['apparent_temp']),
-                'dew_point': _to_fahrenheit(dew_val) if dew_val is not None else defaults['dew_point'],
-                'wind_speed': _parse_mph(cur.get('windSpeed', defaults['wind_speed'])),
-                'wind_dir': _cardinal_to_degrees(cur.get('windDirection', defaults['wind_dir'])),
-                'wind_gust': _parse_mph(cur.get('windSpeed', defaults['wind_gust'])),
-                'humidity': float(pd.to_numeric(humidity, errors='coerce') if humidity is not None else defaults['humidity']),
-                'precipitation': float(pd.to_numeric(precip, errors='coerce') if precip is not None else defaults['precipitation']) / 100.0,
-                'pressure': float(pd.to_numeric(pressure_pa, errors='coerce') / 100.0) if pressure_pa is not None else defaults['pressure'],
-                'cloud_cover': float(defaults['cloud_cover']),
-                'weather_source': 'weather-gov-current',
-                'weather_is_fallback': 0,
-            }
+                return {
+                    'temp': float(pd.to_numeric(cur.get('temperature', defaults['temp']), errors='coerce') or defaults['temp']),
+                    'apparent_temp': float(pd.to_numeric(cur.get('temperature', defaults['apparent_temp']), errors='coerce') or defaults['apparent_temp']),
+                    'dew_point': _to_fahrenheit(dew_val) if dew_val is not None else defaults['dew_point'],
+                    'wind_speed': _parse_mph(cur.get('windSpeed', defaults['wind_speed'])),
+                    'wind_dir': _cardinal_to_degrees(cur.get('windDirection', defaults['wind_dir'])),
+                    'wind_gust': _parse_mph(cur.get('windSpeed', defaults['wind_gust'])),
+                    'humidity': float(pd.to_numeric(humidity, errors='coerce') if humidity is not None else defaults['humidity']),
+                    'precipitation': float(pd.to_numeric(precip, errors='coerce') if precip is not None else defaults['precipitation']) / 100.0,
+                    'pressure': float(pd.to_numeric(pressure_pa, errors='coerce') / 100.0) if pressure_pa is not None else defaults['pressure'],
+                    'cloud_cover': float(defaults['cloud_cover']),
+                    'weather_source': 'weather-gov-current',
+                    'weather_is_fallback': 0,
+                }
+            except Exception:
+                return None
 
         # Primary path: richer current payload.
         url = (
@@ -1137,8 +1140,12 @@ def get_live_weather(lat, lon):
             "&temperature_unit=fahrenheit&windspeed_unit=mph"
             "&timezone=America/New_York"
         )
-        resp = requests.get(url, timeout=7)
-        if getattr(resp, 'status_code', 200) == 200:
+        resp = None
+        try:
+            resp = requests.get(url, timeout=7)
+        except Exception:
+            resp = None
+        if resp is not None and getattr(resp, 'status_code', 200) == 200:
             return _coerce_weather_out(resp.json())
 
         # Backup path: leaner request in case provider rejects richer field set.
@@ -1149,8 +1156,12 @@ def get_live_weather(lat, lon):
             "&temperature_unit=fahrenheit&windspeed_unit=mph"
             "&timezone=America/New_York"
         )
-        backup_resp = requests.get(backup_url, timeout=7)
-        if getattr(backup_resp, 'status_code', 200) == 200:
+        backup_resp = None
+        try:
+            backup_resp = requests.get(backup_url, timeout=7)
+        except Exception:
+            backup_resp = None
+        if backup_resp is not None and getattr(backup_resp, 'status_code', 200) == 200:
             return _coerce_weather_out(backup_resp.json())
 
         # Secondary real-time provider fallback for US venues.
@@ -2538,6 +2549,114 @@ def resolve_daily_probability_target_mean(days_lookback=14, default_target=0.055
         f"days={len(actual_rates)}"
     )
     return target
+
+
+def apply_recent_overconfidence_guardrail(
+    preds_df,
+    days_lookback=14,
+    min_files=4,
+    min_rows=800,
+    prob_threshold=0.08,
+    trigger_gap=0.020,
+    trigger_false_discovery=0.82,
+    max_shrink=0.35,
+):
+    """Suppress probability inflation when recent evaluations show overconfidence.
+
+    Uses recent evaluation files to detect two failure modes:
+    - mean(pred) materially above mean(actual)
+    - high false-discovery rate among higher-confidence picks
+    """
+    try:
+        if preds_df is None:
+            return preds_df, {'applied': False, 'reason': 'preds_none'}
+        work = preds_df.copy()
+        if work.empty:
+            return work, {'applied': False, 'reason': 'preds_empty'}
+
+        cutoff = datetime.today() - timedelta(days=max(3, int(days_lookback)))
+        eval_files = []
+        for fp in sorted(Path('data').glob('evaluation_*.csv')):
+            try:
+                d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+                if d >= cutoff:
+                    eval_files.append(fp)
+            except Exception:
+                continue
+
+        if len(eval_files) < max(1, int(min_files)):
+            return work, {'applied': False, 'reason': 'insufficient_files', 'files': len(eval_files)}
+
+        parts = []
+        for fp in eval_files:
+            try:
+                ev = pd.read_csv(fp, usecols=['pred_hr_prob', 'actual_hr'])
+                if ev is not None and not ev.empty:
+                    parts.append(ev)
+            except Exception:
+                continue
+
+        if not parts:
+            return work, {'applied': False, 'reason': 'no_eval_rows'}
+
+        ev_all = pd.concat(parts, ignore_index=True)
+        ev_all['pred_hr_prob'] = pd.to_numeric(ev_all.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        ev_all['actual_hr'] = pd.to_numeric(ev_all.get('actual_hr', 0.0), errors='coerce').fillna(0.0).clip(0.0, 1.0)
+        if len(ev_all) < max(100, int(min_rows)):
+            return work, {'applied': False, 'reason': 'insufficient_rows', 'rows': int(len(ev_all))}
+
+        pred_mean = float(ev_all['pred_hr_prob'].mean()) if len(ev_all) else 0.0
+        actual_mean = float(ev_all['actual_hr'].mean()) if len(ev_all) else 0.0
+        gap = float(pred_mean - actual_mean)
+
+        hi = ev_all[ev_all['pred_hr_prob'] >= float(np.clip(prob_threshold, 0.02, 0.25))]
+        high_n = int(len(hi))
+        false_discovery = 0.0
+        if high_n > 0:
+            tp = float((hi['actual_hr'] == 1.0).sum())
+            false_discovery = float(1.0 - (tp / max(1.0, float(high_n))))
+
+        gap_severity = max(0.0, (gap - trigger_gap) / max(0.005, trigger_gap))
+        fdr_severity = max(0.0, (false_discovery - trigger_false_discovery) / max(0.05, 1.0 - trigger_false_discovery))
+        severity = max(gap_severity, (0.65 * gap_severity) + (0.35 * fdr_severity))
+
+        if severity <= 0.0:
+            return work, {
+                'applied': False,
+                'reason': 'within_guardrail',
+                'pred_mean': pred_mean,
+                'actual_mean': actual_mean,
+                'gap': gap,
+                'false_discovery': false_discovery,
+                'high_n': high_n,
+            }
+
+        shrink = float(np.clip(0.08 + (severity * 0.16), 0.05, max_shrink))
+        multiplier = float(np.clip(1.0 - shrink, 0.55, 1.0))
+        dynamic_cap = float(np.clip(0.18 - min(0.08, severity * 0.03), 0.10, 0.18))
+
+        probs = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        adjusted = np.clip(probs * multiplier, 0.0, dynamic_cap)
+        work['pred_hr_prob'] = adjusted.round(6)
+        work['overconfidence_guardrail_applied'] = 1
+        work['overconfidence_guardrail_multiplier'] = multiplier
+        work['overconfidence_guardrail_dynamic_cap'] = dynamic_cap
+
+        return work, {
+            'applied': True,
+            'files': int(len(eval_files)),
+            'rows': int(len(ev_all)),
+            'pred_mean': pred_mean,
+            'actual_mean': actual_mean,
+            'gap': gap,
+            'false_discovery': false_discovery,
+            'high_n': high_n,
+            'severity': float(severity),
+            'multiplier': multiplier,
+            'dynamic_cap': dynamic_cap,
+        }
+    except Exception as exc:
+        return preds_df, {'applied': False, 'reason': f'error:{exc}'}
 
 
 def _file_contains_text(path, needle):
@@ -5665,10 +5784,37 @@ def get_today_matchups():
             # then same-date historical archive weather for that ballpark.
             if int(weather.get('weather_is_fallback', 1)) == 1:
                 alt_coord_candidates = []
+                candidate_teams_for_live_retry = []
                 for candidate_team in [home_team_abbr, team_abbrev]:
                     c_team = str(candidate_team or '').strip().upper()
-                    if not c_team:
-                        continue
+                    if c_team:
+                        candidate_teams_for_live_retry.append(c_team)
+
+                # Add schedule/team-api resolved abbreviations when boxscore fields are sparse.
+                try:
+                    home_id = game.get('home_id')
+                    if home_id:
+                        home_team_payload = statsapi.get('team', {'teamId': home_id}) or {}
+                        teams_rec = home_team_payload.get('teams', []) if isinstance(home_team_payload, dict) else []
+                        if teams_rec:
+                            c_team = str(teams_rec[0].get('abbreviation', '') or '').strip().upper()
+                            if c_team:
+                                candidate_teams_for_live_retry.append(c_team)
+                except Exception:
+                    pass
+                try:
+                    lookup = statsapi.lookup_team(game.get('home_name', ''))
+                    if lookup:
+                        c_team = str(lookup[0].get('abbreviation', '') or '').strip().upper()
+                        if c_team:
+                            candidate_teams_for_live_retry.append(c_team)
+                except Exception:
+                    pass
+
+                # Preserve order while removing duplicates.
+                candidate_teams_for_live_retry = list(dict.fromkeys(candidate_teams_for_live_retry))
+
+                for c_team in candidate_teams_for_live_retry:
                     try:
                         alt_coords = _get_stadium_coords_for_team(c_team)
                     except Exception:
@@ -10702,6 +10848,36 @@ def generate_daily_predictions():
             )
         else:
             print(f"Top-probability tie-breaker skipped: {tie_diag.get('reason', 'unknown')}")
+
+    overconfidence_diag = {'applied': False, 'reason': 'disabled'}
+    overconfidence_guard_enabled = str(os.getenv('OVERCONFIDENCE_GUARDRAIL_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if overconfidence_guard_enabled:
+        live, overconfidence_diag = apply_recent_overconfidence_guardrail(
+            live,
+            days_lookback=max(7, _env_int('OVERCONFIDENCE_LOOKBACK_DAYS', 14)),
+            min_files=max(2, _env_int('OVERCONFIDENCE_MIN_FILES', 4)),
+            min_rows=max(300, _env_int('OVERCONFIDENCE_MIN_ROWS', 800)),
+            prob_threshold=float(np.clip(_env_float('OVERCONFIDENCE_PROB_THRESHOLD', 0.08), 0.02, 0.25)),
+            trigger_gap=float(np.clip(_env_float('OVERCONFIDENCE_TRIGGER_GAP', 0.020), 0.005, 0.12)),
+            trigger_false_discovery=float(np.clip(_env_float('OVERCONFIDENCE_TRIGGER_FDR', 0.82), 0.50, 0.98)),
+            max_shrink=float(np.clip(_env_float('OVERCONFIDENCE_MAX_SHRINK', 0.35), 0.05, 0.60)),
+        )
+        if overconfidence_diag.get('applied'):
+            print(
+                "Overconfidence guardrail applied: "
+                f"multiplier={float(overconfidence_diag.get('multiplier', 1.0)):.3f}, "
+                f"cap={float(overconfidence_diag.get('dynamic_cap', np.nan)):.3f}, "
+                f"gap={float(overconfidence_diag.get('gap', 0.0)):+.4f}, "
+                f"fdr={float(overconfidence_diag.get('false_discovery', 0.0)):.3f}"
+            )
+        else:
+            print(f"Overconfidence guardrail skipped: {overconfidence_diag.get('reason', 'unknown')}")
+    if 'overconfidence_guardrail_applied' not in live.columns:
+        live['overconfidence_guardrail_applied'] = 1 if bool(overconfidence_diag.get('applied')) else 0
+    if 'overconfidence_guardrail_multiplier' not in live.columns:
+        live['overconfidence_guardrail_multiplier'] = float(overconfidence_diag.get('multiplier', 1.0)) if bool(overconfidence_diag.get('applied')) else np.nan
+    if 'overconfidence_guardrail_dynamic_cap' not in live.columns:
+        live['overconfidence_guardrail_dynamic_cap'] = float(overconfidence_diag.get('dynamic_cap', np.nan)) if bool(overconfidence_diag.get('applied')) else np.nan
     
     high_conf_count = sum(1 for r in reliability_levels if r == 'HIGH')
     print(f"✅ Calibration complete: {high_conf_count}/{len(live)} predictions HIGH confidence")
@@ -11264,6 +11440,7 @@ def generate_daily_predictions():
                                     'pitcher_damage_boost',
                                     'daily_anchor_scale', 'daily_anchor_target_mean',
                                     'daily_anchor_pre_mean', 'daily_anchor_post_mean', 'daily_anchor_final_cap',
+                                    'overconfidence_guardrail_applied', 'overconfidence_guardrail_multiplier', 'overconfidence_guardrail_dynamic_cap',
                                     'sidecar_online_prob', 'sidecar_blend_applied', 'sidecar_blend_weight',
                                     'sidecar_max_delta', 'sidecar_update_count',
                                     'sidecar_training_applied', 'sidecar_training_update_count',
@@ -11285,7 +11462,35 @@ def generate_daily_predictions():
     discord_radar_n = max(8, _env_int('DISCORD_RADAR_COUNT', 20))
     discord_window_1_hours = max(1, _env_int('DISCORD_WINDOW_1_HOURS', 2))
     discord_window_2_hours = max(discord_window_1_hours + 1, _env_int('DISCORD_WINDOW_2_HOURS', 6))
-    print(f"Discord threshold resolved: {discord_min_prob * 100:.1f}%")
+    effective_top_prob_n = int(discord_top_prob_n)
+    effective_top_ev_n = int(discord_top_ev_n)
+    effective_radar_n = int(discord_radar_n)
+    effective_discord_min_prob = float(discord_min_prob)
+    effective_discord_min_ev_pct = float(discord_min_ev_pct)
+    if bool(overconfidence_diag.get('applied')):
+        gap_boost = max(0.0, float(overconfidence_diag.get('gap', 0.0)))
+        fdr_boost = max(0.0, float(overconfidence_diag.get('false_discovery', 0.0)) - 0.80)
+        severity = max(0.0, float(overconfidence_diag.get('severity', 0.0)))
+        effective_discord_min_prob = float(np.clip(discord_min_prob + (gap_boost * 0.45) + (fdr_boost * 0.03), discord_min_prob, 0.08))
+        effective_discord_min_ev_pct = float(np.clip(discord_min_ev_pct + (gap_boost * 120.0), discord_min_ev_pct, 20.0))
+        volume_mult = float(np.clip(1.0 - (0.28 * severity), 0.55, 1.0))
+        effective_top_prob_n = max(8, int(round(discord_top_prob_n * volume_mult)))
+        effective_top_ev_n = max(3, int(round(discord_top_ev_n * volume_mult)))
+        effective_radar_n = max(6, int(round(discord_radar_n * volume_mult)))
+        print(
+            "Discord thresholds tightened from recent drift: "
+            f"min_prob={effective_discord_min_prob * 100:.2f}% "
+            f"(base {discord_min_prob * 100:.2f}%), "
+            f"min_ev={effective_discord_min_ev_pct:.1f}% "
+            f"(base {discord_min_ev_pct:.1f}%)"
+        )
+        print(
+            "Pick volume throttled from recent drift: "
+            f"top_prob={effective_top_prob_n}/{discord_top_prob_n}, "
+            f"top_ev={effective_top_ev_n}/{discord_top_ev_n}, "
+            f"radar={effective_radar_n}/{discord_radar_n}"
+        )
+    print(f"Discord threshold resolved: {effective_discord_min_prob * 100:.1f}%")
 
     # Top probabilities for reporting/Discord delivery.
     has_market_data = (
@@ -11298,12 +11503,12 @@ def generate_daily_predictions():
         ascending=[False, False, False, False]
     ).reset_index(drop=True)
     prob_pool = prob_pool[
-        pd.to_numeric(prob_pool.get('hr_probability', 0.0), errors='coerce').fillna(0.0) >= discord_min_prob
+        pd.to_numeric(prob_pool.get('hr_probability', 0.0), errors='coerce').fillna(0.0) >= effective_discord_min_prob
     ].copy()
     top_prob = _select_balanced_pick_set(prob_pool, mode='prob')
-    top_prob = top_prob.head(discord_top_prob_n).reset_index(drop=True)
+    top_prob = top_prob.head(effective_top_prob_n).reset_index(drop=True)
     if top_prob.empty:
-        print(f"No predictions met the minimum Discord confidence threshold ({discord_min_prob * 100:.0f}%).")
+        print(f"No predictions met the minimum Discord confidence threshold ({effective_discord_min_prob * 100:.0f}%).")
 
     if 'physics_delta' not in live.columns:
         live['physics_delta'] = 0.0
@@ -11316,9 +11521,9 @@ def generate_daily_predictions():
     ).copy()
     radar = _finalize_discord_radar_frame(radar)
     radar = radar[
-        (radar['hr_probability'] >= max(0.010, discord_min_prob * 0.7))
+        (radar['hr_probability'] >= max(0.010, effective_discord_min_prob * 0.7))
         & (pd.to_numeric(radar.get('edge_pct', 0.0), errors='coerce').fillna(0.0) >= max(2.0, discord_min_edge_pct * 0.5))
-        & (pd.to_numeric(radar.get('ev_pct', 0.0), errors='coerce').fillna(0.0) >= max(3.0, discord_min_ev_pct * 0.5))
+        & (pd.to_numeric(radar.get('ev_pct', 0.0), errors='coerce').fillna(0.0) >= max(3.0, effective_discord_min_ev_pct * 0.5))
     ]
 
     top_keys = _build_discord_top_keys(top_prob)
@@ -11335,7 +11540,7 @@ def generate_daily_predictions():
     radar = radar.sort_values(
         by=['portfolio_action_score', 'physics_delta_abs', 'hr_probability', 'ev_pct'],
         ascending=[False, False, False, False]
-    ).head(discord_radar_n).reset_index(drop=True)
+    ).head(effective_radar_n).reset_index(drop=True)
 
     def _annotate_time_windows(df):
         if df is None or df.empty:
@@ -11463,17 +11668,20 @@ def generate_daily_predictions():
             top_ev = _prepare_discord_rankings(
                 positive_ev[ev_cols]
             )
+            top_ev = top_ev[
+                pd.to_numeric(top_ev.get('ev_pct', top_ev.get('ev_percent', 0.0)), errors='coerce').fillna(0.0) >= effective_discord_min_ev_pct
+            ].copy()
             top_ev = top_ev.sort_values(
                 by=['portfolio_action_score', 'ev_pct', 'kelly_fraction', 'hr_probability'],
                 ascending=[False, False, False, False]
             ).reset_index(drop=True)
             top_ev = _select_balanced_pick_set(top_ev, mode='ev')
-            top_ev = top_ev.head(discord_top_ev_n).reset_index(drop=True)
+            top_ev = top_ev.head(effective_top_ev_n).reset_index(drop=True)
             print(f"\n✅ +EV PREMIUM PICKS (Expected Value > 0%):")
             print(top_ev.to_string(index=False))
     top_ev = _annotate_time_windows(top_ev)
 
-    print(f"\nMost Likely Homers (≥{discord_min_prob*100:.0f}% confidence) - {len(top_prob)} candidates:")
+    print(f"\nMost Likely Homers (≥{effective_discord_min_prob*100:.0f}% confidence) - {len(top_prob)} candidates:")
     print(top_prob.to_string(index=False))
     print(f"\nRadar Coverage: {len(radar)} additional candidates")
     print_discord_payload_diagnostics(top_prob, radar, top_ev)
@@ -11737,7 +11945,7 @@ def generate_daily_predictions():
         top_prob,
         radar,
         top_ev,
-        discord_min_prob,
+        effective_discord_min_prob,
         discord_window_1_hours,
         discord_window_2_hours,
     )
@@ -11748,7 +11956,7 @@ def generate_daily_predictions():
         print("No predictions available to send to Discord.")
         return live
 
-    sent_prob = _post_pick_table_batches(top_prob, f"⚾ Most Likely Homers ({len(top_prob)} candidates ≥{discord_min_prob*100:.0f}%)")
+    sent_prob = _post_pick_table_batches(top_prob, f"⚾ Most Likely Homers ({len(top_prob)} candidates ≥{effective_discord_min_prob*100:.0f}%)")
     sent_ev = True
     sent_radar = _post_pick_table_batches(radar, f"\U0001f535 HR Radar Picks (Physics Movers & Sleepers) ({len(radar)})")
     if not top_ev.empty:
@@ -14155,6 +14363,23 @@ def _should_launch_live_monitor_now(now_local, first_game_start_local):
     strict_window = str(os.getenv('LIVE_MONITOR_STRICT_WINDOW', 'true')).strip().lower() not in {'0', 'false', 'no'}
     if not strict_window:
         return True, None
+
+    # If any game is already live, always allow launch. Missing the pregame window
+    # should not block real-time HR alerts mid-slate.
+    try:
+        today_str = datetime.today().strftime('%m/%d/%Y')
+        live_games = statsapi.schedule(date=today_str) or []
+        for g in live_games:
+            status_parts = [
+                str(g.get('status', '') or ''),
+                str(g.get('detailed_state', '') or ''),
+                str(g.get('game_status', '') or ''),
+            ]
+            status_text = " ".join(status_parts).lower()
+            if any(token in status_text for token in ['in progress', 'manager challenge', 'review', 'warmup', 'delayed', 'live']):
+                return True, "Live game detected; bypassing strict pregame launch window."
+    except Exception:
+        pass
 
     if first_game_start_local is None:
         return False, "No scheduled games found today; strict pregame launch skipped."
