@@ -13807,16 +13807,28 @@ def _build_fallback_hr_event_id(game_id, inning, half_inning, at_bat_idx, batter
 
 
 def _count_unique_processed_hr_events(processed_ids):
-    """Count unique HR events from processed IDs, excluding auxiliary play IDs."""
+    """Count unique HR events from processed IDs across modern and legacy formats."""
     if not processed_ids:
         return 0
-    unique_keys = {
-        str(x) for x in processed_ids
-        if isinstance(x, str) and x.endswith(':HR') and x.count(':') >= 6
-    }
-    if unique_keys:
-        return len(unique_keys)
-    return len(set(str(x) for x in processed_ids))
+
+    def _looks_like_hr_event_id(text):
+        token = str(text or '').strip()
+        if not token:
+            return False
+        lower = token.lower()
+        if lower.endswith(':hr') and token.count(':') >= 6:
+            return True
+        # Legacy watcher IDs used "...:home_run" suffix.
+        if lower.endswith(':home_run') and token.count(':') >= 5:
+            return True
+        return False
+
+    event_keys = {str(x).strip() for x in processed_ids if _looks_like_hr_event_id(x)}
+    if event_keys:
+        return len(event_keys)
+
+    # Last-resort fallback: use all IDs when format is unknown.
+    return len(set(str(x).strip() for x in processed_ids if str(x).strip()))
 
 
 def _build_fallback_hr_event_id_from_statcast_row(row):

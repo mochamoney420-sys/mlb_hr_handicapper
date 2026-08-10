@@ -119,10 +119,16 @@ def load_yesterdays_home_runs():
                     for col in ['game_pk', 'batter', 'pitcher']:
                         if col in ev.columns:
                             ev[col] = pd.to_numeric(ev[col], errors='coerce')
-                    # Match evaluation dedupe granularity exactly.
-                    dedupe_cols = [c for c in ['game_pk', 'batter', 'pitcher'] if c in ev.columns]
-                    if dedupe_cols:
-                        ev = ev.sort_values(by=dedupe_cols).drop_duplicates(subset=dedupe_cols, keep='last')
+                    # Keep event-level HR rows whenever possible so multi-HR games are not collapsed.
+                    event_dedupe_cols = [
+                        c for c in [
+                            'sv_id', 'play_id', 'event_id',
+                            'game_pk', 'batter', 'pitcher', 'inning', 'inning_topbot', 'at_bat_number'
+                        ]
+                        if c in ev.columns
+                    ]
+                    if event_dedupe_cols:
+                        ev = ev.sort_values(by=event_dedupe_cols).drop_duplicates(subset=event_dedupe_cols, keep='last')
                     ev['source'] = 'evaluation_canonical'
                     keep_cols = [c for c in ['date', 'game_pk', 'batter', 'pitcher', 'batter_name', 'pitcher_name', 'model_prob', 'source'] if c in ev.columns]
                     print(f"📊 Found {len(ev)} home runs from {yesterday} in evaluation")
