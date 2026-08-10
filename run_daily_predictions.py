@@ -6202,7 +6202,10 @@ def get_today_matchups():
     schedule = statsapi.schedule(date=today_str)
     print(f"Schedule: {len(schedule)} games for {today_str}")
     matchups = []
-    require_realtime_weather = str(os.getenv('REQUIRE_REALTIME_WEATHER_ALL_GAMES', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    _weather_fail_hard = str(os.getenv('REALTIME_WEATHER_FAIL_HARD', 'false')).strip().lower() in {'1', 'true', 'yes'}
+    require_realtime_weather = _weather_fail_hard and (
+        str(os.getenv('REQUIRE_REALTIME_WEATHER_ALL_GAMES', 'false')).strip().lower() not in {'0', 'false', 'no'}
+    )
     realtime_weather_retries = max(0, _env_int('REALTIME_WEATHER_MAX_RETRIES', 2))
     realtime_weather_retry_sleep = max(0.0, _env_float('REALTIME_WEATHER_RETRY_SLEEP_SECONDS', 1.5))
     realtime_weather_failures = []
@@ -6602,7 +6605,7 @@ def get_today_matchups():
         raise RuntimeError(
             f"Real-time weather requirement failed for {len(realtime_weather_failures)} games on {today_str}. "
             f"Examples: {fail_preview}. "
-            "Set REQUIRE_REALTIME_WEATHER_ALL_GAMES=false to allow fallback weather."
+            "Set REALTIME_WEATHER_FAIL_HARD=false to allow fallback weather."
         )
 
     return pd.DataFrame(matchups)
