@@ -11,6 +11,7 @@ Incorporates:
 
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -548,6 +549,164 @@ TEAM_TO_BALLPARK_KEY = {
 STADIUM_NAME_TO_BALLPARK_KEY = {
     str(v.get('name', '')).lower(): k for k, v in BALLPARK_DATA.items() if v.get('name')
 }
+
+
+def _refresh_ballpark_lookup_maps():
+    """Refresh lookup maps after any runtime data overrides."""
+    global TEAM_TO_BALLPARK_KEY, STADIUM_NAME_TO_BALLPARK_KEY
+    TEAM_TO_BALLPARK_KEY = {
+        str(v.get('team', '')).upper(): k for k, v in BALLPARK_DATA.items() if v.get('team')
+    }
+    STADIUM_NAME_TO_BALLPARK_KEY = {
+        str(v.get('name', '')).lower(): k for k, v in BALLPARK_DATA.items() if v.get('name')
+    }
+
+
+def _coerce_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str) and not value.strip():
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _compute_handed_park_factors(rf, lf, cf, rf_wall, lf_wall, elevation_ft=0.0):
+    """Approximate HR inflation by handedness from 3D wall geometry and altitude."""
+    # RHH pull most HRs to LF; LHH pull most HRs to RF.
+    rh_pull_distance = float(lf)
+    lh_pull_distance = float(rf)
+    rh_pull_wall = float(lf_wall)
+    lh_pull_wall = float(rf_wall)
+    cf = float(cf)
+    elevation_ft = float(elevation_ft or 0.0)
+
+    def _factor(pull_dist, pull_wall):
+        pull_component = (330.0 - pull_dist) / 220.0
+        center_component = (400.0 - cf) / 500.0
+        wall_component = (8.0 - pull_wall) / 120.0
+        altitude_component = elevation_ft / 13000.0
+        raw = 1.0 + (0.55 * pull_component) + (0.30 * center_component) + (0.20 * wall_component) + altitude_component
+        return float(np.clip(raw, 0.88, 1.28))
+
+    rh_factor = _factor(rh_pull_distance, rh_pull_wall)
+    lh_factor = _factor(lh_pull_distance, lh_pull_wall)
+    return rh_factor, lh_factor
+
+
+def apply_savant_ballpark_overrides(csv_path=None):
+    """
+    Load Savant dimensions export and override BALLPARK_DATA geometry/factors.
+
+    Expected CSV columns (flexible names):
+    - team/team_abbr/team_abbreviation
+    - stadium_name/venue_name/park_name
+    - rf_distance/lf_distance/cf_distance
+    - rf_wall_height/lf_wall_height
+    Optional:
+    - elevation_ft/elevation
+    """
+    data_dir = Path(__file__).resolve().parents[1] / 'data'
+    default_path = data_dir / 'savant_ballpark_dimensions.csv'
+    override_path = csv_path or os.getenv('SAVANT_BALLPARK_DIMENSIONS_CSV', str(default_path))
+    csv_file = Path(str(override_path))
+    if not csv_file.exists():
+        return 0
+
+    try:
+        dim_df = pd.read_csv(csv_file)
+    except Exception as exc:
+        print(f"Warning: unable to read Savant dimensions CSV at {csv_file}: {exc}")
+        return 0
+
+    if dim_df.empty:
+        return 0
+
+    team_aliases = {
+        'AZ': 'ARI', 'ARZ': 'ARI', 'WSN': 'WSH', 'KCR': 'KC', 'SDP': 'SD',
+        'SFG': 'SF', 'TBR': 'TB', 'CHW': 'CWS', 'CHC': 'CHC', 'NYY': 'NYY',
+        'NYM': 'NYM', 'LAA': 'LAA', 'LAD': 'LAD',
+    }
+
+    def _first_col(row, candidates):
+        for col in candidates:
+            if col in row.index:
+                v = row.get(col)
+                if pd.notna(v) and str(v).strip() != '':
+                    return v
+        return None
+
+    updated = 0
+    for _, row in dim_df.iterrows():
+        team_raw = _first_col(row, ['team_abbreviation', 'team_abbr', 'team', 'home_team'])
+        stadium_name = _first_col(row, ['stadium_name', 'venue_name', 'park_name', 'stadium'])
+        if team_raw is not None:
+            team_abbr = team_aliases.get(str(team_raw).strip().upper(), str(team_raw).strip().upper())
+            park_key = TEAM_TO_BALLPARK_KEY.get(team_abbr)
+        else:
+            park_key = None
+
+        if park_key is None and stadium_name is not None:
+            park_key = STADIUM_NAME_TO_BALLPARK_KEY.get(str(stadium_name).strip().lower())
+
+        if park_key is None:
+            continue
+
+        rf = _coerce_float(_first_col(row, ['rf_distance', 'right_field_distance', 'rf', 'right_field']))
+        lf = _coerce_float(_first_col(row, ['lf_distance', 'left_field_distance', 'lf', 'left_field']))
+        cf = _coerce_float(_first_col(row, ['cf_distance', 'center_field_distance', 'cf', 'center_field']))
+        if rf is None or lf is None or cf is None:
+            continue
+
+        rf_wall = _coerce_float(_first_col(row, ['rf_wall_height', 'right_field_wall_height', 'rf_wall', 'right_wall_height']), 8.0)
+        lf_wall = _coerce_float(_first_col(row, ['lf_wall_height', 'left_field_wall_height', 'lf_wall', 'left_wall_height']), 8.0)
+        cf_wall = _coerce_float(_first_col(row, ['cf_wall_height', 'center_field_wall_height', 'cf_wall', 'center_wall_height']), 8.0)
+        elevation = _coerce_float(_first_col(row, ['elevation_ft', 'elevation', 'altitude_ft']), 0.0)
+
+        rh_factor, lh_factor = _compute_handed_park_factors(rf, lf, cf, rf_wall, lf_wall, elevation)
+
+        park = BALLPARK_DATA[park_key]
+        park['rf_porch'] = int(round(rf))
+        park['lf_wall'] = int(round(lf))
+        park['cf_distance'] = int(round(cf))
+        park['rf_wall_height'] = int(round(rf_wall))
+        park['lf_wall_height'] = int(round(lf_wall))
+        park['cf_wall_height'] = int(round(cf_wall))
+        park['park_factor_rh'] = float(rh_factor)
+        park['park_factor_lh'] = float(lh_factor)
+        park['pull_hitter_advantage'] = float(np.clip(max(rh_factor, lh_factor) + 0.03, 0.92, 1.35))
+        park['warning_track_hitters'] = float(np.clip(0.10 + ((rh_factor + lh_factor) / 2.0 - 1.0) * 0.30, 0.05, 0.20))
+
+        characteristics = list(park.get('characteristics', []))
+        if 'savant_3d' not in characteristics:
+            characteristics.append('savant_3d')
+        park['characteristics'] = characteristics
+
+        if stadium_name is not None:
+            park['name'] = str(stadium_name).strip()
+
+        updated += 1
+
+    if updated > 0:
+        _refresh_ballpark_lookup_maps()
+        print(f"Loaded Savant 3D dimensions overrides for {updated} stadiums from {csv_file}")
+
+    return updated
+
+
+def _auto_load_savant_ballpark_dimensions():
+    enabled = str(os.getenv('SAVANT_BALLPARK_DIMENSIONS_ENABLED', 'true')).strip().lower() in {'1', 'true', 'yes'}
+    if not enabled:
+        return
+    try:
+        apply_savant_ballpark_overrides()
+    except Exception as exc:
+        print(f"Warning: failed loading Savant ballpark dimensions overrides: {exc}")
+
+
+_auto_load_savant_ballpark_dimensions()
 
 
 def _resolve_ballpark_key(team):

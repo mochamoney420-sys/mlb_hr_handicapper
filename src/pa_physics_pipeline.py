@@ -81,6 +81,112 @@ def _bounded(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def compute_pitch_physics_pressure(pitch_df: pd.DataFrame) -> Dict[str, float]:
+    """Estimate how much a pitcher's arsenal is creating premium-contact pressure today.
+
+    The score blends a simple VAA proxy (steeper angles create more dangerous contact
+    when the hitter is already geared to swing up) with a seam-shifted wake proxy from
+    velocity-spin movement characteristics. Higher values imply more dangerous contact pressure.
+    """
+    if pitch_df is None or pitch_df.empty:
+        return {
+            "pitch_physics_pressure_score": 0.5,
+            "pitch_vaa_pressure_score": 0.5,
+            "pitch_ssw_proxy": 0.0,
+        }
+
+    work = pitch_df.copy()
+    work["vaa"] = pd.to_numeric(work.get("vaa"), errors="coerce")
+    work["release_spin_rate"] = pd.to_numeric(work.get("release_spin_rate"), errors="coerce")
+    work["pfx_x"] = pd.to_numeric(work.get("pfx_x"), errors="coerce")
+    work["pfx_z"] = pd.to_numeric(work.get("pfx_z"), errors="coerce")
+    work["release_extension"] = pd.to_numeric(work.get("release_extension"), errors="coerce")
+
+    vaa_values = work["vaa"].dropna()
+    vaa_pressure = 0.5
+    if not vaa_values.empty:
+        mean_vaa = float(vaa_values.mean())
+        # A steep VAA (more negative/large magnitude) creates a more exploitable fastball plane.
+        vaa_pressure = _bounded(0.5 + ((-mean_vaa - 4.5) / 7.0) * 0.70, 0.05, 0.95)
+
+    spin_values = work["release_spin_rate"].dropna()
+    movement_values = work[["pfx_x", "pfx_z"]].dropna()
+    ssw_proxy = 0.0
+    if not spin_values.empty:
+        spin_z = float(spin_values.mean() / 3000.0)
+        if not movement_values.empty:
+            move_mag = float(np.sqrt((movement_values["pfx_x"] ** 2 + movement_values["pfx_z"] ** 2)).mean())
+            ssw_proxy = _bounded(0.25 + spin_z * 0.35 + move_mag / 10.0, 0.0, 1.0)
+        else:
+            ssw_proxy = _bounded(0.25 + spin_z * 0.45, 0.0, 1.0)
+
+    pressure_score = _bounded(0.55 * vaa_pressure + 0.45 * ssw_proxy, 0.0, 1.0)
+    return {
+        "pitch_physics_pressure_score": pressure_score,
+        "pitch_vaa_pressure_score": vaa_pressure,
+        "pitch_ssw_proxy": ssw_proxy,
+    }
+
+
+def compute_umpire_strike_zone_bias(umpire_name: str, called_strike_rate: float = 0.33) -> Dict[str, float]:
+    """Translate umpire identity and called-strike rate into a hitter-friendly zone-bias multiplier."""
+    name = str(umpire_name or "").lower()
+    rate = _safe_float(called_strike_rate, 0.33)
+
+    tight_zone_score = 0.5
+    if any(token in name for token in ("bucknor", "bellino", "west", "hernandez")):
+        tight_zone_score = 0.70
+    elif any(token in name for token in ("layne", "lee", "miller", "cobbs")):
+        tight_zone_score = 0.62
+
+    # A lower called-strike rate implies the umpire is granting more favorable hitter counts.
+    if rate < 0.30:
+        tight_zone_score += 0.12
+    elif rate < 0.34:
+        tight_zone_score += 0.05
+
+    tight_zone_score = _bounded(tight_zone_score, 0.0, 1.0)
+    multiplier = _bounded(1.0 + (tight_zone_score * 0.14), 0.90, 1.22)
+    return {
+        "umpire_tight_zone_score": tight_zone_score,
+        "umpire_zone_bias_multiplier": multiplier,
+    }
+
+
+def compute_catcher_liability_score(called_strike_rate: float = 0.33, passed_balls: int = 0, stolen_base_attempts: int = 0) -> Dict[str, float]:
+    """Estimate catcher framing and blocking liability that pushes pitchers to predictable fastballs."""
+    rate = _safe_float(called_strike_rate, 0.33)
+    pb = _safe_int(passed_balls, 0)
+    sb = _safe_int(stolen_base_attempts, 0)
+
+    framing_gap = max(0.0, 0.33 - rate)
+    liability_score = _bounded(0.18 * framing_gap + 0.06 * pb + 0.04 * sb, 0.0, 1.0)
+    multiplier = _bounded(1.0 + liability_score * 0.22, 0.90, 1.28)
+    return {
+        "catcher_liability_score": liability_score,
+        "catcher_liability_multiplier": multiplier,
+    }
+
+
+def compute_climate_micro_movement_multiplier(env: Dict[str, float]) -> float:
+    """Translate climate and altitude into a subtle ball/air movement multiplier."""
+    if not env:
+        return 1.0
+
+    temp_f = _safe_float(env.get("temperature_f"), 70.0)
+    humidity_pct = _safe_float(env.get("humidity_pct"), 50.0)
+    altitude_ft = _safe_float(env.get("altitude_ft"), 500.0)
+    pressure_inhg = _safe_float(env.get("pressure_inhg"), 29.92)
+
+    temp_component = _bounded((temp_f - 70.0) / 40.0, -0.15, 0.25)
+    humidity_component = _bounded((humidity_pct - 50.0) / 60.0, -0.10, 0.20)
+    altitude_component = -0.05 if altitude_ft >= 4000.0 else 0.0
+    pressure_component = 0.03 if pressure_inhg < 29.5 else 0.0
+
+    multiplier = 1.0 + 0.75 * temp_component + 0.65 * humidity_component + altitude_component + pressure_component
+    return _bounded(multiplier, 0.84, 1.24)
+
+
 def _safe_int(value, default=0) -> int:
     try:
         if value is None:
@@ -529,6 +635,8 @@ def compute_pitch_level_micro_matchup(
     except Exception:
         arsenal_matchup_score = 1.0
 
+    pitch_physics = compute_pitch_physics_pressure(pitcher_df)
+
     if matchup_df.empty:
         micro_score = 1.0
     else:
@@ -566,6 +674,9 @@ def compute_pitch_level_micro_matchup(
         "vaa_attack_angle_score": vaa_attack_score,
         "estimated_pitcher_vaa": pitch_vaa,
         "estimated_batter_attack_angle": attack_angle,
+        "pitch_physics_pressure_score": _safe_float(pitch_physics.get("pitch_physics_pressure_score"), 0.5),
+        "pitch_vaa_pressure_score": _safe_float(pitch_physics.get("pitch_vaa_pressure_score"), 0.5),
+        "pitch_ssw_proxy": _safe_float(pitch_physics.get("pitch_ssw_proxy"), 0.0),
     }
 
 
@@ -580,6 +691,8 @@ def compute_umpire_catcher_cascade(game_pk: int, pitcher_id: int, batter_id: int
     zone_drift_score = 1.0
     hotzone_overlap = 0.0
     hp_name = ""
+    umpire_bias = {}
+    catcher_liability = {}
 
     try:
         g = statsapi.get("game", {"gamePk": game_pk})
@@ -605,6 +718,11 @@ def compute_umpire_catcher_cascade(game_pk: int, pitcher_id: int, batter_id: int
                 if not called.empty:
                     called_rate = (called["description"] == "called_strike").mean()
                     catcher_framing_impact = _bounded(1.0 - ((called_rate - 0.33) * 0.35), 0.90, 1.08)
+                    catcher_liability = compute_catcher_liability_score(
+                        called_strike_rate=float(called_rate),
+                        passed_balls=int(pd.to_numeric(p_df.get("passed_balls"), errors="coerce").fillna(0).max()) if "passed_balls" in p_df.columns else 0,
+                        stolen_base_attempts=int(pd.to_numeric(p_df.get("stolen_base_attempts"), errors="coerce").fillna(0).max()) if "stolen_base_attempts" in p_df.columns else 0,
+                    )
         except Exception:
             pass
 
@@ -635,6 +753,8 @@ def compute_umpire_catcher_cascade(game_pk: int, pitcher_id: int, batter_id: int
                 pitcher_z = float(called["plate_z"].mean()) if called["plate_z"].notna().any() else 2.45
 
                 lower = hp_name.lower()
+                called_rate = float(called["description"].eq("called_strike").mean()) if not called.empty else 0.33
+                umpire_bias = compute_umpire_strike_zone_bias(hp_name, called_strike_rate=called_rate)
                 drift_x = 0.0
                 drift_z = 0.0
                 squeeze = 0.0
@@ -668,6 +788,10 @@ def compute_umpire_catcher_cascade(game_pk: int, pitcher_id: int, batter_id: int
         "umpire_zone_drift_score": zone_drift_score,
         "umpire_hotzone_overlap": hotzone_overlap,
         "umpire_catcher_cascade": _bounded(umpire_impact * catcher_framing_impact * zone_drift_score, 0.85, 1.18),
+        "umpire_tight_zone_score": _safe_float(umpire_bias.get("umpire_tight_zone_score"), 0.5),
+        "umpire_zone_bias_multiplier": _safe_float(umpire_bias.get("umpire_zone_bias_multiplier"), 1.0),
+        "catcher_liability_score": _safe_float(catcher_liability.get("catcher_liability_score"), 0.0),
+        "catcher_liability_multiplier": _safe_float(catcher_liability.get("catcher_liability_multiplier"), 1.0),
     }
 
 
@@ -988,6 +1112,11 @@ def simulate_plate_appearance_probability(
         1.24,
     )
 
+    pitch_physics_multiplier = _bounded(1.0 + (_safe_float(micro.get("pitch_physics_pressure_score"), 0.5) * 0.12), 0.86, 1.20)
+    umpire_bias_multiplier = _safe_float(ump_catch.get("umpire_zone_bias_multiplier"), 1.0)
+    catcher_liability_multiplier = _safe_float(ump_catch.get("catcher_liability_multiplier"), 1.0)
+    climate_micro_multiplier = compute_climate_micro_movement_multiplier(env)
+
     context_mult = (
         _safe_float(env.get("drag_multiplier"), 1.0)
         * wind_boost
@@ -995,10 +1124,14 @@ def simulate_plate_appearance_probability(
         * _safe_float(micro.get("pitch_micro_matchup_score"), 1.0)
         * _safe_float(micro.get("pitch_arsenal_matchup_score"), 1.0)
         * _safe_float(micro.get("vaa_attack_angle_score"), 1.0)
+        * pitch_physics_multiplier
+        * umpire_bias_multiplier
+        * catcher_liability_multiplier
         * _safe_float(ump_catch.get("umpire_catcher_cascade"), 1.0)
         * _safe_float(fatigue.get("fatigue_multiplier"), 1.0)
         * _safe_float(fatigue.get("lineup_protection_multiplier"), 1.0)
         * _safe_float(spin_decay.get("spin_decay_multiplier"), 1.0)
+        * climate_micro_multiplier
         * bullpen_exposure_multiplier
     )
 
@@ -1021,9 +1154,17 @@ def simulate_plate_appearance_probability(
         "pitch_micro_matchup_score": _safe_float(micro.get("pitch_micro_matchup_score"), 1.0),
         "pitch_arsenal_matchup_score": _safe_float(micro.get("pitch_arsenal_matchup_score"), 1.0),
         "vaa_attack_angle_score": _safe_float(micro.get("vaa_attack_angle_score"), 1.0),
+        "pitch_physics_pressure_score": _safe_float(micro.get("pitch_physics_pressure_score"), 0.5),
+        "pitch_vaa_pressure_score": _safe_float(micro.get("pitch_vaa_pressure_score"), 0.5),
+        "pitch_ssw_proxy": _safe_float(micro.get("pitch_ssw_proxy"), 0.0),
         "estimated_pitcher_vaa": _safe_float(micro.get("estimated_pitcher_vaa"), -5.5),
         "estimated_batter_attack_angle": _safe_float(micro.get("estimated_batter_attack_angle"), 12.0),
         "umpire_catcher_cascade": _safe_float(ump_catch.get("umpire_catcher_cascade"), 1.0),
+        "umpire_tight_zone_score": _safe_float(ump_catch.get("umpire_tight_zone_score"), 0.5),
+        "umpire_zone_bias_multiplier": _safe_float(ump_catch.get("umpire_zone_bias_multiplier"), 1.0),
+        "catcher_liability_score": _safe_float(ump_catch.get("catcher_liability_score"), 0.0),
+        "catcher_liability_multiplier": _safe_float(ump_catch.get("catcher_liability_multiplier"), 1.0),
+        "climate_micro_movement_multiplier": climate_micro_multiplier,
         "umpire_zone_drift_score": _safe_float(ump_catch.get("umpire_zone_drift_score"), 1.0),
         "umpire_hotzone_overlap": _safe_float(ump_catch.get("umpire_hotzone_overlap"), 0.0),
         "fatigue_index": _safe_float(fatigue.get("fatigue_index"), 0.0),

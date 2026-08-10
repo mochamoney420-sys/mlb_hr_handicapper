@@ -519,6 +519,233 @@ def build_bullpen_fatigue_multiplier_map(
     return team_map, debug_info
 
 
+# Stadium architecture wind-shield factors (0=no shield, 1=full shield).
+# Higher values reduce the effective outward-wind carry impact.
+STADIUM_WIND_SHIELDING = {
+    'SF': 0.55,   # Oracle: enclosed geometry + marine layer effects.
+    'CHC': 0.05,  # Wrigley: highly wind-sensitive.
+    'NYY': 0.20,
+    'BOS': 0.25,
+    'SEA': 0.30,
+    'SD': 0.35,
+    'TB': 0.85,   # Dome.
+    'MIA': 0.70,  # Retractable roof often mitigates wind.
+    'MIL': 0.65,
+    'ARI': 0.65,
+    'TEX': 0.60,
+    'HOU': 0.60,
+}
+
+
+def _pressure_mbar_to_inhg(pressure_mbar):
+    try:
+        return float(pressure_mbar) * 0.0295299830714
+    except Exception:
+        return 29.92
+
+
+def compute_micro_atmo_carry_adjustment(
+    pressure_mbar,
+    humidity_pct,
+    wind_out_mph,
+    team_abbr='',
+    roof_sealed=0,
+):
+    """Return carry adjustment in feet using micro-atmospheric rules of thumb.
+
+    Rules encoded:
+    - Every 0.3 inHg pressure drop from 29.92 adds about +2 ft carry.
+    - Every +50 humidity points adds about +1 ft carry.
+    - Outward wind impact is reduced by stadium wind-shield architecture.
+    """
+    pressure_inhg = _pressure_mbar_to_inhg(pressure_mbar)
+    humidity = float(pd.to_numeric(humidity_pct, errors='coerce')) if pd.notna(humidity_pct) else 50.0
+    wind_out = float(pd.to_numeric(wind_out_mph, errors='coerce')) if pd.notna(wind_out_mph) else 0.0
+    team = str(team_abbr or '').upper().strip()
+    shield = float(np.clip(STADIUM_WIND_SHIELDING.get(team, 0.20), 0.0, 0.95))
+    if int(pd.to_numeric(roof_sealed, errors='coerce')) == 1:
+        shield = 0.95
+
+    # Pressure effect (+2 ft per 0.3 inHg drop from standard pressure).
+    pressure_drop_inhg = 29.92 - pressure_inhg
+    pressure_ft = (pressure_drop_inhg / 0.3) * 2.0
+
+    # Humidity effect (+1 ft per +50% humidity change).
+    humidity_ft = ((humidity - 50.0) / 50.0) * 1.0
+
+    # Wind carry effect in feet, attenuated by stadium shielding.
+    effective_wind_out = wind_out * (1.0 - shield)
+    wind_ft = effective_wind_out * 0.60
+
+    carry_ft = float(np.clip(pressure_ft + humidity_ft + wind_ft, -12.0, 18.0))
+    # Convert carry feet to a conservative multiplicative HR adjustment.
+    carry_multiplier = float(np.clip(1.0 + (carry_ft / 400.0), 0.92, 1.12))
+    return {
+        'carry_adjustment_ft': carry_ft,
+        'carry_multiplier': carry_multiplier,
+        'effective_wind_out_mph': float(effective_wind_out),
+        'wind_shield_factor': shield,
+        'pressure_inhg': pressure_inhg,
+    }
+
+
+def build_bullpen_depletion_vulnerability_map(
+    statcast_df,
+    lookback_days=14,
+    top_n_arms=3,
+    exhaustion_pitch_threshold=30,
+):
+    """Build team-level bullpen depletion + HR/9 vulnerability map.
+
+    Tracks top low-HR relievers and checks whether they are effectively unavailable
+    after heavy two-day pitch loads, then estimates the HR/9 gap to middle relief.
+    """
+    empty_debug = {'teams_seen': 0, 'teams_depleted': 0}
+    if statcast_df is None or statcast_df.empty:
+        return {}, empty_debug
+
+    work = statcast_df.copy()
+    if 'pitcher' not in work.columns or 'game_date' not in work.columns:
+        return {}, empty_debug
+
+    work['_game_date'] = pd.to_datetime(work['game_date'], errors='coerce').dt.date
+    work = work[work['_game_date'].notna()].copy()
+    if work.empty:
+        return {}, empty_debug
+
+    cutoff = (datetime.today() - timedelta(days=max(3, int(lookback_days)))).date()
+    work = work[work['_game_date'] >= cutoff].copy()
+    if work.empty:
+        return {}, empty_debug
+
+    if 'pitching_team' in work.columns:
+        work['_pitching_team'] = work['pitching_team'].astype(str).str.upper().str.strip()
+    elif {'inning_topbot', 'home_team', 'away_team'}.issubset(set(work.columns)):
+        itb = work['inning_topbot'].astype(str).str.lower().str.strip()
+        work['_pitching_team'] = np.where(itb.str.startswith('top'), work['home_team'], work['away_team'])
+        work['_pitching_team'] = work['_pitching_team'].astype(str).str.upper().str.strip()
+    else:
+        work['_pitching_team'] = ''
+
+    work['pitcher'] = pd.to_numeric(work['pitcher'], errors='coerce')
+    work = work[(work['pitcher'].notna()) & (work['_pitching_team'].astype(str).str.len() >= 2)].copy()
+    if work.empty:
+        return {}, empty_debug
+
+    # Pitch-count workload by day.
+    daily_pitch_ct = work.groupby(['_pitching_team', 'pitcher', '_game_date'], as_index=False).size()
+    daily_pitch_ct = daily_pitch_ct.rename(columns={'size': 'pitch_count'})
+
+    usage = daily_pitch_ct.groupby(['_pitching_team', 'pitcher'], as_index=False).agg(
+        total_pitches=('pitch_count', 'sum'),
+        active_days=('pitch_count', 'count'),
+        avg_pitches_day=('pitch_count', 'mean'),
+    )
+    reliever_pool = usage[(usage['active_days'] >= 3) & (usage['avg_pitches_day'] <= 35)].copy()
+    if reliever_pool.empty:
+        return {}, empty_debug
+
+    # Build pitcher HR/9 proxy from PA outcomes.
+    pa_work = work.copy()
+    if {'events', 'at_bat_number', 'game_pk'}.issubset(set(pa_work.columns)):
+        pa_work = pa_work.dropna(subset=['events']).drop_duplicates(subset=['game_pk', 'pitcher', 'at_bat_number'])
+    else:
+        pa_work = pa_work.dropna(subset=['pitcher'])
+    pa_work['is_hr'] = pa_work.get('events', pd.Series([''] * len(pa_work), index=pa_work.index)).astype(str).str.lower().eq('home_run').astype(int)
+    pit_outcome = pa_work.groupby(['_pitching_team', 'pitcher'], as_index=False).agg(
+        pa_count=('pitcher', 'count'),
+        hr_allowed=('is_hr', 'sum'),
+    )
+    pit_outcome['hr9_proxy'] = (pit_outcome['hr_allowed'] * 9.0) / (pit_outcome['pa_count'] / 4.3).clip(lower=1.0)
+    reliever_pool = reliever_pool.merge(
+        pit_outcome[['_pitching_team', 'pitcher', 'pa_count', 'hr9_proxy']],
+        on=['_pitching_team', 'pitcher'],
+        how='left',
+    )
+    reliever_pool['pa_count'] = pd.to_numeric(reliever_pool.get('pa_count', 0), errors='coerce').fillna(0)
+    reliever_pool['hr9_proxy'] = pd.to_numeric(reliever_pool.get('hr9_proxy', 1.1), errors='coerce').fillna(1.1)
+
+    today = datetime.today().date()
+    d1 = today - timedelta(days=1)
+    d2 = today - timedelta(days=2)
+    daily_lookup = {
+        (str(r['_pitching_team']), float(r['pitcher']), r['_game_date']): int(r['pitch_count'])
+        for _, r in daily_pitch_ct.iterrows()
+    }
+
+    team_map = {}
+    teams_depleted = 0
+    for team, grp in reliever_pool.groupby('_pitching_team'):
+        g = grp.sort_values('total_pitches', ascending=False).copy()
+        if g.empty:
+            continue
+        usage_candidates = g.head(max(5, int(top_n_arms) + 2)).copy()
+        top_low_hr = usage_candidates.sort_values('hr9_proxy', ascending=True).head(max(1, int(top_n_arms))).copy()
+        top_ids = set(float(x) for x in top_low_hr['pitcher'].tolist())
+
+        exhausted = 0
+        for _, arm in top_low_hr.iterrows():
+            pid = float(arm['pitcher'])
+            p1 = int(daily_lookup.get((str(team), pid, d1), 0))
+            p2 = int(daily_lookup.get((str(team), pid, d2), 0))
+            if p1 >= int(exhaustion_pitch_threshold) and p2 >= int(exhaustion_pitch_threshold):
+                exhausted += 1
+
+        middle_relief = g[~g['pitcher'].astype(float).isin(top_ids)].copy()
+        top_hr9 = float(pd.to_numeric(top_low_hr.get('hr9_proxy', 1.1), errors='coerce').mean()) if not top_low_hr.empty else 1.1
+        mid_hr9 = float(pd.to_numeric(middle_relief.get('hr9_proxy', top_hr9), errors='coerce').mean()) if not middle_relief.empty else top_hr9
+        hr9_gap = max(0.0, mid_hr9 - top_hr9)
+
+        depleted = exhausted >= max(1, int(top_n_arms))
+        if depleted:
+            teams_depleted += 1
+
+        depletion_multiplier = 1.0
+        if depleted:
+            depletion_multiplier += float(np.clip((hr9_gap / 2.5) * 0.18 + (exhausted * 0.03), 0.06, 0.40))
+
+        team_map[str(team)] = {
+            'depleted': bool(depleted),
+            'depletion_multiplier': float(np.clip(depletion_multiplier, 1.0, 1.45)),
+            'exhausted_top_arms': int(exhausted),
+            'top_relief_hr9': float(np.clip(top_hr9, 0.2, 3.5)),
+            'middle_relief_hr9': float(np.clip(mid_hr9, 0.2, 4.5)),
+            'hr9_gap': float(np.clip(hr9_gap, 0.0, 3.0)),
+        }
+
+    debug = {'teams_seen': int(len(team_map)), 'teams_depleted': int(teams_depleted)}
+    return team_map, debug
+
+
+def calculate_starter_bullpen_chunk_game_probability(
+    pa_hr_prob,
+    expected_pa,
+    bullpen_multiplier=1.0,
+    starter_chunk_ratio=0.62,
+    bullpen_chunk_floor=1.5,
+    bullpen_chunk_cap=2.2,
+):
+    """Convert per-PA HR probability into game probability using starter/bullpen chunks."""
+    p = float(np.clip(pa_hr_prob, 0.0, 0.99))
+    pa = float(np.clip(expected_pa, 1.5, 7.0))
+    bullpen_mult = float(np.clip(bullpen_multiplier, 0.85, 1.60))
+
+    bullpen_pa = float(np.clip(pa * (1.0 - float(starter_chunk_ratio)), bullpen_chunk_floor, bullpen_chunk_cap))
+    if bullpen_pa > pa - 0.5:
+        bullpen_pa = max(0.5, pa - 0.5)
+    starter_pa = max(0.5, pa - bullpen_pa)
+
+    lam_starter = p * starter_pa
+    lam_bullpen = (p * bullpen_mult) * bullpen_pa
+    game_prob = 1.0 - math.exp(-(lam_starter + lam_bullpen))
+    return {
+        'game_hr_prob': float(np.clip(game_prob, 0.0, 1.0)),
+        'starter_pa_chunk': float(starter_pa),
+        'bullpen_pa_chunk': float(bullpen_pa),
+        'bullpen_multiplier': bullpen_mult,
+    }
+
+
 def _clv_tracker_path(date_str=None):
     date_str = date_str or datetime.today().strftime('%Y-%m-%d')
     return Path('data') / f'clv_tracker_{date_str}.csv'
@@ -771,8 +998,8 @@ def audit_clv_performance(date_str=None, lookback_days=30):
                 nm = _normalize_player_name(r.get('batter_name'))
                 if nm:
                     game_time_by_name[nm] = r.get('game_time', '')
-        except Exception:
-            pass
+        except Exception as feedback_exc:
+            print(f"Live HR feedback lookup failed: {feedback_exc}")
 
     snapshots = _load_odds_snapshots(date_str)
 
@@ -2657,6 +2884,73 @@ def apply_recent_overconfidence_guardrail(
         }
     except Exception as exc:
         return preds_df, {'applied': False, 'reason': f'error:{exc}'}
+
+
+def resolve_recent_precision_snapshot(
+    days_lookback=14,
+    prob_threshold=0.07,
+    min_files=4,
+    min_rows=600,
+):
+    """Return recent precision diagnostics for a fixed probability trigger threshold."""
+    try:
+        cutoff = datetime.today() - timedelta(days=max(3, int(days_lookback)))
+        eval_files = []
+        for fp in sorted(Path('data').glob('evaluation_*.csv')):
+            try:
+                d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+                if d >= cutoff:
+                    eval_files.append(fp)
+            except Exception:
+                continue
+
+        if len(eval_files) < max(1, int(min_files)):
+            return {'applied': False, 'reason': 'insufficient_files', 'files': len(eval_files)}
+
+        frames = []
+        for fp in eval_files:
+            try:
+                ev = pd.read_csv(fp, usecols=['pred_hr_prob', 'actual_hr'])
+                if ev is not None and not ev.empty:
+                    frames.append(ev)
+            except Exception:
+                continue
+
+        if not frames:
+            return {'applied': False, 'reason': 'no_eval_rows'}
+
+        ev_all = pd.concat(frames, ignore_index=True)
+        ev_all['pred_hr_prob'] = pd.to_numeric(ev_all.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        ev_all['actual_hr'] = pd.to_numeric(ev_all.get('actual_hr', 0.0), errors='coerce').fillna(0.0).clip(0.0, 1.0)
+        if len(ev_all) < max(100, int(min_rows)):
+            return {'applied': False, 'reason': 'insufficient_rows', 'rows': int(len(ev_all))}
+
+        thr = float(np.clip(prob_threshold, 0.01, 0.30))
+        pred = (ev_all['pred_hr_prob'] >= thr).astype(int)
+        y = (ev_all['actual_hr'] >= 0.5).astype(int)
+        tp = int(((pred == 1) & (y == 1)).sum())
+        fp = int(((pred == 1) & (y == 0)).sum())
+        fn = int(((pred == 0) & (y == 1)).sum())
+        pred_count = int(pred.sum())
+        precision = float(tp / max(1, tp + fp)) if pred_count > 0 else 0.0
+        recall = float(tp / max(1, tp + fn))
+
+        return {
+            'applied': True,
+            'threshold': thr,
+            'files': int(len(eval_files)),
+            'rows': int(len(ev_all)),
+            'tp': tp,
+            'fp': fp,
+            'fn': fn,
+            'pred_count': pred_count,
+            'precision': precision,
+            'recall': recall,
+            'pred_mean': float(ev_all['pred_hr_prob'].mean()) if len(ev_all) else 0.0,
+            'actual_mean': float(ev_all['actual_hr'].mean()) if len(ev_all) else 0.0,
+        }
+    except Exception as exc:
+        return {'applied': False, 'reason': f'error:{exc}'}
 
 
 def _file_contains_text(path, needle):
@@ -5451,7 +5745,8 @@ def get_advanced_hr_metrics(days_back=60):
                           (pa_df['launch_angle'] <= 30 + (pa_df['launch_speed'] - 98))).astype(int)
 
     pa_df['is_hard_hit'] = (pa_df['launch_speed'] >= 95).astype(int)
-    pa_df['is_sweet_spot'] = ((pa_df['launch_speed'] >= 90) & pa_df['launch_angle'].between(18, 32)).astype(int)
+    # Statcast sweet-spot contact window: launch angle between 8 and 32 degrees.
+    pa_df['is_sweet_spot'] = pa_df['launch_angle'].between(8, 32).astype(int)
     pa_df['release_speed'] = pd.to_numeric(pa_df.get('release_speed', 0), errors='coerce').fillna(0)
     pa_df['is_fly'] = pa_df.get('bb_type', '').fillna('').str.lower() == 'fly_ball'
     pa_df['is_ground'] = pa_df.get('bb_type', '').fillna('').str.lower() == 'ground_ball'
@@ -5578,15 +5873,15 @@ def get_advanced_hr_metrics(days_back=60):
     batter_stats['bat_barrel_trend_delta'] = (batter_stats['bat_barrel_rate_14d'] - batter_stats['bat_barrel_rate_365d']).clip(-0.25, 0.25)
     batter_stats['bat_hard_hit_trend_delta'] = (batter_stats['bat_hard_hit_rate_14d'] - batter_stats['bat_hard_hit_rate_365d']).clip(-0.35, 0.35)
     
-    # Add wRC+ (Weighted Runs Created+) - normalized to league average of 100
-    # wRC+ = 100 * [(HRs * 1.4 + SweetSpot% * 0.8 + AvgEV bonus) / league average]
-    # Approximation: higher HR rate, sweet spot rate, and exit velocity = higher wRC+
+    # Contact-quality run creation proxy (quality-first, no direct HR-count dependency).
+    # Approximation: barrels + sweet-spot + hard-hit + EV drive most sustainable power.
     batter_stats['bat_wrc_plus'] = (
         100 * (
-            (batter_stats['bat_hr_rate'] * 1.4 * 60) +  # HR component (scaled to league HR rate ~0.033)
-            (batter_stats['bat_sweet_spot_rate'] * 0.8 * 100) +  # Sweet spot contact quality
-            ((batter_stats['bat_avg_exit_velocity'] - 85) / 5 * 10)  # Exit velo bonus (normalized)
-        ) / 60  # Normalize to league average ~100
+            (batter_stats['bat_barrel_rate'] * 1.6 * 100)
+            + (batter_stats['bat_sweet_spot_rate'] * 0.9 * 100)
+            + (batter_stats['bat_hard_hit_rate'] * 0.7 * 100)
+            + ((batter_stats['bat_avg_exit_velocity'] - 85) / 5 * 10)
+        ) / 75
     ).clip(lower=30, upper=200)  # Realistic wRC+ range
     
     today_date = pd.Timestamp(datetime.today().date())
@@ -5688,8 +5983,12 @@ def get_today_matchups():
         raw_dt = game.get('game_datetime', '')
         if raw_dt:
             try:
-                gdt = datetime.strptime(raw_dt[:19], '%Y-%m-%dT%H:%M:%S')
-                gdt_et = gdt - timedelta(hours=4)  # UTC to EDT
+                gdt_utc = datetime.strptime(raw_dt[:19], '%Y-%m-%dT%H:%M:%S')
+                if ZoneInfo is not None:
+                    gdt_et = gdt_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(ZoneInfo('America/New_York'))
+                else:
+                    # Fallback when zoneinfo is unavailable.
+                    gdt_et = gdt_utc - timedelta(hours=4)
                 hr = gdt_et.hour % 12 or 12
                 ampm = 'PM' if gdt_et.hour >= 12 else 'AM'
                 game_time_str = f"{hr}:{gdt_et.minute:02d} {ampm}"
@@ -5918,6 +6217,9 @@ def get_today_matchups():
                     if not p_throws:
                         p_throws = 'R'
 
+                # In sparse pregame states, roster-proxy batting orders can create noisy/misaligned rows.
+                allow_roster_proxy_lineup = str(os.getenv('ALLOW_ROSTER_PROXY_LINEUP', 'false')).strip().lower() in {'1', 'true', 'yes'}
+
                 batting_order = team_info.get('battingOrder') or team_info.get('batters') or []
                 if not batting_order and get_game_lineups is not None:
                     fallback_lineups = get_game_lineups(game_id) or {}
@@ -5926,15 +6228,16 @@ def get_today_matchups():
                     batting_order = [str(p.get('id', '')).replace('ID', '') for p in fallback_players if p.get('is_batter')][:9]
                 if not batting_order:
                     # Data-availability fail-safe: use available roster player IDs as emergency batting-order proxy.
-                    team_players = team_info.get('players', {}) if isinstance(team_info, dict) else {}
-                    if not team_players and raw_team_info:
-                        team_players = raw_team_info.get('players', {}) or {}
-                    roster_ids = []
-                    for k in (team_players or {}).keys():
-                        sid = str(k).replace('ID', '').strip()
-                        if sid.isdigit():
-                            roster_ids.append(sid)
-                    batting_order = roster_ids[:9]
+                    if allow_roster_proxy_lineup:
+                        team_players = team_info.get('players', {}) if isinstance(team_info, dict) else {}
+                        if not team_players and raw_team_info:
+                            team_players = raw_team_info.get('players', {}) or {}
+                        roster_ids = []
+                        for k in (team_players or {}).keys():
+                            sid = str(k).replace('ID', '').strip()
+                            if sid.isdigit():
+                                roster_ids.append(sid)
+                        batting_order = roster_ids[:9]
 
                 seen_batters = set()
                 for order_idx, batter_id in enumerate(batting_order):
@@ -5969,6 +6272,28 @@ def get_today_matchups():
                     # Fall back to pre-resolved probable pitcher ID when boxscore hasn't populated yet.
                     if not pitcher_id:
                         pitcher_id = probable_away_pitcher_id if team_type == 'home' else probable_home_pitcher_id
+
+                    # Re-resolve pitcher hand after fallback pitcher assignment.
+                    if pitcher_id and (not p_throws or str(p_throws).strip().upper() not in {'R', 'L'}):
+                        try:
+                            pp_info = statsapi.lookup_player(str(pitcher_name), gameType='R') if pitcher_name else []
+                            if pp_info:
+                                hand = str(pp_info[0].get('pitchHand', {}).get('code', '') or '').strip().upper()
+                                if hand in {'R', 'L'}:
+                                    p_throws = hand
+                        except Exception:
+                            pass
+                    if str(p_throws).strip().upper() not in {'R', 'L'}:
+                        p_throws = 'R'
+
+                    skip_unknown_pitcher = str(os.getenv('SKIP_UNKNOWN_PITCHER_MATCHUPS', 'true')).strip().lower() not in {'0', 'false', 'no'}
+                    pitcher_name_clean = str(pitcher_name or '').strip()
+                    if skip_unknown_pitcher and (
+                        not pitcher_name_clean
+                        or pitcher_name_clean.lower() in {'unknown pitcher', 'unknown', 'tbd', 'nan', 'none', 'null'}
+                        or pitcher_id in {None, '', 'nan'}
+                    ):
+                        continue
 
                     matchups.append({
                         'game_pk': game_id,
@@ -6594,8 +6919,8 @@ def _save_closed_loop_coefficients(coeffs):
         out = dict(coeffs or {})
         out['last_updated'] = datetime.now().isoformat()
         path.write_text(_json.dumps(out, indent=2), encoding='utf-8')
-    except Exception:
-        pass
+    except Exception as cons_exc:
+        print(f"Conservative Discord send failed: {cons_exc}")
 
 
 def _load_cached_statcast_window(end_date, days_back=21):
@@ -6653,6 +6978,11 @@ def _pitch_mix_vector(df):
         return {}
     vc = df['pitch_type'].dropna().astype(str).value_counts(normalize=True)
     return {str(k): float(v) for k, v in vc.items()}
+
+
+def _quality_only_statcast_mode_enabled():
+    """When true, downweight/remove raw HR-count based signals in favor of contact quality."""
+    return str(os.getenv('QUALITY_ONLY_STATCAST_MODE', 'true')).strip().lower() not in {'0', 'false', 'no'}
 
 
 def build_pregame_primary_weapon_vulnerability_lookup(
@@ -6823,9 +7153,11 @@ def build_matchup_history_features(statcast_df, rows_df, lookback_days=365):
     out['batter_vs_pitcher_hr_count'] = 0.0
     out['batter_vs_pitcher_pa_count'] = 0.0
     out['batter_vs_pitcher_hr_rate'] = 0.033
+    out['batter_vs_pitcher_reliability'] = 0.0
     out['batter_in_park_hr_count'] = 0.0
     out['batter_in_park_pa_count'] = 0.0
     out['batter_in_park_hr_rate'] = 0.033
+    out['batter_in_park_reliability'] = 0.0
 
     if statcast_df is None or getattr(statcast_df, 'empty', True):
         return out
@@ -6859,14 +7191,23 @@ def build_matchup_history_features(statcast_df, rows_df, lookback_days=365):
         pair_hr=('is_hr', 'sum'),
     )
     if not pair.empty:
-        pair['pair_rate'] = (pair['pair_hr'] + 1.0) / (pair['pair_pa'] + 30.0)
+        pair_prior = float(np.clip(_env_float('H2H_RATE_PRIOR', 0.033), 0.005, 0.20))
+        pair_min_pa = max(10.0, float(_env_float('H2H_RELIABILITY_MIN_PA', 80.0)))
+        pair['pair_rate_raw'] = pair['pair_hr'] / pair['pair_pa'].clip(lower=1)
+        pair['pair_reliability'] = (pair['pair_pa'] / pair_min_pa).clip(lower=0.0, upper=1.0)
+        pair['pair_rate'] = (
+            (pair['pair_rate_raw'] * pair['pair_reliability'])
+            + (pair_prior * (1.0 - pair['pair_reliability']))
+        )
         pair_map_hr = {(int(r['batter']), int(r['pitcher'])): float(r['pair_hr']) for _, r in pair.iterrows()}
         pair_map_pa = {(int(r['batter']), int(r['pitcher'])): float(r['pair_pa']) for _, r in pair.iterrows()}
         pair_map_rate = {(int(r['batter']), int(r['pitcher'])): float(r['pair_rate']) for _, r in pair.iterrows()}
+        pair_map_rel = {(int(r['batter']), int(r['pitcher'])): float(r['pair_reliability']) for _, r in pair.iterrows()}
     else:
         pair_map_hr = {}
         pair_map_pa = {}
         pair_map_rate = {}
+        pair_map_rel = {}
 
     park_map_hr = {}
     park_map_pa = {}
@@ -6878,10 +7219,22 @@ def build_matchup_history_features(statcast_df, rows_df, lookback_days=365):
             park_hr=('is_hr', 'sum'),
         )
         if not park.empty:
-            park['park_rate'] = (park['park_hr'] + 1.0) / (park['park_pa'] + 40.0)
+            park_prior = float(np.clip(_env_float('PARK_RATE_PRIOR', 0.033), 0.005, 0.20))
+            park_min_pa = max(15.0, float(_env_float('PARK_RELIABILITY_MIN_PA', 100.0)))
+            park['park_rate_raw'] = park['park_hr'] / park['park_pa'].clip(lower=1)
+            park['park_reliability'] = (park['park_pa'] / park_min_pa).clip(lower=0.0, upper=1.0)
+            park['park_rate'] = (
+                (park['park_rate_raw'] * park['park_reliability'])
+                + (park_prior * (1.0 - park['park_reliability']))
+            )
             park_map_hr = {(int(r['batter']), str(r['home_team'])): float(r['park_hr']) for _, r in park.iterrows()}
             park_map_pa = {(int(r['batter']), str(r['home_team'])): float(r['park_pa']) for _, r in park.iterrows()}
             park_map_rate = {(int(r['batter']), str(r['home_team'])): float(r['park_rate']) for _, r in park.iterrows()}
+            park_map_rel = {(int(r['batter']), str(r['home_team'])): float(r['park_reliability']) for _, r in park.iterrows()}
+        else:
+            park_map_rel = {}
+    else:
+        park_map_rel = {}
 
     row_bat = pd.to_numeric(rows_df.get('batter', np.nan), errors='coerce')
     row_pit = pd.to_numeric(rows_df.get('pitcher', np.nan), errors='coerce')
@@ -6899,6 +7252,7 @@ def build_matchup_history_features(statcast_df, rows_df, lookback_days=365):
             out.at[idx, 'batter_vs_pitcher_hr_count'] = pair_map_hr.get(k, 0.0)
             out.at[idx, 'batter_vs_pitcher_pa_count'] = pair_map_pa.get(k, 0.0)
             out.at[idx, 'batter_vs_pitcher_hr_rate'] = pair_map_rate.get(k, 0.033)
+            out.at[idx, 'batter_vs_pitcher_reliability'] = pair_map_rel.get(k, 0.0)
 
         if b is not None:
             t = str(row_team.loc[idx])
@@ -6907,6 +7261,7 @@ def build_matchup_history_features(statcast_df, rows_df, lookback_days=365):
                 out.at[idx, 'batter_in_park_hr_count'] = park_map_hr.get(pk, 0.0)
                 out.at[idx, 'batter_in_park_pa_count'] = park_map_pa.get(pk, 0.0)
                 out.at[idx, 'batter_in_park_hr_rate'] = park_map_rate.get(pk, 0.033)
+                out.at[idx, 'batter_in_park_reliability'] = park_map_rel.get(pk, 0.0)
 
     return out
 
@@ -6986,15 +7341,24 @@ def build_recent_pitcher_damage_proxy(statcast_df, rows_df, lookback_days=45, mi
     if work.empty:
         return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
 
-    if 'launch_speed' in work.columns:
-        hard_hit = pd.to_numeric(work['launch_speed'], errors='coerce').fillna(0.0) >= 95.0
+    launch_speed = pd.to_numeric(work.get('launch_speed', 0.0), errors='coerce').fillna(0.0)
+    launch_angle = pd.to_numeric(work.get('launch_angle', 0.0), errors='coerce').fillna(0.0)
+    hard_hit = launch_speed >= 95.0
+    sweet_spot = launch_angle.between(8.0, 32.0)
+    is_barrel = (
+        (launch_speed >= 98)
+        & (launch_angle >= 26 - (launch_speed - 98))
+        & (launch_angle <= 30 + (launch_speed - 98))
+    )
+    # Quality-only by default: damaging contact is defined by process quality, not HR outcomes.
+    if _quality_only_statcast_mode_enabled():
+        damage = ((is_barrel.astype(int) * 2) + hard_hit.astype(int) + sweet_spot.astype(int) >= 2).astype(int)
     else:
-        hard_hit = pd.Series([False] * len(work), index=work.index)
-    if 'events' in work.columns:
-        is_hr = work['events'].astype(str).str.lower().eq('home_run')
-    else:
-        is_hr = pd.Series([False] * len(work), index=work.index)
-    damage = (hard_hit.astype(int) + is_hr.astype(int)).clip(0, 1)
+        if 'events' in work.columns:
+            is_hr = work['events'].astype(str).str.lower().eq('home_run')
+        else:
+            is_hr = pd.Series([False] * len(work), index=work.index)
+        damage = (hard_hit.astype(int) + is_hr.astype(int)).clip(0, 1)
     work['damage_flag'] = damage
 
     pit_summary = work.groupby('pitcher', as_index=False).agg(
@@ -7022,6 +7386,174 @@ def build_recent_pitcher_damage_proxy(statcast_df, rows_df, lookback_days=45, mi
         return float(np.clip(match['recent_damage_rate'].iloc[0], 0.0, 1.0))
 
     return rows_df.apply(_score_for_row, axis=1).astype(float)
+
+
+def build_pitch_type_quality_matchup_features(
+    statcast_df,
+    rows_df,
+    lookback_days=60,
+    pitcher_min_sample=30,
+    batter_min_sample=12,
+    usage_floor=0.12,
+):
+    """Build matchup features from pitch usage and pitch-specific quality damage.
+
+    Output columns:
+    - pitcher_primary_pitch_usage_pct
+    - pitcher_primary_pitch_barrel_allowed_pct
+    - pitcher_primary_pitch_hard_hit_allowed_pct
+    - pitcher_primary_pitch_sweet_spot_allowed_pct
+    - batter_vs_primary_pitch_barrel_pct
+    - batter_vs_primary_pitch_hard_hit_pct
+    - batter_vs_primary_pitch_sweet_spot_pct
+    - pitch_quality_matchup_edge
+    """
+    if rows_df is None or getattr(rows_df, 'empty', True):
+        return pd.DataFrame(index=getattr(rows_df, 'index', pd.RangeIndex(0)))
+
+    out = pd.DataFrame(index=rows_df.index)
+    defaults = {
+        'pitcher_primary_pitch_usage_pct': 0.0,
+        'pitcher_primary_pitch_barrel_allowed_pct': 7.0,
+        'pitcher_primary_pitch_hard_hit_allowed_pct': 35.0,
+        'pitcher_primary_pitch_sweet_spot_allowed_pct': 33.0,
+        'batter_vs_primary_pitch_barrel_pct': 7.0,
+        'batter_vs_primary_pitch_hard_hit_pct': 35.0,
+        'batter_vs_primary_pitch_sweet_spot_pct': 33.0,
+        'pitch_quality_matchup_edge': 0.0,
+    }
+    for col, val in defaults.items():
+        out[col] = float(val)
+
+    if statcast_df is None or getattr(statcast_df, 'empty', True):
+        return out
+    needed = {'pitcher', 'batter', 'pitch_type'}
+    if not needed.issubset(set(statcast_df.columns)):
+        return out
+
+    work = statcast_df.copy()
+    try:
+        if 'game_date' in work.columns:
+            work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+            cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=max(21, int(lookback_days)))
+            work = work[work['game_date'] >= cutoff]
+    except Exception:
+        pass
+
+    if work.empty:
+        return out
+
+    work['pitcher'] = pd.to_numeric(work['pitcher'], errors='coerce')
+    work['batter'] = pd.to_numeric(work['batter'], errors='coerce')
+    work['pitch_type'] = work['pitch_type'].astype(str)
+    work = work.dropna(subset=['pitcher', 'batter', 'pitch_type']).copy()
+    if work.empty:
+        return out
+
+    launch_speed = pd.to_numeric(work.get('launch_speed', 0.0), errors='coerce').fillna(0.0)
+    launch_angle = pd.to_numeric(work.get('launch_angle', 0.0), errors='coerce').fillna(0.0)
+    work['is_hard_hit'] = (launch_speed >= 95.0).astype(int)
+    work['is_sweet_spot'] = launch_angle.between(8.0, 32.0).astype(int)
+    work['is_barrel'] = (
+        (launch_speed >= 98)
+        & (launch_angle >= 26 - (launch_speed - 98))
+        & (launch_angle <= 30 + (launch_speed - 98))
+    ).astype(int)
+
+    pitch_summary = work.groupby(['pitcher', 'pitch_type'], as_index=False).agg(
+        sample_size=('pitch_type', 'count'),
+        barrel_allowed=('is_barrel', 'mean'),
+        hard_hit_allowed=('is_hard_hit', 'mean'),
+        sweet_spot_allowed=('is_sweet_spot', 'mean'),
+    )
+    if pitch_summary.empty:
+        return out
+
+    pitch_summary['pitcher_total'] = pitch_summary.groupby('pitcher')['sample_size'].transform('sum')
+    pitch_summary['usage_rate'] = pitch_summary['sample_size'] / pitch_summary['pitcher_total'].clip(lower=1)
+    pitch_summary = pitch_summary[pitch_summary['sample_size'] >= max(5, int(pitcher_min_sample))].copy()
+    if pitch_summary.empty:
+        return out
+
+    pitch_summary = pitch_summary.sort_values(['pitcher', 'sample_size'], ascending=[True, False])
+    primary = pitch_summary.groupby('pitcher', as_index=False).head(1).copy()
+
+    batter_pitch = work.groupby(['batter', 'pitch_type'], as_index=False).agg(
+        batter_pitch_n=('pitch_type', 'count'),
+        batter_barrel=('is_barrel', 'mean'),
+        batter_hard_hit=('is_hard_hit', 'mean'),
+        batter_sweet_spot=('is_sweet_spot', 'mean'),
+    )
+    if batter_pitch.empty:
+        return out
+
+    min_n = max(3, int(batter_min_sample))
+    batter_pitch = batter_pitch[batter_pitch['batter_pitch_n'] >= min_n].copy()
+
+    primary_map = {
+        int(r['pitcher']): {
+            'pitch_type': str(r['pitch_type']),
+            'usage_rate': float(r['usage_rate']),
+            'barrel_allowed': float(r['barrel_allowed']),
+            'hard_hit_allowed': float(r['hard_hit_allowed']),
+            'sweet_spot_allowed': float(r['sweet_spot_allowed']),
+        }
+        for _, r in primary.iterrows()
+    }
+
+    batter_pitch_map = {
+        (int(r['batter']), str(r['pitch_type'])): {
+            'barrel': float(r['batter_barrel']),
+            'hard_hit': float(r['batter_hard_hit']),
+            'sweet_spot': float(r['batter_sweet_spot']),
+            'n': float(r['batter_pitch_n']),
+        }
+        for _, r in batter_pitch.iterrows()
+    }
+
+    row_bat = pd.to_numeric(rows_df.get('batter', np.nan), errors='coerce')
+    row_pit = pd.to_numeric(rows_df.get('pitcher', np.nan), errors='coerce')
+
+    for idx in rows_df.index:
+        if pd.isna(row_bat.loc[idx]) or pd.isna(row_pit.loc[idx]):
+            continue
+        batter_id = int(row_bat.loc[idx])
+        pitcher_id = int(row_pit.loc[idx])
+        p_info = primary_map.get(pitcher_id)
+        if not p_info:
+            continue
+
+        pitch_type = p_info['pitch_type']
+        usage = float(p_info['usage_rate'])
+        pit_barrel = float(p_info['barrel_allowed'])
+        pit_hh = float(p_info['hard_hit_allowed'])
+        pit_ss = float(p_info['sweet_spot_allowed'])
+        b_key = (batter_id, pitch_type)
+        b_info = batter_pitch_map.get(b_key)
+
+        bat_barrel = float(b_info['barrel']) if b_info else 0.07
+        bat_hh = float(b_info['hard_hit']) if b_info else 0.35
+        bat_ss = float(b_info['sweet_spot']) if b_info else 0.33
+
+        usage_signal = np.clip((usage - float(usage_floor)) / max(0.05, 0.60 - float(usage_floor)), 0.0, 1.0)
+        edge_raw = (
+            (bat_barrel - pit_barrel) * 1.6
+            + (bat_hh - pit_hh) * 0.9
+            + (bat_ss - pit_ss) * 0.8
+            + (usage_signal * 0.20)
+        )
+        edge = float(np.clip(edge_raw, -0.50, 0.50))
+
+        out.at[idx, 'pitcher_primary_pitch_usage_pct'] = usage * 100.0
+        out.at[idx, 'pitcher_primary_pitch_barrel_allowed_pct'] = pit_barrel * 100.0
+        out.at[idx, 'pitcher_primary_pitch_hard_hit_allowed_pct'] = pit_hh * 100.0
+        out.at[idx, 'pitcher_primary_pitch_sweet_spot_allowed_pct'] = pit_ss * 100.0
+        out.at[idx, 'batter_vs_primary_pitch_barrel_pct'] = bat_barrel * 100.0
+        out.at[idx, 'batter_vs_primary_pitch_hard_hit_pct'] = bat_hh * 100.0
+        out.at[idx, 'batter_vs_primary_pitch_sweet_spot_pct'] = bat_ss * 100.0
+        out.at[idx, 'pitch_quality_matchup_edge'] = edge
+
+    return out
 
 
 def build_batter_pitch_mix_matchup_feature(
@@ -7119,6 +7651,143 @@ def build_batter_pitch_mix_matchup_feature(
         return score
 
     return rows_df.apply(_score_for_row, axis=1).astype(float)
+
+
+def _get_ballpark_record_from_team_abbr(team_abbr):
+    """Resolve a ballpark record from team abbreviation using BALLPARK_DATA."""
+    team = str(team_abbr or '').upper().strip()
+    if not team or not isinstance(BALLPARK_DATA, dict) or not BALLPARK_DATA:
+        return None
+    for _, rec in BALLPARK_DATA.items():
+        if str(rec.get('team', '')).upper().strip() == team:
+            return rec
+    return None
+
+
+def build_spray_geometry_overlap_features(statcast_df, rows_df, lookback_days=120, min_fb_sample=12):
+    """Build spray-angle overlap features against park dimensions and wall heights."""
+    if rows_df is None or getattr(rows_df, 'empty', True):
+        return pd.DataFrame(index=getattr(rows_df, 'index', pd.RangeIndex(0)))
+
+    out = pd.DataFrame(index=rows_df.index)
+    defaults = {
+        'bat_pull_flyball_rate': 0.33,
+        'bat_center_flyball_rate': 0.34,
+        'bat_oppo_flyball_rate': 0.33,
+        'spray_park_overlap_multiplier': 1.0,
+    }
+    for col, val in defaults.items():
+        out[col] = float(val)
+
+    if statcast_df is None or getattr(statcast_df, 'empty', True):
+        return out
+
+    needed = {'batter', 'stand'}
+    if not needed.issubset(set(statcast_df.columns)):
+        return out
+
+    work = statcast_df.copy()
+    try:
+        if 'game_date' in work.columns:
+            work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+            cutoff = pd.Timestamp(datetime.today().date()) - pd.Timedelta(days=max(30, int(lookback_days)))
+            work = work[work['game_date'] >= cutoff]
+    except Exception:
+        pass
+
+    if work.empty:
+        return out
+
+    work['batter'] = pd.to_numeric(work['batter'], errors='coerce')
+    work['stand'] = work.get('stand', pd.Series(['R'] * len(work), index=work.index)).astype(str).str.upper().str.strip()
+    work['bb_type'] = work.get('bb_type', pd.Series([''] * len(work), index=work.index)).astype(str).str.lower().str.strip()
+    work['spray_angle'] = pd.to_numeric(work.get('spray_angle', np.nan), errors='coerce')
+    work = work.dropna(subset=['batter', 'spray_angle']).copy()
+    work = work[work['bb_type'].isin({'fly_ball', 'line_drive'})].copy()
+    if work.empty:
+        return out
+
+    # Handedness-aware spray bucket mapping.
+    is_pull = ((work['stand'] == 'R') & (work['spray_angle'] < -15)) | ((work['stand'] == 'L') & (work['spray_angle'] > 15))
+    is_oppo = ((work['stand'] == 'R') & (work['spray_angle'] > 15)) | ((work['stand'] == 'L') & (work['spray_angle'] < -15))
+    is_center = ~(is_pull | is_oppo)
+    work['is_pull'] = is_pull.astype(int)
+    work['is_center'] = is_center.astype(int)
+    work['is_oppo'] = is_oppo.astype(int)
+
+    spray = work.groupby('batter', as_index=False).agg(
+        fb_sample=('is_pull', 'count'),
+        pull_rate=('is_pull', 'mean'),
+        center_rate=('is_center', 'mean'),
+        oppo_rate=('is_oppo', 'mean'),
+        stand_mode=('stand', lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else 'R'),
+    )
+    spray = spray[spray['fb_sample'] >= max(3, int(min_fb_sample))].copy()
+    if spray.empty:
+        return out
+
+    spray_map = {
+        int(r['batter']): {
+            'pull': float(r['pull_rate']),
+            'center': float(r['center_rate']),
+            'oppo': float(r['oppo_rate']),
+            'stand': str(r['stand_mode']),
+        }
+        for _, r in spray.iterrows()
+    }
+
+    rb = pd.to_numeric(rows_df.get('batter', np.nan), errors='coerce')
+    rteam = rows_df.get('home_team', pd.Series([''] * len(rows_df), index=rows_df.index)).astype(str).str.upper().str.strip()
+    rstand = rows_df.get('batter_hand', rows_df.get('stand', pd.Series(['R'] * len(rows_df), index=rows_df.index)))
+    rstand = rstand.astype(str).str.upper().str.strip()
+
+    for idx in rows_df.index:
+        if pd.isna(rb.loc[idx]):
+            continue
+        batter_id = int(rb.loc[idx])
+        info = spray_map.get(batter_id)
+        if not info:
+            continue
+
+        stand = rstand.loc[idx] if rstand.loc[idx] in {'L', 'R'} else info.get('stand', 'R')
+        park = _get_ballpark_record_from_team_abbr(rteam.loc[idx])
+        if not park:
+            out.at[idx, 'bat_pull_flyball_rate'] = info['pull']
+            out.at[idx, 'bat_center_flyball_rate'] = info['center']
+            out.at[idx, 'bat_oppo_flyball_rate'] = info['oppo']
+            continue
+
+        rf = float(pd.to_numeric(park.get('rf_porch', 330), errors='coerce'))
+        lf = float(pd.to_numeric(park.get('lf_wall', 330), errors='coerce'))
+        cf = float(pd.to_numeric(park.get('cf_distance', 400), errors='coerce'))
+        rf_h = float(pd.to_numeric(park.get('rf_wall_height', 8), errors='coerce'))
+        lf_h = float(pd.to_numeric(park.get('lf_wall_height', 8), errors='coerce'))
+        cf_h = float(pd.to_numeric(park.get('cf_wall_height', 8), errors='coerce'))
+
+        if stand == 'L':
+            pull_dist, pull_h = rf, rf_h
+            oppo_dist, oppo_h = lf, lf_h
+        else:
+            pull_dist, pull_h = lf, lf_h
+            oppo_dist, oppo_h = rf, rf_h
+
+        pull_geom = ((330.0 - pull_dist) / 120.0) + ((8.0 - pull_h) / 55.0)
+        center_geom = ((400.0 - cf) / 220.0) + ((8.0 - cf_h) / 65.0)
+        oppo_geom = ((330.0 - oppo_dist) / 120.0) + ((8.0 - oppo_h) / 55.0)
+
+        overlap_raw = (
+            info['pull'] * pull_geom * 0.70
+            + info['center'] * center_geom * 0.20
+            + info['oppo'] * oppo_geom * 0.10
+        )
+        overlap_mult = float(np.clip(1.0 + overlap_raw * 0.45, 0.86, 1.22))
+
+        out.at[idx, 'bat_pull_flyball_rate'] = info['pull']
+        out.at[idx, 'bat_center_flyball_rate'] = info['center']
+        out.at[idx, 'bat_oppo_flyball_rate'] = info['oppo']
+        out.at[idx, 'spray_park_overlap_multiplier'] = overlap_mult
+
+    return out
 
 
 def apply_park_adjustment(prob, batter_hand, home_team, away_team):
@@ -8519,6 +9188,7 @@ def build_matchup_weather_features(df):
         return pd.Series([default] * len(out), index=out.index, dtype=float)
 
     bat_barrel = _safe_num(out.get('bat_barrel_rate', 0.08), 0.08)
+    bat_sweet = _safe_num(out.get('bat_sweet_spot_rate', 0.33), 0.33)
     bat_ev = _safe_num(out.get('bat_avg_exit_velocity', 88.0), 88.0)
     bat_pull = _safe_num(out.get('bat_pull_rate', 0.38), 0.38)
     bat_launch = _safe_num(out.get('bat_avg_launch_angle', 12.0), 12.0)
@@ -8527,6 +9197,9 @@ def build_matchup_weather_features(df):
     pitch_days = _safe_num(out.get('pitch_days_since_last_start', 5.0), 5.0)
     pitch_hr_allowed = _safe_num(out.get('pitch_hr_allowed_rate', 0.04), 0.04)
     pitch_hr_fb_allowed = _safe_num(out.get('pitch_hr_fb_allowed_rate', 0.12), 0.12)
+    pitch_barrel_allowed = _safe_num(out.get('pitch_barrel_allowed_rate', 0.08), 0.08)
+    pitch_hh_allowed = _safe_num(out.get('pitch_hard_hit_allowed_rate', 0.35), 0.35)
+    pitch_sweet_allowed = _safe_num(out.get('pitch_sweet_spot_allowed_rate', 0.33), 0.33)
     pitch_fb_allowed = _safe_num(out.get('pitch_fb_allowed_rate', 0.35), 0.35)
     temp = _safe_num(out.get('temp', 72.0), 72.0)
     apparent_temp = _safe_num(out.get('apparent_temp', temp), 72.0)
@@ -8539,27 +9212,39 @@ def build_matchup_weather_features(df):
     lineup_slot = _safe_num(out.get('batting_order_slot', 5.0), 5.0)
     release_flag = _safe_num(out.get('line_release_window_flag', 0.0), 0.0)
 
-    ppci = (
-        1.0
-        + ((bat_barrel - 0.08) / 0.08) * 0.20
-        + ((bat_ev - 88.0) / 12.0) * 0.16
-        + ((bat_hr_fb - 0.12) / 0.08) * 0.14
-        + ((pitch_hr_allowed - 0.04) / 0.03) * 0.18
-        + ((pitch_hr_fb_allowed - 0.12) / 0.08) * 0.12
-        + ((pitch_velo - 92.0) / 12.0) * 0.05
-    )
+    if _quality_only_statcast_mode_enabled():
+        ppci = (
+            1.0
+            + ((bat_barrel - 0.08) / 0.08) * 0.22
+            + ((bat_sweet - 0.33) / 0.20) * 0.18
+            + ((bat_ev - 88.0) / 12.0) * 0.16
+            + ((pitch_barrel_allowed - 0.08) / 0.08) * 0.22
+            + ((pitch_hh_allowed - 0.35) / 0.25) * 0.14
+            + ((pitch_sweet_allowed - 0.33) / 0.20) * 0.08
+        )
+    else:
+        ppci = (
+            1.0
+            + ((bat_barrel - 0.08) / 0.08) * 0.20
+            + ((bat_ev - 88.0) / 12.0) * 0.16
+            + ((bat_hr_fb - 0.12) / 0.08) * 0.14
+            + ((pitch_hr_allowed - 0.04) / 0.03) * 0.18
+            + ((pitch_hr_fb_allowed - 0.12) / 0.08) * 0.12
+            + ((pitch_velo - 92.0) / 12.0) * 0.05
+        )
     dynamic = (
         1.0
         + ((bat_pull - 0.38) / 0.20) * 0.08
         + ((bat_launch - 12.0) / 16.0) * 0.07
         + ((pitch_fb_allowed - 0.35) / 0.15) * 0.09
+        + ((pitch_sweet_allowed - 0.33) / 0.20) * 0.05
         + ((pitch_days - 5.0) / 7.0) * 0.04
     )
     arsenal = (
         1.0
         + ((bat_barrel - 0.08) / 0.08) * 0.11
         + ((bat_ev - 88.0) / 12.0) * 0.09
-        + ((pitch_hr_allowed - 0.04) / 0.03) * 0.10
+        + ((pitch_barrel_allowed - 0.08) / 0.08) * 0.10
         + ((pitch_velo - 92.0) / 10.0) * 0.04
     )
     micro = (
@@ -8592,10 +9277,10 @@ def build_matchup_weather_features(df):
     # Explicit upside signals inspired by professional hitter's-edge research.
     split_edge = np.clip((out.get('has_platoon_advantage', 0) * 0.18) + (out.get('platoon_advantage_multiplier', 1.0) - 1.0) * 0.35, 0.0, 1.0)
     flyball_target = np.clip(
-        ((pitch_hr_fb_allowed - 0.12) / 0.08) * 0.42
-        + ((pitch_fb_allowed - 0.35) / 0.15) * 0.24
-        + ((bat_hr_fb - 0.12) / 0.08) * 0.18
-        + ((bat_pull - 0.38) / 0.20) * 0.16,
+        ((pitch_fb_allowed - 0.35) / 0.15) * 0.30
+        + ((pitch_sweet_allowed - 0.33) / 0.20) * 0.26
+        + ((bat_sweet - 0.33) / 0.20) * 0.24
+        + ((bat_launch - 12.0) / 16.0) * 0.20,
         0.0,
         1.0,
     )
@@ -8749,9 +9434,14 @@ def apply_expert_signal_boosts(live_df, base_probs):
     platoon_mult = _series_or_default('platoon_advantage_multiplier', 1.0)
     barrel_rate = _series_or_default('bat_barrel_rate', 0.0)
     hard_hit_rate = _series_or_default('bat_hard_hit_rate', 0.0)
+    sweet_spot_rate = _series_or_default('bat_sweet_spot_rate', 0.33)
     exit_velo = _series_or_default('bat_avg_exit_velocity', 88.0)
     pitch_hr9 = _series_or_default('pitch_hr_per_9', 1.1)
     pitch_hr_allowed = _series_or_default('pitch_hr_allowed_rate', 0.04)
+    pitch_barrel_allowed = _series_or_default('pitch_barrel_allowed_rate', 0.08)
+    pitch_hard_hit_allowed = _series_or_default('pitch_hard_hit_allowed_rate', 0.35)
+    pitch_sweet_spot_allowed = _series_or_default('pitch_sweet_spot_allowed_rate', 0.33)
+    pitch_fb_allowed = _series_or_default('pitch_fb_allowed_rate', 0.35)
     park_factor = _series_or_default('park_factor', 100.0)
     temp = _series_or_default('temp', 72.0)
     wind_out = _series_or_default('wind_out_component', 0.0)
@@ -8769,16 +9459,32 @@ def apply_expert_signal_boosts(live_df, base_probs):
     contact_score = np.clip(
         ((barrel_rate - 0.08) / 0.10) * 0.45
         + ((hard_hit_rate - 0.35) / 0.25) * 0.35
-        + ((exit_velo - 88.0) / 12.0) * 0.20,
+        + ((sweet_spot_rate - 0.33) / 0.20) * 0.20
+        + ((exit_velo - 88.0) / 12.0) * 0.10,
         0.0,
         1.0,
     )
-    pitcher_score = np.clip(
-        ((pitch_hr9 - 1.1) / 1.2) * 0.55
-        + ((pitch_hr_allowed - 0.04) / 0.03) * 0.45,
-        0.0,
-        1.0,
-    )
+    if _quality_only_statcast_mode_enabled():
+        pitcher_score = np.clip(
+            ((pitch_barrel_allowed - 0.08) / 0.08) * 0.40
+            + ((pitch_hard_hit_allowed - 0.35) / 0.25) * 0.30
+            + ((pitch_sweet_spot_allowed - 0.33) / 0.20) * 0.18
+            + ((pitch_fb_allowed - 0.35) / 0.15) * 0.12,
+            0.0,
+            1.0,
+        )
+    else:
+        pitcher_score = np.clip(
+            ((pitch_hr9 - 1.1) / 1.2) * 0.55
+            + ((pitch_hr_allowed - 0.04) / 0.03) * 0.45,
+            0.0,
+            1.0,
+        )
+    pitch_physics_pressure = _series_or_default('pitch_physics_pressure_score', 0.5)
+    umpire_zone_bias = _series_or_default('umpire_zone_bias_multiplier', 1.0)
+    catcher_liability = _series_or_default('catcher_liability_multiplier', 1.0)
+    climate_micro_movement = _series_or_default('climate_micro_movement_multiplier', 1.0)
+
     park_weather_score = np.clip(
         ((park_factor - 100.0) / 20.0) * 0.35
         + ((temp - 72.0) / 18.0) * 0.25
@@ -8788,20 +9494,29 @@ def apply_expert_signal_boosts(live_df, base_probs):
         0.0,
         1.0,
     )
+    context_pressure_score = np.clip(
+        (pitch_physics_pressure * 0.30)
+        + ((umpire_zone_bias - 1.0) / 0.20 * 0.20)
+        + ((catcher_liability - 1.0) / 0.25 * 0.20)
+        + ((climate_micro_movement - 1.0) / 0.25 * 0.15),
+        0.0,
+        1.0,
+    )
     porch_score = np.clip((porch_bonus - 1.0) / 0.15, 0.0, 1.0)
 
     specific_day_upside_score = np.clip(
-        (platoon_score * 0.20)
-        + (contact_score * 0.18)
-        + (pitcher_score * 0.16)
-        + (park_weather_score * 0.12)
-        + (porch_score * 0.08)
-        + (elite_flag * 0.06)
-        + (split_adv * 0.14)
-        + (flyball_target * 0.12)
-        + (hot_streak * 0.10)
-        + (arsenal_vuln * 0.10)
-        + (game_total_ctx * 0.08),
+        (platoon_score * 0.18)
+        + (contact_score * 0.16)
+        + (pitcher_score * 0.14)
+        + (park_weather_score * 0.10)
+        + (porch_score * 0.06)
+        + (elite_flag * 0.05)
+        + (split_adv * 0.12)
+        + (flyball_target * 0.10)
+        + (hot_streak * 0.08)
+        + (arsenal_vuln * 0.08)
+        + (game_total_ctx * 0.07)
+        + (context_pressure_score * 0.16),
         0.0,
         1.0,
     )
@@ -8824,31 +9539,54 @@ def run_adversarial_debate_layer(live_df, rounds=5000):
 
     bat_barrel = pd.to_numeric(out.get('bat_barrel_rate', 0.0), errors='coerce').fillna(0.0)
     bat_hh = pd.to_numeric(out.get('bat_hard_hit_rate', 0.0), errors='coerce').fillna(0.0)
+    bat_sweet = pd.to_numeric(out.get('bat_sweet_spot_rate', 0.33), errors='coerce').fillna(0.33)
     park = pd.to_numeric(out.get('park_factor', 100.0), errors='coerce').fillna(100.0)
     temp = pd.to_numeric(out.get('temp', 72.0), errors='coerce').fillna(72.0)
     wind_out = pd.to_numeric(out.get('wind_out_component', 0.0), errors='coerce').fillna(0.0)
     pitch_hr9 = pd.to_numeric(out.get('pitch_hr_per_9', 1.1), errors='coerce').fillna(1.1)
     pitch_hr_allowed = pd.to_numeric(out.get('pitch_hr_allowed_rate', 0.04), errors='coerce').fillna(0.04)
+    pitch_barrel_allowed = pd.to_numeric(out.get('pitch_barrel_allowed_rate', 0.08), errors='coerce').fillna(0.08)
+    pitch_hh_allowed = pd.to_numeric(out.get('pitch_hard_hit_allowed_rate', 0.35), errors='coerce').fillna(0.35)
+    pitch_sweet_allowed = pd.to_numeric(out.get('pitch_sweet_spot_allowed_rate', 0.33), errors='coerce').fillna(0.33)
     umpire_impact = pd.to_numeric(out.get('umpire_strike_zone_impact', 1.0), errors='coerce').fillna(1.0)
     bullpen_home = pd.to_numeric(out.get('bullpen_quality_score_home', 50.0), errors='coerce').fillna(50.0)
     bullpen_away = pd.to_numeric(out.get('bullpen_quality_score_away', 50.0), errors='coerce').fillna(50.0)
     fear = pd.to_numeric(out.get('pitcher_fear_factor', 0.0), errors='coerce').fillna(0.0)
 
-    optimist = (
-        ((bat_barrel - 0.08) / 0.08) * 0.90
-        + ((bat_hh - 0.35) / 0.20) * 0.75
-        + ((park - 100.0) / 20.0) * 0.55
-        + ((temp - 72.0) / 18.0) * 0.25
-        + (wind_out / 10.0) * 0.30
-        + ((pitch_hr9 - 1.1) / 0.6) * 0.55
-    )
+    if _quality_only_statcast_mode_enabled():
+        optimist = (
+            ((bat_barrel - 0.08) / 0.08) * 0.85
+            + ((bat_hh - 0.35) / 0.20) * 0.65
+            + ((bat_sweet - 0.33) / 0.20) * 0.45
+            + ((park - 100.0) / 20.0) * 0.55
+            + ((temp - 72.0) / 18.0) * 0.25
+            + (wind_out / 10.0) * 0.30
+            + ((pitch_barrel_allowed - 0.08) / 0.08) * 0.45
+            + ((pitch_hh_allowed - 0.35) / 0.25) * 0.35
+        )
+        pessim = (
+            ((0.07 - pitch_barrel_allowed) / 0.04) * 0.55
+            + ((0.33 - pitch_sweet_allowed) / 0.15) * 0.40
+            + ((umpire_impact - 1.0) / 0.08) * 0.35
+            + (((bullpen_home + bullpen_away) / 2.0 - 50.0) / 20.0) * 0.30
+            + (fear * 1.10)
+        )
+    else:
+        optimist = (
+            ((bat_barrel - 0.08) / 0.08) * 0.90
+            + ((bat_hh - 0.35) / 0.20) * 0.75
+            + ((park - 100.0) / 20.0) * 0.55
+            + ((temp - 72.0) / 18.0) * 0.25
+            + (wind_out / 10.0) * 0.30
+            + ((pitch_hr9 - 1.1) / 0.6) * 0.55
+        )
 
-    pessim = (
-        ((0.05 - pitch_hr_allowed) / 0.03) * 0.65
-        + ((umpire_impact - 1.0) / 0.08) * 0.35
-        + (((bullpen_home + bullpen_away) / 2.0 - 50.0) / 20.0) * 0.30
-        + (fear * 1.10)
-    )
+        pessim = (
+            ((0.05 - pitch_hr_allowed) / 0.03) * 0.65
+            + ((umpire_impact - 1.0) / 0.08) * 0.35
+            + (((bullpen_home + bullpen_away) / 2.0 - 50.0) / 20.0) * 0.30
+            + (fear * 1.10)
+        )
 
     debate_logit = optimist - pessim
     p_opt = 1.0 / (1.0 + np.exp(-debate_logit))
@@ -9134,6 +9872,24 @@ def generate_daily_predictions():
         usage_floor=float(np.clip(_env_float('PREGAME_PITCH_MIX_USAGE_FLOOR', 0.12), 0.05, 0.4)),
         damage_threshold=float(np.clip(_env_float('PREGAME_PITCH_MIX_DAMAGE_THRESHOLD', 0.38), 0.15, 0.70)),
     )
+    _train_pitch_quality = build_pitch_type_quality_matchup_features(
+        statcast_df,
+        train_df[['batter', 'pitcher']],
+        lookback_days=max(30, _env_int('PREGAME_PITCH_MIX_LOOKBACK_DAYS', 60)),
+        pitcher_min_sample=max(10, _env_int('PREGAME_PITCH_MIX_MIN_SAMPLE', 30)),
+        batter_min_sample=max(6, _env_int('PREGAME_BATTER_PITCH_SAMPLE', 12)),
+        usage_floor=float(np.clip(_env_float('PREGAME_PITCH_MIX_USAGE_FLOOR', 0.12), 0.05, 0.4)),
+    )
+    for _pq_col in _train_pitch_quality.columns:
+        train_df[_pq_col] = _train_pitch_quality[_pq_col].values
+    _train_spray_overlap = build_spray_geometry_overlap_features(
+        statcast_df,
+        train_df[['batter', 'home_team', 'batter_hand']] if 'home_team' in train_df.columns else train_df[['batter']],
+        lookback_days=max(45, _env_int('SPRAY_GEOMETRY_LOOKBACK_DAYS', 120)),
+        min_fb_sample=max(6, _env_int('SPRAY_GEOMETRY_MIN_FB_SAMPLE', 12)),
+    )
+    for _sg_col in _train_spray_overlap.columns:
+        train_df[_sg_col] = _train_spray_overlap[_sg_col].values
     train_df['recent_batter_woba_proxy'] = build_recent_batter_woba_proxy(
         statcast_df,
         train_df[['batter', 'pitcher']],
@@ -9180,6 +9936,14 @@ def generate_daily_predictions():
         'roof_sealed': 0,
         'pitcher_fear_factor': 0.0,
         'is_elite_power_batter': 0,
+        'pitcher_primary_pitch_usage_pct': 0.0,
+        'pitcher_primary_pitch_barrel_allowed_pct': 7.0,
+        'pitcher_primary_pitch_hard_hit_allowed_pct': 35.0,
+        'pitcher_primary_pitch_sweet_spot_allowed_pct': 33.0,
+        'batter_vs_primary_pitch_barrel_pct': 7.0,
+        'batter_vs_primary_pitch_hard_hit_pct': 35.0,
+        'batter_vs_primary_pitch_sweet_spot_pct': 33.0,
+        'pitch_quality_matchup_edge': 0.0,
     }
     for col, default in professional_default_cols.items():
         if col not in train_df.columns:
@@ -9286,9 +10050,15 @@ def generate_daily_predictions():
         'split_advantage_score', 'flyball_pitcher_target_score', 'hot_streak_contact_score',
         'arsenal_vulnerability_score', 'game_total_context_score',
         'batter_pitch_mix_matchup_score', 'recent_batter_woba_proxy', 'recent_pitcher_damage_proxy',
+        'pitcher_primary_pitch_usage_pct', 'pitcher_primary_pitch_barrel_allowed_pct',
+        'pitcher_primary_pitch_hard_hit_allowed_pct', 'pitcher_primary_pitch_sweet_spot_allowed_pct',
+        'batter_vs_primary_pitch_barrel_pct', 'batter_vs_primary_pitch_hard_hit_pct',
+        'batter_vs_primary_pitch_sweet_spot_pct', 'pitch_quality_matchup_edge',
         'batter_hr_last_7d', 'batter_hr_last_14d', 'batter_hr_rate_7d', 'batter_hr_rate_14d',
         'batter_vs_pitcher_hr_count', 'batter_vs_pitcher_pa_count', 'batter_vs_pitcher_hr_rate',
+        'batter_vs_pitcher_reliability',
         'batter_in_park_hr_count', 'batter_in_park_pa_count', 'batter_in_park_hr_rate',
+        'batter_in_park_reliability',
         'bat_hr_rate_vs_rhp', 'bat_hr_rate_vs_lhp', 'bat_days_since_last_hr',
 
         # Professional features used in live scoring and calibration
@@ -9308,15 +10078,38 @@ def generate_daily_predictions():
     if simple_baseline_model not in {'lightgbm', 'xgboost'}:
         simple_baseline_model = 'lightgbm'
 
+    # Raw batter-vs-pitcher and batter-in-park counts/rates are extremely noisy in small samples.
+    # Keep them disabled by default and rely on pitch-mix/barrel/weather physics signals.
+    disable_h2h_raw = str(os.getenv('DISABLE_H2H_RAW_FEATURES', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if disable_h2h_raw:
+        h2h_raw_features = {
+            'batter_vs_pitcher_hr_count', 'batter_vs_pitcher_pa_count', 'batter_vs_pitcher_hr_rate',
+            'batter_in_park_hr_count', 'batter_in_park_pa_count', 'batter_in_park_hr_rate',
+        }
+        features_train = [f for f in features_train if f not in h2h_raw_features]
+        print("H2H raw features disabled; using reliability-aware matchup context only.")
+
+    if _quality_only_statcast_mode_enabled():
+        hr_outcome_features = {
+            'bat_hr_rate', 'bat_hr_fb_rate',
+            'pitch_hr_allowed_rate', 'pitch_hr_fb_allowed_rate', 'pitch_hr_per_9',
+            'pitch_15pa_hr_rate', 'pitch_30pa_hr_rate',
+            'batter_hr_last_7d', 'batter_hr_last_14d', 'batter_hr_rate_7d', 'batter_hr_rate_14d',
+            'bat_hr_rate_vs_rhp', 'bat_hr_rate_vs_lhp', 'bat_days_since_last_hr',
+        }
+        features_train = [f for f in features_train if f not in hr_outcome_features]
+        print("QUALITY_ONLY_STATCAST_MODE=true -> removed direct HR-count/rate features from training.")
+
     if simple_baseline_mode:
         # Keep only high-signal baseline features; fall back to nearest available proxy when needed.
         core_feature_aliases = [
             # Prioritize recent wOBA proxy so baseline mode always includes contact-quality run value.
-            ['recent_batter_woba_proxy', 'bat_xslg', 'bat_iso_proxy', 'bat_hr_rate'],
+            ['recent_batter_woba_proxy', 'bat_xslg', 'bat_iso_proxy', 'bat_sweet_spot_rate'],
+            ['bat_barrel_rate', 'bat_30pa_barrel_rate', 'bat_15pa_barrel_rate'],
             ['pitch_barrel_allowed_rate', 'pitch_30pa_barrel_allowed_rate', 'pitch_15pa_barrel_allowed_rate'],
+            ['pitch_quality_matchup_edge', 'batter_pitch_mix_matchup_score', 'split_advantage_score'],
             ['park_factor', 'ballpark_park_factor'],
             ['temp'],
-            ['has_platoon_advantage', 'platoon_advantage_multiplier', 'split_advantage_score'],
         ]
 
         resolved_features = []
@@ -9336,7 +10129,7 @@ def generate_daily_predictions():
 
         features_train = list(dict.fromkeys(resolved_features))
         print(
-            "SIMPLE_BASELINE_ENABLED=true -> using 5 core features: "
+            "SIMPLE_BASELINE_ENABLED=true -> using quality-first core features: "
             + ", ".join(features_train)
         )
     
@@ -9825,6 +10618,16 @@ def generate_daily_predictions():
         usage_floor=float(np.clip(_env_float('PREGAME_PITCH_MIX_USAGE_FLOOR', 0.12), 0.05, 0.4)),
         damage_threshold=float(np.clip(_env_float('PREGAME_PITCH_MIX_DAMAGE_THRESHOLD', 0.38), 0.15, 0.70)),
     )
+    _live_pitch_quality = build_pitch_type_quality_matchup_features(
+        statcast_df,
+        live[['batter', 'pitcher']],
+        lookback_days=max(30, _env_int('PREGAME_PITCH_MIX_LOOKBACK_DAYS', 60)),
+        pitcher_min_sample=max(10, _env_int('PREGAME_PITCH_MIX_MIN_SAMPLE', 30)),
+        batter_min_sample=max(6, _env_int('PREGAME_BATTER_PITCH_SAMPLE', 12)),
+        usage_floor=float(np.clip(_env_float('PREGAME_PITCH_MIX_USAGE_FLOOR', 0.12), 0.05, 0.4)),
+    )
+    for _pq_col in _live_pitch_quality.columns:
+        live[_pq_col] = _live_pitch_quality[_pq_col].values
     live['recent_batter_woba_proxy'] = build_recent_batter_woba_proxy(
         statcast_df,
         live[['batter', 'pitcher']],
@@ -9915,6 +10718,20 @@ def generate_daily_predictions():
     live['pitch_hr_per_9'] = live['pitch_hr_per_9'].fillna(1.10)
     live['wind_out_component'] = live['wind_out_component'].fillna(0.0)
     live['bat_pull_rate'] = live['bat_pull_rate'].fillna(0.38)
+    for _col, _default in [
+        ('pitcher_primary_pitch_usage_pct', 0.0),
+        ('pitcher_primary_pitch_barrel_allowed_pct', 7.0),
+        ('pitcher_primary_pitch_hard_hit_allowed_pct', 35.0),
+        ('pitcher_primary_pitch_sweet_spot_allowed_pct', 33.0),
+        ('batter_vs_primary_pitch_barrel_pct', 7.0),
+        ('batter_vs_primary_pitch_hard_hit_pct', 35.0),
+        ('batter_vs_primary_pitch_sweet_spot_pct', 33.0),
+        ('pitch_quality_matchup_edge', 0.0),
+    ]:
+        if _col in live.columns:
+            live[_col] = pd.to_numeric(live[_col], errors='coerce').fillna(_default)
+        else:
+            live[_col] = _default
     for _rh_col in ['batter_hr_last_7d', 'batter_hr_last_14d']:
         if _rh_col in live.columns:
             live[_rh_col] = live[_rh_col].fillna(0.0)
@@ -11291,10 +12108,18 @@ def generate_daily_predictions():
         'drag_multiplier': 1.0,
         'pitch_micro_matchup_score': 1.0,
         'pitch_arsenal_matchup_score': 1.0,
+        'pitch_physics_pressure_score': 0.5,
+        'pitch_vaa_pressure_score': 0.5,
+        'pitch_ssw_proxy': 0.0,
         'vaa_attack_angle_score': 1.0,
         'umpire_catcher_cascade': 1.0,
         'umpire_zone_drift_score': 1.0,
         'umpire_hotzone_overlap': 0.0,
+        'umpire_tight_zone_score': 0.5,
+        'umpire_zone_bias_multiplier': 1.0,
+        'catcher_liability_score': 0.0,
+        'catcher_liability_multiplier': 1.0,
+        'climate_micro_movement_multiplier': 1.0,
         'fatigue_index': 0.0,
         'circadian_disruption_index': 0.0,
         'visual_fatigue_modifier': 1.0,
@@ -11425,8 +12250,11 @@ def generate_daily_predictions():
                                     'release_window_sniper_signal', 'line_release_window_flag', 'nrfi_under_drag_score',
                                     'physics_hr_prob', 'physics_per_pa_hr_prob', 'density_altitude_ft',
                                     'air_density_kg_m3', 'drag_multiplier', 'pitch_micro_matchup_score',
-                                    'pitch_arsenal_matchup_score', 'vaa_attack_angle_score', 'umpire_catcher_cascade', 'umpire_zone_drift_score',
-                                    'umpire_hotzone_overlap', 'fatigue_index', 'circadian_disruption_index', 'visual_fatigue_modifier',
+                                    'pitch_arsenal_matchup_score', 'pitch_physics_pressure_score', 'pitch_vaa_pressure_score', 'pitch_ssw_proxy',
+                                    'vaa_attack_angle_score', 'umpire_catcher_cascade', 'umpire_zone_drift_score',
+                                    'umpire_hotzone_overlap', 'umpire_tight_zone_score', 'umpire_zone_bias_multiplier',
+                                    'catcher_liability_score', 'catcher_liability_multiplier', 'climate_micro_movement_multiplier',
+                                    'fatigue_index', 'circadian_disruption_index', 'visual_fatigue_modifier',
                                     'travel_distance_miles', 'rest_day_count',
                                     'ballistic_hr_proxy_prob', 'ballistic_carry_distance_ft',
                                     'ballistic_barrier_distance_ft', 'ballistic_carry_gap_ft', 'ballistic_multiplier',
@@ -11462,6 +12290,12 @@ def generate_daily_predictions():
     discord_radar_n = max(8, _env_int('DISCORD_RADAR_COUNT', 20))
     discord_window_1_hours = max(1, _env_int('DISCORD_WINDOW_1_HOURS', 2))
     discord_window_2_hours = max(discord_window_1_hours + 1, _env_int('DISCORD_WINDOW_2_HOURS', 6))
+    hard_budget_enabled = str(os.getenv('HARD_DAILY_PICK_BUDGET_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    hard_budget_total = max(5, _env_int('HARD_DAILY_PICK_BUDGET_TOTAL', 30))
+    precision_floor_enabled = str(os.getenv('HARD_PRECISION_FLOOR_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    hard_min_recent_precision = float(np.clip(_env_float('HARD_MIN_RECENT_PRECISION', 0.08), 0.01, 0.50))
+    hard_precision_floor_min_prob = float(np.clip(_env_float('HARD_PRECISION_FLOOR_MIN_PROB', 0.07), 0.02, 0.25))
+    hard_precision_floor_min_ev_pct = float(np.clip(_env_float('HARD_PRECISION_FLOOR_MIN_EV_PCT', 10.0), 0.0, 40.0))
     effective_top_prob_n = int(discord_top_prob_n)
     effective_top_ev_n = int(discord_top_ev_n)
     effective_radar_n = int(discord_radar_n)
@@ -11490,6 +12324,43 @@ def generate_daily_predictions():
             f"top_ev={effective_top_ev_n}/{discord_top_ev_n}, "
             f"radar={effective_radar_n}/{discord_radar_n}"
         )
+
+    precision_diag = {'applied': False, 'reason': 'disabled'}
+    if precision_floor_enabled:
+        precision_diag = resolve_recent_precision_snapshot(
+            days_lookback=max(7, _env_int('HARD_PRECISION_LOOKBACK_DAYS', 14)),
+            prob_threshold=max(0.05, effective_discord_min_prob),
+            min_files=max(2, _env_int('HARD_PRECISION_MIN_FILES', 4)),
+            min_rows=max(200, _env_int('HARD_PRECISION_MIN_ROWS', 600)),
+        )
+        if bool(precision_diag.get('applied')):
+            recent_precision = float(precision_diag.get('precision', 0.0))
+            if recent_precision < hard_min_recent_precision:
+                pressure = float(np.clip((hard_min_recent_precision - recent_precision) / max(0.01, hard_min_recent_precision), 0.0, 1.5))
+                effective_discord_min_prob = max(effective_discord_min_prob, hard_precision_floor_min_prob)
+                effective_discord_min_ev_pct = max(effective_discord_min_ev_pct, hard_precision_floor_min_ev_pct)
+                tighten_mult = float(np.clip(1.0 - (0.60 * pressure), 0.35, 1.0))
+                effective_top_prob_n = max(6, int(round(effective_top_prob_n * tighten_mult)))
+                effective_top_ev_n = max(2, int(round(effective_top_ev_n * tighten_mult)))
+                effective_radar_n = max(4, int(round(effective_radar_n * tighten_mult)))
+                if hard_budget_enabled:
+                    hard_budget_total = max(8, int(round(hard_budget_total * tighten_mult)))
+                print(
+                    "Hard precision floor triggered: "
+                    f"recent_precision={recent_precision:.3f} < floor={hard_min_recent_precision:.3f}; "
+                    f"min_prob={effective_discord_min_prob * 100:.2f}%, "
+                    f"min_ev={effective_discord_min_ev_pct:.1f}%, "
+                    f"tighten_mult={tighten_mult:.2f}"
+                )
+        else:
+            print(f"Hard precision floor diagnostics unavailable: {precision_diag.get('reason', 'unknown')}")
+
+    if hard_budget_enabled:
+        # Keep pre-selection caps aligned with strict daily ceiling.
+        effective_top_prob_n = min(effective_top_prob_n, hard_budget_total)
+        effective_top_ev_n = min(effective_top_ev_n, hard_budget_total)
+        effective_radar_n = min(effective_radar_n, hard_budget_total)
+
     print(f"Discord threshold resolved: {effective_discord_min_prob * 100:.1f}%")
 
     # Top probabilities for reporting/Discord delivery.
@@ -11586,6 +12457,41 @@ def generate_daily_predictions():
     top_prob = _annotate_time_windows(top_prob)
     radar = _annotate_time_windows(radar)
 
+    # Final integrity gate: only send batter/pitcher pairs that exist in today's live slate.
+    try:
+        valid_pair_keys = set()
+        if {'batter_name', 'pitcher_name'}.issubset(set(live.columns)):
+            valid_frame = live[['batter_name', 'pitcher_name']].dropna().copy()
+            valid_pair_keys = {
+                (str(r.get('batter_name', '')).strip(), str(r.get('pitcher_name', '')).strip())
+                for _, r in valid_frame.iterrows()
+            }
+
+        def _enforce_pair_integrity(df, label='discord'):
+            if df is None or df.empty or not valid_pair_keys:
+                return df
+            if not {'batter_name', 'pitcher_name'}.issubset(set(df.columns)):
+                return df
+
+            work = df.copy()
+            batter_vals = work['batter_name'].astype(str).str.strip()
+            pitcher_vals = work['pitcher_name'].astype(str).str.strip()
+            pair_ok = pd.Series(
+                [(b, p) in valid_pair_keys for b, p in zip(batter_vals, pitcher_vals)],
+                index=work.index,
+            )
+            pitcher_known = ~pitcher_vals.str.upper().isin({'', 'UNKNOWN', 'NAN', 'NONE', 'NULL'})
+            keep_mask = pair_ok & pitcher_known
+            dropped = int((~keep_mask).sum())
+            if dropped > 0:
+                print(f"Filtered {dropped} invalid batter/pitcher rows from {label} before Discord send.")
+            return work[keep_mask].reset_index(drop=True)
+
+        top_prob = _enforce_pair_integrity(top_prob, label='top_prob')
+        radar = _enforce_pair_integrity(radar, label='radar')
+    except Exception as _pair_integrity_exc:
+        print(f"Pair integrity validation skipped: {_pair_integrity_exc}")
+
     # Show largest movers caused by physics/context simulation.
     if 'physics_delta' in live.columns:
         movers = live[['batter_name', 'pitcher_name', 'physics_delta', 'base_model_prob', 'pred_hr_prob']].copy()
@@ -11677,9 +12583,31 @@ def generate_daily_predictions():
             ).reset_index(drop=True)
             top_ev = _select_balanced_pick_set(top_ev, mode='ev')
             top_ev = top_ev.head(effective_top_ev_n).reset_index(drop=True)
+            try:
+                top_ev = _enforce_pair_integrity(top_ev, label='top_ev')
+            except Exception:
+                pass
             print(f"\n✅ +EV PREMIUM PICKS (Expected Value > 0%):")
             print(top_ev.to_string(index=False))
     top_ev = _annotate_time_windows(top_ev)
+
+    if hard_budget_enabled:
+        total_out = int(len(top_prob) + len(top_ev) + len(radar))
+        if total_out > hard_budget_total:
+            remaining = int(hard_budget_total)
+            keep_prob = min(len(top_prob), remaining)
+            remaining -= keep_prob
+            keep_ev = min(len(top_ev), remaining)
+            remaining -= keep_ev
+            keep_radar = min(len(radar), remaining)
+
+            top_prob = top_prob.head(keep_prob).reset_index(drop=True)
+            top_ev = top_ev.head(keep_ev).reset_index(drop=True)
+            radar = radar.head(keep_radar).reset_index(drop=True)
+            print(
+                "Hard daily pick budget enforced: "
+                f"total={hard_budget_total} (top_prob={keep_prob}, top_ev={keep_ev}, radar={keep_radar})"
+            )
 
     print(f"\nMost Likely Homers (≥{effective_discord_min_prob*100:.0f}% confidence) - {len(top_prob)} candidates:")
     print(top_prob.to_string(index=False))
@@ -12031,12 +12959,45 @@ def generate_daily_predictions():
         if conservative_path.exists():
             cons = pd.read_csv(conservative_path)
             if not cons.empty:
-                cons_lines = [f"🛡️ **CONSERVATIVE BET-READY ({target_date}) — {len(cons)} picks**"]
-                for _, row in cons.head(8).iterrows():
+                # Keep only actionable conservative rows for Discord output.
+                cons['pred_hr_prob'] = pd.to_numeric(cons.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0)
+                cons['best_market_odds_american'] = pd.to_numeric(cons.get('best_market_odds_american', np.nan), errors='coerce')
+                cons['ev_percent'] = pd.to_numeric(cons.get('ev_percent', 0.0), errors='coerce').fillna(0.0)
+                cons['kelly_fraction'] = pd.to_numeric(cons.get('kelly_fraction', 0.0), errors='coerce').fillna(0.0)
+                cons['stake_usd'] = pd.to_numeric(cons.get('stake_usd', 0.0), errors='coerce').fillna(0.0)
+
+                cons_send = cons[
+                    cons['best_market_odds_american'].notna()
+                    & (cons['ev_percent'] > 0.0)
+                    & (cons['kelly_fraction'] > 0.0)
+                    & (cons['stake_usd'] > 0.0)
+                ].copy()
+                if 'valid_pair_keys' in locals() and valid_pair_keys and {'batter_name', 'pitcher_name'}.issubset(set(cons_send.columns)):
+                    cons_b = cons_send['batter_name'].astype(str).str.strip()
+                    cons_p = cons_send['pitcher_name'].astype(str).str.strip()
+                    cons_keep = pd.Series(
+                        [(b, p) in valid_pair_keys for b, p in zip(cons_b, cons_p)],
+                        index=cons_send.index,
+                    )
+                    cons_send = cons_send[cons_keep].copy()
+                cons_send = cons_send.sort_values(
+                    by=['ev_percent', 'pred_hr_prob', 'kelly_fraction'],
+                    ascending=[False, False, False]
+                ).head(8)
+
+                if not cons_send.empty:
+                    cons_lines = [f"🛡️ **CONSERVATIVE BET-READY ({target_date}) — {len(cons_send)} picks**"]
+                else:
+                    cons_lines = [
+                        f"🛡️ **CONSERVATIVE BET-READY ({target_date}) — 0 picks**",
+                        "No actionable conservative picks passed odds/EV/Kelly filters."
+                    ]
+
+                for _, row in cons_send.iterrows():
                     cons_lines.append(
                         f"- {row.get('batter_name','')} vs {row.get('pitcher_name','')}: "
                         f"prob={float(row.get('pred_hr_prob',0))*100:.1f}%, "
-                        f"odds={int(float(row.get('best_market_odds_american',0))) if pd.notna(row.get('best_market_odds_american')) else 'N/A'}, "
+                        f"odds={int(float(row.get('best_market_odds_american',0))):+d}, "
                         f"EV={float(row.get('ev_percent',0)):+.1f}%, "
                         f"Kelly={float(row.get('kelly_fraction',0)):.3f}, "
                         f"stake=${float(row.get('stake_usd',0)):.0f} [{row.get('game_time','')}]"
@@ -12057,9 +13018,11 @@ def monitor_odds_rlm():
     """Continuously watch all sportsbook lines for RLM and steam moves on today's top picks."""
     WEBHOOK_URL = os.getenv("DISCORD_MLB_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
     if not WEBHOOK_URL:
-        raise RuntimeError("DISCORD_MLB_WEBHOOK not set")
+        print("RLM monitor skipped: DISCORD_MLB_WEBHOOK/DISCORD_WEBHOOK_URL not set.")
+        return
     if not os.getenv('ODDS_API_KEY'):
-        raise RuntimeError("ODDS_API_KEY not set — required for RLM monitoring")
+        print("RLM monitor skipped: ODDS_API_KEY not set (required for current RLM mode).")
+        return
 
     today_str = datetime.today().strftime('%Y-%m-%d')
     if not _claim_rlm_monitor_pidfile(today_str):
@@ -12085,22 +13048,25 @@ def monitor_odds_rlm():
         if col in preds.columns:
             preds[col] = pd.to_numeric(preds[col], errors='coerce')
 
+    preds['batter_name'] = preds.get('batter_name', pd.Series([''] * len(preds), index=preds.index)).astype(str).str.strip()
+    preds = preds[preds['batter_name'].ne('')].copy()
+    preds['batter_name_norm'] = preds['batter_name'].apply(_normalize_player_name)
+
     watch_batters = preds.nlargest(15, 'pred_hr_prob')['batter_name'].dropna().astype(str).tolist()
-    model_prob_by_name = {
-        _normalize_player_name(r.get('batter_name')): float(pd.to_numeric(r.get('pred_hr_prob', 0.0), errors='coerce') or 0.0)
-        for _, r in preds.iterrows()
-        if str(r.get('batter_name', '')).strip()
-    }
-    kelly_by_name = {
-        _normalize_player_name(r.get('batter_name')): float(pd.to_numeric(r.get('kelly_fraction', 0.0), errors='coerce') or 0.0)
-        for _, r in preds.iterrows()
-        if str(r.get('batter_name', '')).strip()
-    }
-    game_time_by_name = {
-        _normalize_player_name(r.get('batter_name')): r.get('game_time', '')
-        for _, r in preds.iterrows()
-        if str(r.get('batter_name', '')).strip()
-    }
+
+    # Aggregate by normalized batter name to avoid nondeterministic overwrite when duplicate names exist.
+    agg = (
+        preds.sort_values(['pred_hr_prob', 'kelly_fraction'], ascending=[False, False])
+        .groupby('batter_name_norm', as_index=False)
+        .agg(
+            pred_hr_prob=('pred_hr_prob', 'max'),
+            kelly_fraction=('kelly_fraction', 'max'),
+            game_time=('game_time', 'first'),
+        )
+    )
+    model_prob_by_name = {str(r['batter_name_norm']): float(r['pred_hr_prob'] or 0.0) for _, r in agg.iterrows()}
+    kelly_by_name = {str(r['batter_name_norm']): float(r['kelly_fraction'] or 0.0) for _, r in agg.iterrows()}
+    game_time_by_name = {str(r['batter_name_norm']): r.get('game_time', '') for _, r in agg.iterrows()}
 
     min_alert_odds = _env_int('LIVE_EV_MIN_AMERICAN_ODDS', 300)
     max_alert_odds = max(min_alert_odds, _env_int('LIVE_EV_MAX_AMERICAN_ODDS', 2500))
@@ -12176,11 +13142,15 @@ def monitor_odds_rlm():
                 hit = normalized_current.get(norm)
                 if hit:
                     return hit[0], hit[1]
+                # Use cautious fuzzy fallback: if multiple candidates match, skip to avoid wrong-player mapping.
+                fuzzy_hits = []
                 for n, (orig_name, books) in normalized_current.items():
                     if not n:
                         continue
                     if norm in n or n in norm:
-                        return orig_name, books
+                        fuzzy_hits.append((orig_name, books))
+                if len(fuzzy_hits) == 1:
+                    return fuzzy_hits[0][0], fuzzy_hits[0][1]
                 return None, {}
 
             ev_candidates = []
@@ -12471,9 +13441,24 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
     if pred_file.exists():
         try:
             preds = pd.read_csv(pred_file)
-            match = preds[preds['batter_name'].str.lower().str.strip() == batter_name.lower().strip()]
+            preds['batter_name_norm'] = preds.get('batter_name', pd.Series([''] * len(preds), index=preds.index)).astype(str).str.lower().str.strip()
+            preds['pitcher_name_norm'] = preds.get('pitcher_name', pd.Series([''] * len(preds), index=preds.index)).astype(str).str.lower().str.strip()
+            match = preds[preds['batter_name_norm'] == str(batter_name or '').lower().strip()]
+
+            # Prefer same-game row when game_pk is available.
+            if not match.empty and 'game_pk' in match.columns and game_pk is not None:
+                same_game = match[pd.to_numeric(match.get('game_pk'), errors='coerce') == pd.to_numeric(game_pk, errors='coerce')]
+                if not same_game.empty:
+                    match = same_game
+
+            # Next preference: same listed pitcher name within the same batter rows.
+            if not match.empty and str(pitcher_name or '').strip():
+                same_pitcher = match[match['pitcher_name_norm'] == str(pitcher_name).lower().strip()]
+                if not same_pitcher.empty:
+                    match = same_pitcher
+
             if not match.empty:
-                row = match.iloc[0]
+                row = match.sort_values('pred_hr_prob', ascending=False).iloc[0]
                 model_prob = float(row['pred_hr_prob'])
                 batter_id = row.get('batter')
                 pitcher_id = row.get('pitcher')
@@ -12483,7 +13468,7 @@ def log_live_hr_feedback(batter_name, pitcher_name, game_pk, inning_half, num_in
 
                 preds_ranked = preds.sort_values('pred_hr_prob', ascending=False).reset_index(drop=True)
                 ranked_match = preds_ranked[
-                    preds_ranked['batter_name'].str.lower().str.strip() == batter_name.lower().strip()
+                    preds_ranked['batter_name'].astype(str).str.lower().str.strip() == str(batter_name or '').lower().strip()
                 ]
                 if not ranked_match.empty:
                     model_rank = int(ranked_match.index[0] + 1)
@@ -12587,29 +13572,107 @@ def _build_fallback_hr_event_id_from_statcast_row(row):
     return _build_fallback_hr_event_id(game_id, inning, half_inning, at_bat_idx, batter_id, pitcher_id)
 
 
+def _load_today_home_runs_from_mlb_pbp(date_str):
+    """Return today's HR events from MLB play-by-play as a backfill fallback."""
+    try:
+        target_dt = datetime.strptime(str(date_str), '%Y-%m-%d')
+    except Exception:
+        target_dt = datetime.today()
+
+    schedule_date = target_dt.strftime('%m/%d/%Y')
+    games = statsapi.schedule(date=schedule_date) or []
+    rows = []
+
+    for game in games:
+        game_id = game.get('game_pk') or game.get('game_id')
+        if not game_id:
+            continue
+
+        try:
+            pbp = statsapi.get('game', {'gamePk': game_id}) or {}
+            plays = pbp.get('liveData', {}).get('plays', {}).get('allPlays', []) or []
+        except Exception:
+            continue
+
+        away_name = str(game.get('away_name') or game.get('away') or 'Away')
+        home_name = str(game.get('home_name') or game.get('home') or 'Home')
+
+        for play in plays:
+            result = play.get('result', {}) or {}
+            about = play.get('about', {}) or {}
+            matchup = play.get('matchup', {}) or {}
+            event_name = str(result.get('event', '')).lower().strip()
+            event_type = str(result.get('eventType', '')).lower().strip()
+            event_desc = str(result.get('description', '')).lower()
+
+            is_hr = any([
+                event_name in ('home run', 'home_run', 'homerun', 'hr'),
+                event_type in ('home_run', 'home run', 'homerun', 'hr'),
+                'home run' in event_name,
+                'home run' in event_type,
+                'home run' in event_desc,
+                'solo home run' in event_desc,
+                '2-run home run' in event_desc,
+                '3-run home run' in event_desc,
+                'grand slam' in event_desc,
+            ])
+            if not is_hr:
+                continue
+
+            batter = (matchup.get('batter', {}) or {})
+            pitcher = (matchup.get('pitcher', {}) or {})
+            rows.append({
+                'game_pk': _safe_int(game_id),
+                'inning': _safe_int(about.get('inning')),
+                'inning_topbot': about.get('halfInning', ''),
+                'at_bat_number': _safe_int(about.get('atBatIndex')),
+                'atBatIndex': _safe_int(about.get('atBatIndex')),
+                'batter': _safe_int(batter.get('id')),
+                'batter_name': str(batter.get('fullName') or '').strip(),
+                'pitcher': _safe_int(pitcher.get('id')),
+                'pitcher_name': str(pitcher.get('fullName') or '').strip(),
+                'home_team': home_name,
+                'away_team': away_name,
+                'play_id': str(about.get('playId') or '').strip(),
+                'description': str(result.get('description') or '').strip(),
+            })
+
+    return pd.DataFrame(rows)
+
+
 def backfill_unprocessed_today_home_runs(processed_home_runs, webhook_url):
     """Reconcile today's Statcast HR feed against processed IDs and send any missed alerts."""
     today_str = datetime.today().strftime('%Y-%m-%d')
+    hr_rows = pd.DataFrame()
     try:
         sc = load_or_fetch_statcast(today_str)
     except Exception as e:
-        print(f"Live HR backfill skipped: {e}")
-        return 0
+        print(f"Statcast backfill source unavailable: {e}")
+        sc = pd.DataFrame()
 
-    if sc is None or sc.empty or 'events' not in sc.columns:
-        return 0
+    if sc is not None and not sc.empty and 'events' in sc.columns:
+        hr_rows = sc[sc['events'] == 'home_run'].copy()
+        if not hr_rows.empty:
+            print(f"Live HR backfill source: Statcast ({len(hr_rows)} HR rows)")
 
-    hr_rows = sc[sc['events'] == 'home_run'].copy()
     if hr_rows.empty:
-        return 0
+        hr_rows = _load_today_home_runs_from_mlb_pbp(today_str)
+        if not hr_rows.empty:
+            print(f"Live HR backfill source: MLB play-by-play fallback ({len(hr_rows)} HR rows)")
+        else:
+            return 0
 
     sent_count = 0
     hr_rows['fallback_event_id'] = hr_rows.apply(_build_fallback_hr_event_id_from_statcast_row, axis=1)
     hr_rows = hr_rows[hr_rows['fallback_event_id'].notna()].copy()
+    if 'play_id' not in hr_rows.columns:
+        hr_rows['play_id'] = ''
+    hr_rows = hr_rows.drop_duplicates(subset=['fallback_event_id'], keep='first').copy()
 
     for _, row in hr_rows.iterrows():
         fallback_event_id = str(row.get('fallback_event_id'))
-        if fallback_event_id in processed_home_runs:
+        play_id = str(row.get('play_id') or '').strip()
+        if fallback_event_id in processed_home_runs or (play_id and play_id in processed_home_runs):
             continue
 
         batter_name = row.get('batter_name') or row.get('player_name') or row.get('batter')
@@ -12633,7 +13696,7 @@ def backfill_unprocessed_today_home_runs(processed_home_runs, webhook_url):
         message_lines = [
             "🚨 **LIVE HOME RUN ALERT** 🚨",
             f"⏰ Time: {alert_ts}",
-            f"🏟️ *{row.get('home_team','Home')} @ {row.get('away_team','Away')}* ({inning_half} {num_inning})",
+            f"🏟️ *{row.get('away_team','Away')} @ {row.get('home_team','Home')}* ({inning_half} {num_inning})",
             "⚾ Backfill reconciliation caught a missed HR event",
         ]
         if batter_name:
@@ -12655,6 +13718,8 @@ def backfill_unprocessed_today_home_runs(processed_home_runs, webhook_url):
         sent = send_discord_webhook(content="\n".join(message_lines), webhook_url=webhook_url, async_send=False)
         if sent:
             processed_home_runs.add(fallback_event_id)
+            if play_id:
+                processed_home_runs.add(play_id)
             processed_home_runs.add(f"{game_id}:{row.get('inning')}:{_normalize_half_inning_label(inning_half)}:{row.get('at_bat_number') or row.get('atBatIndex') or ''}:{_safe_int(row.get('batter'))}:{_safe_int(row.get('pitcher'))}:HR")
             sent_count += 1
             print(f"✅ Backfill HR alert CONFIRMED for {batter_name} vs {pitcher_name} (play {fallback_event_id})")
