@@ -111,6 +111,70 @@ def _env_float(name, default):
     except Exception:
         return float(default)
 
+
+def _normalise_hand_value(value):
+    """Return a canonical handedness code for common MLB inputs."""
+    if pd.isna(value):
+        return None
+    hand = str(value).strip().upper()
+    if hand in {'L', 'R'}:
+        return hand
+    if hand in {'LEFT', 'LEFTY'}:
+        return 'L'
+    if hand in {'RIGHT', 'RIGHTY'}:
+        return 'R'
+    return None
+
+
+def _ensure_handedness_columns(df):
+    """Ensure batter/pitcher handedness columns exist and are normalized."""
+    if df is None:
+        return pd.DataFrame()
+
+    work = df.copy()
+    if 'batter_hand' not in work.columns:
+        work['batter_hand'] = work.get('stand', pd.Series(['R'] * len(work), index=work.index))
+    if 'pitcher_hand' not in work.columns:
+        work['pitcher_hand'] = work.get('p_throws', pd.Series(['R'] * len(work), index=work.index))
+
+    work['batter_hand'] = work['batter_hand'].apply(_normalise_hand_value).fillna('R')
+    work['pitcher_hand'] = work['pitcher_hand'].apply(_normalise_hand_value).fillna('R')
+
+    if 'stand' not in work.columns:
+        work['stand'] = work['batter_hand']
+    else:
+        work['stand'] = work.get('stand', pd.Series(['R'] * len(work), index=work.index)).apply(_normalise_hand_value).fillna(work['batter_hand'])
+
+    if 'p_throws' not in work.columns:
+        work['p_throws'] = work['pitcher_hand']
+    else:
+        work['p_throws'] = work.get('p_throws', pd.Series(['R'] * len(work), index=work.index)).apply(_normalise_hand_value).fillna(work['pitcher_hand'])
+
+    return work
+
+
+def _resolve_historical_season_window(today=None, env=None):
+    """Resolve the historical season window, defaulting to the current year for 2026 continuity."""
+    env = env or os.environ
+    today = today or datetime.today()
+    min_year = 2019
+    lookback_seasons = max(1, int(env.get('HIST_SEASONS_LOOKBACK', '2')))
+    current_year = int(getattr(today, 'year', datetime.today().year))
+
+    end_year_override = env.get('HIST_SEASONS_END_YEAR')
+    if end_year_override and str(end_year_override).strip():
+        end_year = max(min_year, int(float(end_year_override)))
+    else:
+        end_year = current_year
+
+    start_year_override = env.get('HIST_SEASONS_START_YEAR')
+    if start_year_override and str(start_year_override).strip():
+        start_year = max(min_year, int(float(start_year_override)))
+    else:
+        start_year = max(min_year, int(end_year - (lookback_seasons - 1)))
+
+    return start_year, end_year
+
 # =====================================================================
 # TIMEOUT WRAPPER FOR STATCAST API CALLS
 # =====================================================================
@@ -2485,6 +2549,193 @@ def load_or_fetch_statcast(date_str):
         return pd.DataFrame()
 
 
+def _iter_calendar_dates(start_date, end_date):
+    """Yield inclusive date values between two endpoints."""
+    cur = start_date
+    while cur <= end_date:
+        yield cur
+        cur += timedelta(days=1)
+
+
+def _historical_coverage_report_path(year):
+    return Path('data') / f'historical_coverage_{int(year)}.json'
+
+
+def _read_historical_coverage_report(year):
+    fp = _historical_coverage_report_path(year)
+    if not fp.exists():
+        return {}
+    try:
+        return json.loads(fp.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def _write_historical_coverage_report(year, payload):
+    fp = _historical_coverage_report_path(year)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fp.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def ensure_year_statcast_coverage(year=2026, force_refresh=False):
+    """Ensure day-level Statcast cache coverage exists for the full calendar year-to-date.
+
+    This makes production runs self-healing: missing dates are fetched automatically,
+    empty/no-game dates are marked, and a yearly parquet cache is refreshed.
+    """
+    year = int(year)
+    today = datetime.today().date()
+    year_start = datetime(year, 1, 1).date()
+    year_end = min(today, datetime(year, 12, 31).date())
+
+    if year_end < year_start:
+        report = {
+            'year': year,
+            'status': 'skipped',
+            'reason': 'year_out_of_range',
+            'verified_on': today.isoformat(),
+        }
+        _write_historical_coverage_report(year, report)
+        return report
+
+    existing = _read_historical_coverage_report(year)
+    if (
+        not force_refresh
+        and existing
+        and str(existing.get('verified_on', '')) == today.isoformat()
+        and str(existing.get('status', '')).lower() == 'complete'
+    ):
+        print(f"Historical {year} coverage already verified today.")
+        return existing
+
+    cache_dir = Path('cache')
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    hist_dir = Path('data') / 'historical'
+    hist_dir.mkdir(parents=True, exist_ok=True)
+
+    missing_dates = []
+    for day in _iter_calendar_dates(year_start, year_end):
+        date_str = day.strftime('%Y-%m-%d')
+        csv_path = cache_dir / f'statcast_{date_str}.csv'
+        nogame_path = cache_dir / f'statcast_{date_str}.nogame'
+        if (not csv_path.exists()) and (not nogame_path.exists()):
+            missing_dates.append(date_str)
+
+    fetched_days = 0
+    marked_nogame_days = 0
+    failed_dates = []
+    pending_recent_dates = []
+
+    if missing_dates:
+        print(
+            f"Historical {year} coverage: fetching {len(missing_dates)} missing day(s) "
+            f"from {year_start} through {year_end}..."
+        )
+
+    for date_str in missing_dates:
+        day_dt = datetime.strptime(date_str, '%Y-%m-%d').date()
+        df = load_or_fetch_statcast(date_str)
+        csv_path = cache_dir / f'statcast_{date_str}.csv'
+        nogame_path = cache_dir / f'statcast_{date_str}.nogame'
+
+        if df is not None and not df.empty and csv_path.exists():
+            fetched_days += 1
+            continue
+
+        # For historical days, persist a durable marker to avoid re-fetch loops.
+        if day_dt <= (today - timedelta(days=2)):
+            try:
+                nogame_path.write_text('no_data_or_no_game', encoding='utf-8')
+                marked_nogame_days += 1
+            except Exception:
+                failed_dates.append(date_str)
+        else:
+            # Very recent day can still be delayed by Statcast availability.
+            pending_recent_dates.append(date_str)
+
+    yearly_csv_files = sorted(cache_dir.glob(f'statcast_{year}-*.csv'))
+    parquet_path = hist_dir / f'statcast_{year}.parquet'
+    csv_fallback_path = hist_dir / f'statcast_{year}.csv'
+
+    rebuilt_rows = 0
+    if yearly_csv_files and (force_refresh or fetched_days > 0 or not parquet_path.exists()):
+        frames = []
+        for fp in yearly_csv_files:
+            try:
+                day_df = pd.read_csv(fp)
+                if day_df is not None and not day_df.empty:
+                    frames.append(day_df)
+            except Exception:
+                continue
+
+        if frames:
+            year_df = pd.concat(frames, ignore_index=True)
+            rebuilt_rows = int(len(year_df))
+
+            # Deduplicate common statcast keys when available.
+            dedup_keys = [k for k in ['game_pk', 'at_bat_number', 'pitch_number', 'batter', 'pitcher'] if k in year_df.columns]
+            if dedup_keys:
+                year_df = year_df.drop_duplicates(subset=dedup_keys, keep='last')
+
+            rebuilt_rows = int(len(year_df))
+            try:
+                year_df.to_parquet(parquet_path, index=False)
+            except Exception:
+                year_df.to_csv(csv_fallback_path, index=False)
+
+    total_days = (year_end - year_start).days + 1
+    csv_days = len(yearly_csv_files)
+    nogame_days = len(list(cache_dir.glob(f'statcast_{year}-*.nogame')))
+    covered_days = int(csv_days + nogame_days)
+
+    report = {
+        'year': year,
+        'status': 'complete' if len(failed_dates) == 0 else 'partial',
+        'verified_on': today.isoformat(),
+        'date_range': {'start': year_start.isoformat(), 'end': year_end.isoformat()},
+        'total_days_expected': int(total_days),
+        'covered_days': int(covered_days),
+        'csv_days': int(csv_days),
+        'nogame_days': int(nogame_days),
+        'missing_before_fetch': int(len(missing_dates)),
+        'fetched_days': int(fetched_days),
+        'marked_nogame_days': int(marked_nogame_days),
+        'failed_dates': failed_dates[:25],
+        'failed_count': int(len(failed_dates)),
+        'pending_recent_dates': pending_recent_dates[:25],
+        'pending_recent_count': int(len(pending_recent_dates)),
+        'yearly_cache_rows': int(rebuilt_rows),
+        'parquet_path': str(parquet_path),
+    }
+    _write_historical_coverage_report(year, report)
+
+    print(
+        f"Historical {year} coverage status: {report['status']} | "
+        f"covered={report['covered_days']}/{report['total_days_expected']} "
+        f"(csv={report['csv_days']}, nogame={report['nogame_days']}, "
+        f"failed={report['failed_count']}, pending_recent={report['pending_recent_count']})"
+    )
+    return report
+
+
+def run_production_prerun_checks(backfill_days=30, ensure_year=2026, force_history_refresh=False):
+    """Autonomous pre-run flow for production reliability."""
+    ensure_history = str(os.getenv('AUTO_ENSURE_YEAR_HISTORY', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if ensure_history:
+        ensure_year_statcast_coverage(year=ensure_year, force_refresh=bool(force_history_refresh))
+
+    backfill_enabled = str(os.getenv('AUTO_BACKFILL_PHYSICS', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if backfill_enabled:
+        backfill_physics_columns(days_lookback=max(1, int(backfill_days)))
+
+    self_check_enabled = str(os.getenv('AUTO_RUN_SELF_CHECK', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if self_check_enabled:
+        run_model_self_check(days_lookback=max(1, int(min(backfill_days, 30))))
+
+
 def calculate_probability_metrics(y_true, probs):
     """Evaluate probabilistic binary predictions using log-loss and Brier score."""
     labels = pd.to_numeric(pd.Series(y_true), errors='coerce').fillna(0).astype(int).to_numpy()
@@ -3834,8 +4085,11 @@ def run_systematic_ev_operation(backfill_days=90):
     print("\n" + "=" * 70)
     print("SYSTEMATIC +EV OPERATION")
     print("=" * 70)
-    backfill_physics_columns(days_lookback=max(1, int(backfill_days)))
-    run_model_self_check(days_lookback=max(1, int(min(backfill_days, 30))))
+    run_production_prerun_checks(
+        backfill_days=max(1, int(backfill_days)),
+        ensure_year=_env_int('AUTO_ENSURE_HISTORY_YEAR', 2026),
+        force_history_refresh=False,
+    )
     generate_daily_predictions()
     print_weekly_todo(days_lookback=7)
 
@@ -5574,12 +5828,16 @@ def load_historical_statcast_seasons(
 
     Path(hist_dir).mkdir(parents=True, exist_ok=True)
     today = datetime.today()
-    if end_year is None:
-        end_year = today.year - 1  # previous complete season
-    lookback_seasons = max(1, int(os.getenv('HIST_SEASONS_LOOKBACK', '2')))
-    if start_year is None:
-        start_year = max(min_year, int(os.getenv('HIST_SEASONS_START_YEAR', str(end_year - (lookback_seasons - 1)))))
+    if start_year is None or end_year is None:
+        start_year, end_year = _resolve_historical_season_window(today=today)
+        if start_year is None:
+            start_year = max(min_year, int(os.getenv('HIST_SEASONS_START_YEAR', str(end_year - 1))))
+        if end_year is None:
+            end_year = today.year
+    elif start_year is None:
+        start_year, _ = _resolve_historical_season_window(today=today)
     start_year = max(min_year, int(start_year))
+    end_year = max(start_year, int(end_year))
     hist_rows_per_year_cap = max(0, int(os.getenv('HIST_ROWS_PER_YEAR', '200000')))
 
     def _sanitize_for_concat(df_in):
@@ -9857,6 +10115,7 @@ def generate_daily_predictions():
     _drop_all = list(set(_b_drop + _p_drop))
     train_df = raw_pa.drop(columns=_drop_all, errors='ignore').merge(b_stats, on='batter', how='inner')
     train_df = train_df.merge(p_stats, on='pitcher', how='inner')
+    train_df = _ensure_handedness_columns(train_df)
     history_lookback_days = max(60, _env_int('MATCHUP_HISTORY_LOOKBACK_DAYS', 365))
     history_statcast_df = build_local_statcast_history_pool(statcast_df, days_back=history_lookback_days)
     if not history_statcast_df.empty:
@@ -15660,8 +15919,21 @@ def main():
     parser.add_argument("--audit-clv-date", type=str, help="Date for CLV audit, format YYYY-MM-DD")
     parser.add_argument("--audit-clv-days", type=int, default=30, help="Rolling lookback window in days for CLV audit trend stats")
     parser.add_argument("--backfill-days", type=int, default=30, help="Lookback window for self-check/backfill commands")
+    parser.add_argument("--skip-auto-history", action="store_true", help="Skip automatic year-history coverage checks before prediction generation")
+    parser.add_argument("--force-history-refresh", action="store_true", help="Force refresh of automatic year-history coverage checks")
+    parser.add_argument("--auto-history-year", type=int, default=2026, help="Year used for automatic history coverage checks")
 
     args = parser.parse_args()
+
+    auto_history_enabled = not bool(args.skip_auto_history)
+
+    def _maybe_run_prerun_checks():
+        if auto_history_enabled:
+            run_production_prerun_checks(
+                backfill_days=max(1, int(args.backfill_days)),
+                ensure_year=int(args.auto_history_year),
+                force_history_refresh=bool(args.force_history_refresh),
+            )
 
     if args.live:
         monitor_live_home_runs()
@@ -15722,6 +15994,7 @@ def main():
         return
 
     if args.bet_ready:
+        _maybe_run_prerun_checks()
         generate_daily_predictions()
         print_bet_ready_wagers()
         print_conservative_bet_ready_wagers()
@@ -15729,6 +16002,7 @@ def main():
         launch_live_monitor_background()
         return
 
+    _maybe_run_prerun_checks()
     generate_daily_predictions()
     print_conservative_bet_ready_wagers()
     print_single_straight_market_discrepancies()
