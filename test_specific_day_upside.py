@@ -6,7 +6,13 @@ import pandas as pd
 
 sys.path.insert(0, '.')
 
-from run_daily_predictions import apply_expert_signal_boosts, apply_professional_filter_stack
+from run_daily_predictions import (
+    _filter_current_slate_sgo_events,
+    _has_viable_lineup_fallback,
+    _is_feed_row_current,
+    apply_expert_signal_boosts,
+    apply_professional_filter_stack,
+)
 
 
 class SpecificDayUpsideTests(unittest.TestCase):
@@ -105,6 +111,51 @@ class SpecificDayUpsideTests(unittest.TestCase):
         self.assertEqual(out.loc[0, 'daily_filter_stage'], 'market')
         self.assertTrue(out.loc[1, 'professional_filter_pass'])
         self.assertEqual(out.loc[1, 'daily_filter_stage'], 'ready')
+
+    def test_professional_filter_stack_keeps_positive_numeric_signal_columns(self):
+        df = pd.DataFrame([
+            {
+                'is_in_lineup': 1,
+                'is_healthy': 1,
+                'market_available': 1,
+                'weather_ok': 1,
+                'park_ok': 1,
+                'has_platoon_advantage': 0,
+                'platoon_advantage_multiplier': 1.15,
+                'is_elite_power_batter': 0,
+                'bat_barrel_rate': 0.15,
+                'bat_hard_hit_rate': 0.48,
+                'bat_avg_exit_velocity': 94.5,
+            },
+        ])
+
+        out = apply_professional_filter_stack(df)
+
+        self.assertTrue(out.loc[0, 'professional_filter_pass'])
+        self.assertEqual(out.loc[0, 'daily_filter_stage'], 'ready')
+
+    def test_stale_external_rows_are_rejected_before_ingest(self):
+        now = pd.Timestamp('2026-08-11 12:00:00Z').to_pydatetime()
+        stale_events = [{
+            'event_id': 'old',
+            'commence_time': '2026-08-10T00:00:00Z',
+            'odds': {'batting_homeruns-JANE_DOE': {'sideID': 'over', 'byBookmaker': {'draftkings': 140}}},
+        }]
+        fresh_events = [{
+            'event_id': 'new',
+            'commence_time': '2026-08-11T18:00:00Z',
+            'odds': {'batting_homeruns-JANE_DOE': {'sideID': 'over', 'byBookmaker': {'draftkings': 140}}},
+        }]
+
+        self.assertFalse(_is_feed_row_current(stale_events[0]['commence_time'], max_age_hours=24, now=now))
+        self.assertTrue(_is_feed_row_current(fresh_events[0]['commence_time'], max_age_hours=24, now=now))
+        with self.assertRaises(RuntimeError):
+            _filter_current_slate_sgo_events(stale_events)
+        self.assertEqual(len(_filter_current_slate_sgo_events(fresh_events)), 1)
+
+    def test_partial_lineup_fallback_is_rejected_upstream(self):
+        self.assertFalse(_has_viable_lineup_fallback(['101', '102', '103'], min_players=5))
+        self.assertTrue(_has_viable_lineup_fallback(['101', '102', '103', '104', '105', '106'], min_players=5))
 
 
 if __name__ == '__main__':

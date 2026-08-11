@@ -4707,6 +4707,59 @@ def _parse_odds_event_commence_time(event_obj):
         return None
 
 
+def _coerce_datetime_or_none(value):
+    """Normalize a timestamp-like value into a timezone-aware UTC datetime if possible."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = text.replace('Z', '+00:00') if text.endswith('Z') else text
+    try:
+        return datetime.fromisoformat(cleaned)
+    except Exception:
+        try:
+            return datetime.strptime(cleaned, '%Y-%m-%d %H:%M:%S')
+        except Exception:
+            return None
+
+
+def _is_feed_row_current(value, *, max_age_hours=36, now=None):
+    """Reject stale or malformed external-feed rows while allowing current-slate near-future events."""
+    now_dt = now or datetime.now(timezone.utc)
+    parsed = _coerce_datetime_or_none(value)
+    if parsed is None:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age_hours = (parsed.astimezone(timezone.utc) - now_dt).total_seconds() / 3600.0
+    return abs(age_hours) <= max_age_hours
+
+
+def _has_viable_lineup_fallback(lineup_ids, *, min_players=5):
+    """Return True only when a fallback lineup has enough valid player IDs to be trustworthy."""
+    if not isinstance(lineup_ids, (list, tuple, set)):
+        return False
+    valid_ids = []
+    for raw in lineup_ids:
+        sid = str(raw or '').replace('ID', '').strip()
+        if not sid or not sid.isdigit():
+            continue
+        if int(sid) <= 0:
+            continue
+        valid_ids.append(sid)
+        if len(valid_ids) >= max(1, min_players):
+            break
+    return len(valid_ids) >= min_players
+
+
 def _filter_current_slate_sgo_events(events_payload):
     """Keep only current slate events from Sportsgameodds payload."""
     events_payload = list(events_payload or [])
@@ -5009,15 +5062,17 @@ def _fetch_hr_props_raw_from_sharpapi(api_key):
         # HR over props must be positive American odds (underdogs); negative = under/favorite side.
         if odds_i <= 0 or odds_i < 100 or odds_i > 15000:
             continue
-        # Date guard — reject stale props
+        # Date + freshness guard — reject stale or malformed props without a valid event timestamp.
         start_raw = row.get('event_start_time', '')
-        if start_raw:
+        if not _is_feed_row_current(start_raw, max_age_hours=48):
+            continue
+        ev_dt = _coerce_datetime_or_none(start_raw)
+        if ev_dt is not None:
             try:
-                ev_date = datetime.fromisoformat(start_raw.replace('Z', '+00:00')).date()
-                if ev_date not in allowed_dates:
+                if ev_dt.date() not in allowed_dates:
                     continue
             except Exception:
-                pass
+                continue
         out.setdefault(player, {})[book] = odds_i
 
     if out:
@@ -6849,13 +6904,17 @@ def get_today_matchups():
                 allow_roster_proxy_lineup = str(os.getenv('ALLOW_ROSTER_PROXY_LINEUP', 'false')).strip().lower() in {'1', 'true', 'yes'}
 
                 batting_order = team_info.get('battingOrder') or team_info.get('batters') or []
+                fallback_lineup_used = False
                 if not batting_order and get_game_lineups is not None:
                     fallback_lineups = get_game_lineups(game_id) or {}
                     side_key = f'{team_type}_players'
                     fallback_players = fallback_lineups.get(side_key, [])
-                    batting_order = [str(p.get('id', '')).replace('ID', '') for p in fallback_players if p.get('is_batter')][:9]
+                    fallback_ids = [str(p.get('id', '')).replace('ID', '') for p in fallback_players if p.get('is_batter')][:9]
+                    if _has_viable_lineup_fallback(fallback_ids, min_players=5):
+                        batting_order = fallback_ids
+                        fallback_lineup_used = True
                 if not batting_order:
-                    # Data-availability fail-safe: use available roster player IDs as emergency batting-order proxy.
+                    # Data-availability fail-safe: only allow a roster proxy when it is clearly non-empty.
                     if allow_roster_proxy_lineup:
                         team_players = team_info.get('players', {}) if isinstance(team_info, dict) else {}
                         if not team_players and raw_team_info:
@@ -6865,7 +6924,10 @@ def get_today_matchups():
                             sid = str(k).replace('ID', '').strip()
                             if sid.isdigit():
                                 roster_ids.append(sid)
-                        batting_order = roster_ids[:9]
+                        if _has_viable_lineup_fallback(roster_ids, min_players=5):
+                            batting_order = roster_ids[:9]
+                if not batting_order or (fallback_lineup_used and not _has_viable_lineup_fallback(batting_order, min_players=5)):
+                    continue
 
                 seen_batters = set()
                 for order_idx, batter_id in enumerate(batting_order):
@@ -8941,8 +9003,22 @@ def apply_professional_filter_stack(df):
         if col not in out.columns:
             ser = pd.Series([default] * len(out), index=out.index)
         else:
-            ser = pd.to_numeric(out[col], errors='coerce').fillna(1 if default else 0).astype(int)
-        return ser.astype(bool)
+            ser = out[col]
+
+        def _convert(value):
+            if pd.isna(value):
+                return bool(default)
+            if isinstance(value, (bool, np.bool_)):
+                return bool(value)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return bool(str(value).strip())
+            if np.isfinite(numeric):
+                return numeric > 0.0
+            return bool(default)
+
+        return ser.map(_convert).astype(bool)
 
     market_ok = _as_bool_series('market_available', True)
     availability_ok = _as_bool_series('is_in_lineup', True) & _as_bool_series('is_healthy', True)
