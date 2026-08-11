@@ -8917,6 +8917,55 @@ def _finalize_discord_radar_frame(rankings_df):
     return work
 
 
+def apply_professional_filter_stack(df):
+    """Apply the professional daily filter stack in a bias-safe order.
+
+    Order is intentionally strict and staged:
+    1) market + availability gates
+    2) environmental checks
+    3) matchup and split checks
+    4) core power / elite hitter checks
+    5) rows that pass all stages are marked ready for expensive modeling and EV math.
+    """
+    if df is None:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if out.empty:
+        return out
+
+    out['professional_filter_pass'] = False
+    out['daily_filter_stage'] = 'blocked'
+
+    def _as_bool_series(col, default=True):
+        if col not in out.columns:
+            ser = pd.Series([default] * len(out), index=out.index)
+        else:
+            ser = pd.to_numeric(out[col], errors='coerce').fillna(1 if default else 0).astype(int)
+        return ser.astype(bool)
+
+    market_ok = _as_bool_series('market_available', True)
+    availability_ok = _as_bool_series('is_in_lineup', True) & _as_bool_series('is_healthy', True)
+    env_ok = _as_bool_series('weather_ok', True) & _as_bool_series('park_ok', True)
+    matchup_ok = _as_bool_series('has_platoon_advantage', True) | _as_bool_series('platoon_advantage_multiplier', True)
+    power_ok = _as_bool_series('is_elite_power_batter', True) | _as_bool_series('bat_barrel_rate', True)
+
+    # Use market + availability as the first gate because it prevents wasting compute on dead cards
+    # before expensive weather, matchup, and power models run.
+    failed_stage = pd.Series('ready', index=out.index)
+    failed_stage[~market_ok] = 'market'
+    failed_stage[(~market_ok) & (~availability_ok)] = 'market'
+    failed_stage[(market_ok & ~availability_ok)] = 'market'
+    failed_stage[(market_ok & availability_ok & ~env_ok)] = 'environment'
+    failed_stage[(market_ok & availability_ok & env_ok & ~matchup_ok)] = 'matchup'
+    failed_stage[(market_ok & availability_ok & env_ok & matchup_ok & ~power_ok)] = 'power'
+
+    ready = market_ok & availability_ok & env_ok & matchup_ok & power_ok
+    out['professional_filter_pass'] = ready.astype(bool)
+    out['daily_filter_stage'] = np.where(ready, 'ready', failed_stage)
+    return out
+
+
 def _select_thresholded_candidates(rankings_df, min_prob, max_rows):
     """Return only rows that meet the requested probability threshold."""
     if rankings_df is None or rankings_df.empty:
@@ -13037,6 +13086,12 @@ def generate_daily_predictions():
                                     'sidecar_training_applied', 'sidecar_training_update_count',
                                     'confidence_lower_95pct', 'confidence_upper_95pct', 'model_reliability', 'batter_consistency_score',
                                     'model_name', 'prediction_timestamp']])
+
+    # Professional daily filter stack: market + availability first, then environment,
+    # then matchup, then power. This prevents wasting compute and reduces look-ahead bias.
+    if any(col in live.columns for col in ['market_available', 'is_in_lineup', 'is_healthy', 'weather_ok', 'park_ok', 'has_platoon_advantage', 'is_elite_power_batter']):
+        live = apply_professional_filter_stack(live)
+        live = live[live.get('professional_filter_pass', True)].copy()
 
     # Sort and present elite values
     rankings = _prepare_discord_rankings(

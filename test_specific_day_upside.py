@@ -6,7 +6,7 @@ import pandas as pd
 
 sys.path.insert(0, '.')
 
-from run_daily_predictions import apply_expert_signal_boosts
+from run_daily_predictions import apply_expert_signal_boosts, apply_professional_filter_stack
 
 
 class SpecificDayUpsideTests(unittest.TestCase):
@@ -62,6 +62,49 @@ class SpecificDayUpsideTests(unittest.TestCase):
         self.assertGreater(adjusted[1], adjusted[0])
         self.assertGreater(df.loc[1, 'specific_day_upside_score'], df.loc[0, 'specific_day_upside_score'])
         self.assertGreater(df.loc[1, 'upside_boost_multiplier'], df.loc[0, 'upside_boost_multiplier'])
+
+    def test_professional_filter_stack_orders_market_environment_matchup_and_power(self):
+        df = pd.DataFrame([
+            {
+                'is_in_lineup': 0,
+                'is_healthy': 1,
+                'market_available': 1,
+                'weather_ok': 1,
+                'park_ok': 1,
+                'has_platoon_advantage': 1,
+                'pitch_arsenal_matchup_score': 0.90,
+                'bat_barrel_rate': 0.15,
+                'bat_hard_hit_rate': 0.50,
+                'bat_avg_exit_velocity': 96.0,
+                'is_elite_power_batter': 1,
+                'best_market_odds_american': -120,
+                'market_prob': 0.54,
+                'ev_percent': 12.5,
+            },
+            {
+                'is_in_lineup': 1,
+                'is_healthy': 1,
+                'market_available': 1,
+                'weather_ok': 1,
+                'park_ok': 1,
+                'has_platoon_advantage': 1,
+                'pitch_arsenal_matchup_score': 0.90,
+                'bat_barrel_rate': 0.15,
+                'bat_hard_hit_rate': 0.50,
+                'bat_avg_exit_velocity': 96.0,
+                'is_elite_power_batter': 1,
+                'best_market_odds_american': -120,
+                'market_prob': 0.54,
+                'ev_percent': 12.5,
+            },
+        ])
+
+        out = apply_professional_filter_stack(df)
+
+        self.assertFalse(out.loc[0, 'professional_filter_pass'])
+        self.assertEqual(out.loc[0, 'daily_filter_stage'], 'market')
+        self.assertTrue(out.loc[1, 'professional_filter_pass'])
+        self.assertEqual(out.loc[1, 'daily_filter_stage'], 'ready')
 
 
 if __name__ == '__main__':
