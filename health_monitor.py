@@ -292,28 +292,42 @@ def schedule_health_checks():
     
     # PowerShell script to create scheduled task
     ps_cmd = f"""
+$ErrorActionPreference = 'Stop'
 $TaskName = "MLB_HR_HealthMonitor"
-$TaskPath = "\\MLB_HR_Handicapper\\"
 
 # Check if task exists
-$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-
-if ($task) {{
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existing) {{
     Write-Host "Task already exists. Skipping..."
     exit 0
 }}
 
-# Create trigger: Every 4 hours, starting at 7 AM
-$trigger = New-ScheduledTaskTrigger -Daily -At 7:00am -RepetitionInterval (New-TimeSpan -Hours 4) -RepetitionDuration (New-TimeSpan -Days 999)
+# Create trigger: Repeat every 4 hours from 7 AM with a long duration.
+$trigger = New-ScheduledTaskTrigger -Once -At 7:00am -RepetitionInterval (New-TimeSpan -Hours 4) -RepetitionDuration (New-TimeSpan -Days 3650)
 
 # Create action: Run Python script
-$action = New-ScheduledTaskAction -Execute 'C:\\Users\\bobby\\AppData\\Local\\Programs\\Python\\Python314\\python.exe' -Argument '{script_path} --auto' -WorkingDirectory '{workspace_dir}'
+$action = New-ScheduledTaskAction -Execute '{sys.executable}' -Argument '{script_path} --auto' -WorkingDirectory '{workspace_dir}'
 
-# Create task with high priority
-$task = New-ScheduledTask -Action $action -Trigger $trigger -TaskName $TaskName -Description "MLB HR Model: Auto health monitoring and recovery" -RunLevel Highest
+# Register in root task folder for maximum compatibility.
+# First try elevated run level; fallback to current-user registration if denied.
+try {{
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Description "MLB HR Model: Auto health monitoring and recovery" -RunLevel Highest -Force | Out-Null
+}}
+catch {{
+    if ($_.Exception.Message -match 'Access is denied|0x80070005') {{
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Description "MLB HR Model: Auto health monitoring and recovery" -Force | Out-Null
+    }}
+    else {{
+        throw
+    }}
+}}
 
-# Register task
-Register-ScheduledTask -TaskPath $TaskPath -InputObject $task -Force
+# Verify task was actually created
+$verify = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $verify) {{
+    throw "Task registration returned success but task is missing"
+}}
+
 Write-Host "✅ Health monitor scheduled (every 4 hours starting 7 AM)"
 """
     

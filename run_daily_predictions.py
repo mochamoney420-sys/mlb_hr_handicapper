@@ -1706,6 +1706,115 @@ def _mark_morning_bet_alert_sent(date_str=None, payload=None):
         pass
 
 
+def _prediction_wave_state_path(date_str=None):
+    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    return _repo_data_dir() / f'discord_prediction_wave_sent_{date_str}.json'
+
+
+def _prediction_wave_policy():
+    """Return prediction-wave send policy.
+
+    Supported values:
+    - first_only (default): send one prediction wave per day
+    - material_change: send only when the pick signature changes
+    - always: no suppression
+    """
+    policy = str(os.getenv('DISCORD_PREDICTION_WAVE_POLICY', 'first_only')).strip().lower()
+    if policy not in {'first_only', 'material_change', 'always'}:
+        return 'first_only'
+    return policy
+
+
+def _load_prediction_wave_state(date_str=None):
+    path = _prediction_wave_state_path(date_str)
+    if not path.exists():
+        return None
+    try:
+        payload = _json.loads(path.read_text(encoding='utf-8'))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _build_prediction_wave_signature(top_prob, top_ev, radar, straight_discrepancies):
+    """Build a compact stable signature for prediction-wave content."""
+    def _rows_sig(df, limit):
+        if df is None or getattr(df, 'empty', True):
+            return []
+        cols = [
+            c for c in ['batter_name', 'pitcher_name', 'hr_probability', 'pred_hr_prob', 'market_prob', 'ev_pct', 'ev_percent']
+            if c in df.columns
+        ]
+        if not cols:
+            return []
+        work = df[cols].head(limit).copy()
+        rows = []
+        for _, row in work.iterrows():
+            rows.append({
+                'b': str(row.get('batter_name', '')).strip().lower(),
+                'p': str(row.get('pitcher_name', '')).strip().lower(),
+                'hp': round(float(pd.to_numeric(pd.Series([row.get('hr_probability', np.nan)]), errors='coerce').iloc[0] or 0.0), 4),
+                'pp': round(float(pd.to_numeric(pd.Series([row.get('pred_hr_prob', np.nan)]), errors='coerce').iloc[0] or 0.0), 4),
+                'mp': round(float(pd.to_numeric(pd.Series([row.get('market_prob', np.nan)]), errors='coerce').iloc[0] or 0.0), 4),
+                'ev': round(float(pd.to_numeric(pd.Series([row.get('ev_pct', row.get('ev_percent', np.nan))]), errors='coerce').iloc[0] or 0.0), 2),
+            })
+        return rows
+
+    payload = {
+        'counts': {
+            'top_prob': int(len(top_prob) if top_prob is not None else 0),
+            'top_ev': int(len(top_ev) if top_ev is not None else 0),
+            'radar': int(len(radar) if radar is not None else 0),
+            'discrepancies': int(len(straight_discrepancies) if straight_discrepancies is not None else 0),
+        },
+        'top_prob_rows': _rows_sig(top_prob, 25),
+        'top_ev_rows': _rows_sig(top_ev, 10),
+        'discrepancy_rows': _rows_sig(straight_discrepancies, 8),
+    }
+    raw = _json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest(), payload
+
+
+def _should_send_prediction_wave(date_str, signature_hash):
+    policy = _prediction_wave_policy()
+    if policy == 'always':
+        return True, 'policy_always'
+
+    state = _load_prediction_wave_state(date_str)
+    if not state:
+        return True, 'first_wave_today'
+
+    prior_hash = str(state.get('signature_hash', '') or '')
+    if policy == 'first_only':
+        return False, 'already_sent_today'
+
+    if policy == 'material_change':
+        if prior_hash and prior_hash != signature_hash:
+            return True, 'signature_changed'
+        return False, 'no_material_change'
+
+    return False, 'suppressed'
+
+
+def _mark_prediction_wave_sent(date_str, signature_hash, signature_payload=None, meta=None):
+    path = _prediction_wave_state_path(date_str)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = {
+        'sent': True,
+        'sent_at': datetime.now().isoformat(),
+        'policy': _prediction_wave_policy(),
+        'signature_hash': str(signature_hash or ''),
+    }
+    if isinstance(signature_payload, dict):
+        body['signature'] = signature_payload
+    if isinstance(meta, dict):
+        body.update(meta)
+    try:
+        path.write_text(_json.dumps(body, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
 def send_morning_bet_now_alert(live_df, date_str=None):
     """Send a once-per-day morning Discord alert with actionable pre-correction bets."""
     date_str = date_str or datetime.today().strftime('%Y-%m-%d')
@@ -3204,6 +3313,225 @@ def resolve_recent_precision_snapshot(
         return {'applied': False, 'reason': f'error:{exc}'}
 
 
+def _load_recent_evaluation_frame(days_lookback=21, min_files=3):
+    """Load recent evaluation rows used by adaptive threshold tuning."""
+    try:
+        cutoff = datetime.today() - timedelta(days=max(3, int(days_lookback)))
+        eval_files = []
+        for fp in sorted(Path('data').glob('evaluation_*.csv')):
+            try:
+                d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+                if d >= cutoff:
+                    eval_files.append(fp)
+            except Exception:
+                continue
+
+        if len(eval_files) < max(1, int(min_files)):
+            return pd.DataFrame(), {'applied': False, 'reason': 'insufficient_files', 'files': len(eval_files)}
+
+        frames = []
+        for fp in eval_files:
+            try:
+                ev = pd.read_csv(fp, usecols=['pred_hr_prob', 'actual_hr'])
+                if ev is not None and not ev.empty:
+                    frames.append(ev)
+            except Exception:
+                continue
+
+        if not frames:
+            return pd.DataFrame(), {'applied': False, 'reason': 'no_eval_rows'}
+
+        ev_all = pd.concat(frames, ignore_index=True)
+        ev_all['pred_hr_prob'] = pd.to_numeric(ev_all.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        ev_all['actual_hr'] = pd.to_numeric(ev_all.get('actual_hr', 0.0), errors='coerce').fillna(0.0).clip(0.0, 1.0)
+        return ev_all, {'applied': True, 'files': len(eval_files), 'rows': len(ev_all)}
+    except Exception as exc:
+        return pd.DataFrame(), {'applied': False, 'reason': f'error:{exc}'}
+
+
+def resolve_adaptive_prediction_threshold(
+    days_lookback=30,
+    min_files=5,
+    min_rows=400,
+    min_hr_rows=24,
+    recall_floor=0.45,
+    base_quantile=0.45,
+    min_threshold=0.03,
+    max_threshold=0.20,
+):
+    """Auto-tune a prediction threshold from recent outcomes with a recall floor.
+
+    This is intentionally separate from bankroll/risk controls. It is used for
+    model-reporting and signal interpretation, not bet-sizing governance.
+    """
+    ev_all, status = _load_recent_evaluation_frame(days_lookback=days_lookback, min_files=min_files)
+    if not status.get('applied'):
+        return {'applied': False, 'reason': status.get('reason', 'unavailable')}
+    if len(ev_all) < max(100, int(min_rows)):
+        return {'applied': False, 'reason': 'insufficient_rows', 'rows': int(len(ev_all))}
+
+    hr_probs = ev_all.loc[ev_all['actual_hr'] >= 0.5, 'pred_hr_prob'].dropna()
+    if len(hr_probs) < max(6, int(min_hr_rows)):
+        return {
+            'applied': False,
+            'reason': 'insufficient_hr_rows',
+            'hr_rows': int(len(hr_probs)),
+            'rows': int(len(ev_all)),
+        }
+
+    q = float(np.clip(base_quantile, 0.05, 0.95))
+    floor = float(np.clip(recall_floor, 0.10, 0.95))
+    candidate = float(hr_probs.quantile(q))
+    max_q_for_floor = float(np.clip(1.0 - floor, 0.05, 0.95))
+    floor_ceiling = float(hr_probs.quantile(max_q_for_floor))
+
+    threshold = min(candidate, floor_ceiling)
+    threshold = float(np.clip(threshold, min_threshold, max_threshold))
+    realized_recall = float((hr_probs >= threshold).mean()) if len(hr_probs) else 0.0
+
+    return {
+        'applied': True,
+        'threshold': threshold,
+        'files': int(status.get('files', 0)),
+        'rows': int(status.get('rows', len(ev_all))),
+        'hr_rows': int(len(hr_probs)),
+        'base_quantile': q,
+        'recall_floor': floor,
+        'realized_recall': realized_recall,
+    }
+
+
+def apply_recent_pitcher_ranking_calibration(
+    preds_df,
+    days_lookback=21,
+    min_files=4,
+    min_rows=700,
+    min_pitcher_rows=14,
+    shrink_k=22.0,
+    scale=1.10,
+    min_mult=0.88,
+    max_mult=1.12,
+):
+    """Calibrate ranking by pitcher-level residuals from recent evaluated outcomes.
+
+    Goal: improve slate ranking quality without large global threshold moves.
+    Uses bounded per-pitcher multipliers derived from recent residual error:
+      residual = mean(actual_hr - pred_hr_prob)
+    Positive residual => underestimation (apply uplift).
+    Negative residual => overestimation (apply downweight).
+    """
+    try:
+        if preds_df is None:
+            return preds_df, {'applied': False, 'reason': 'preds_none'}
+        work = preds_df.copy()
+        if work.empty:
+            return work, {'applied': False, 'reason': 'preds_empty'}
+        if 'pred_hr_prob' not in work.columns:
+            return work, {'applied': False, 'reason': 'missing_pred_hr_prob'}
+        if 'pitcher_name' not in work.columns:
+            return work, {'applied': False, 'reason': 'missing_pitcher_name'}
+
+        cutoff = datetime.today() - timedelta(days=max(3, int(days_lookback)))
+        eval_files = []
+        for fp in sorted(Path('data').glob('evaluation_*.csv')):
+            try:
+                d = datetime.strptime(fp.stem.replace('evaluation_', ''), '%Y-%m-%d')
+                if d >= cutoff:
+                    eval_files.append(fp)
+            except Exception:
+                continue
+
+        if len(eval_files) < max(1, int(min_files)):
+            return work, {'applied': False, 'reason': 'insufficient_files', 'files': len(eval_files)}
+
+        frames = []
+        for fp in eval_files:
+            try:
+                ev = pd.read_csv(fp)
+                if ev is None or ev.empty:
+                    continue
+                need = {'pitcher_name', 'pred_hr_prob', 'actual_hr'}
+                if not need.issubset(set(ev.columns)):
+                    continue
+                sub = ev[['pitcher_name', 'pred_hr_prob', 'actual_hr']].copy()
+                sub['pitcher_name'] = sub['pitcher_name'].astype(str)
+                sub['pred_hr_prob'] = pd.to_numeric(sub['pred_hr_prob'], errors='coerce').fillna(0.0).clip(0.0, 0.99)
+                sub['actual_hr'] = pd.to_numeric(sub['actual_hr'], errors='coerce').fillna(0.0).clip(0.0, 1.0)
+                frames.append(sub)
+            except Exception:
+                continue
+
+        if not frames:
+            return work, {'applied': False, 'reason': 'no_eval_rows'}
+
+        ev_all = pd.concat(frames, ignore_index=True)
+        if len(ev_all) < max(150, int(min_rows)):
+            return work, {'applied': False, 'reason': 'insufficient_rows', 'rows': int(len(ev_all))}
+
+        ev_all['pitcher_key'] = ev_all['pitcher_name'].map(_normalize_player_key)
+        by_pitcher = ev_all.groupby('pitcher_key', dropna=False).agg(
+            n=('actual_hr', 'size'),
+            actual_rate=('actual_hr', 'mean'),
+            pred_mean=('pred_hr_prob', 'mean'),
+        ).reset_index()
+        by_pitcher['residual'] = by_pitcher['actual_rate'] - by_pitcher['pred_mean']
+
+        stable = by_pitcher[by_pitcher['n'] >= max(3, int(min_pitcher_rows))].copy()
+        if stable.empty:
+            return work, {'applied': False, 'reason': 'no_stable_pitchers'}
+
+        # Shrink noisy groups toward zero residual so one-day spikes cannot dominate.
+        shrink = stable['n'] / (stable['n'] + float(max(1.0, shrink_k)))
+        stable['adj_residual'] = stable['residual'] * shrink
+        stable['multiplier'] = (1.0 + (stable['adj_residual'] * float(scale))).clip(
+            float(min_mult),
+            float(max_mult),
+        )
+
+        mult_map = {
+            str(r['pitcher_key']): float(r['multiplier'])
+            for _, r in stable.iterrows()
+            if str(r['pitcher_key'])
+        }
+        if not mult_map:
+            return work, {'applied': False, 'reason': 'empty_multiplier_map'}
+
+        work['pitcher_key'] = work['pitcher_name'].astype(str).map(_normalize_player_key)
+        base_prob = pd.to_numeric(work['pred_hr_prob'], errors='coerce').fillna(0.0).clip(0.0, 0.99)
+        cal_mult = work['pitcher_key'].map(lambda k: float(mult_map.get(str(k), 1.0))).fillna(1.0)
+        adjusted = base_prob * cal_mult
+
+        # Respect existing confidence ceilings after calibration.
+        row_cap = pd.Series([0.99] * len(work), index=work.index, dtype=float)
+        if 'reliability_prob_cap' in work.columns:
+            row_cap = np.minimum(row_cap, pd.to_numeric(work['reliability_prob_cap'], errors='coerce').fillna(0.99))
+        if 'hard_confidence_cap' in work.columns:
+            row_cap = np.minimum(row_cap, pd.to_numeric(work['hard_confidence_cap'], errors='coerce').fillna(0.99))
+
+        work['pred_hr_prob'] = np.minimum(adjusted, row_cap).clip(0.0, 0.99).round(6)
+        work['ranking_calibration_multiplier'] = cal_mult
+        work = work.drop(columns=['pitcher_key'], errors='ignore')
+
+        touched = int((np.abs(cal_mult - 1.0) > 1e-9).sum())
+        up_count = int((cal_mult > 1.0 + 1e-9).sum())
+        down_count = int((cal_mult < 1.0 - 1e-9).sum())
+
+        return work, {
+            'applied': True,
+            'files': int(len(eval_files)),
+            'rows': int(len(ev_all)),
+            'stable_pitchers': int(len(stable)),
+            'touched_rows': touched,
+            'up_rows': up_count,
+            'down_rows': down_count,
+            'mult_min': float(cal_mult.min()) if len(cal_mult) else 1.0,
+            'mult_max': float(cal_mult.max()) if len(cal_mult) else 1.0,
+            'mult_mean': float(cal_mult.mean()) if len(cal_mult) else 1.0,
+        }
+    except Exception as exc:
+        return preds_df, {'applied': False, 'reason': f'error:{exc}'}
+
+
 def _file_contains_text(path, needle):
     try:
         p = Path(path)
@@ -3244,6 +3572,10 @@ def run_model_self_check(days_lookback=30):
         try:
             file_date = _extract_date_from_prefixed_stem(f.stem, 'predictions_')
             if file_date is None:
+                continue
+            canonical_stem = f"predictions_{file_date.strftime('%Y-%m-%d')}"
+            # Skip derivative exports (e.g., preview/top-N files); only validate canonical daily predictions files.
+            if f.stem != canonical_stem:
                 continue
             if file_date < cutoff:
                 continue
@@ -5743,7 +6075,32 @@ def send_nightly_accuracy_summary(date_str=None, webhook_url=None, predicted_thr
     if marker.exists() and os.getenv('FORCE_NIGHTLY_ACCURACY_SUMMARY', 'false').lower() != 'true':
         return False
 
-    threshold = float(predicted_threshold if predicted_threshold is not None else _env_float('NIGHTLY_PREDICTED_THRESHOLD', 0.15))
+    adaptive_enabled = str(os.getenv('NIGHTLY_AUTO_PREDICTED_THRESHOLD_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    threshold_source = 'manual'
+    adaptive_diag = {'applied': False, 'reason': 'disabled'}
+    if predicted_threshold is not None:
+        threshold = float(predicted_threshold)
+    elif adaptive_enabled:
+        adaptive_diag = resolve_adaptive_prediction_threshold(
+            days_lookback=max(7, _env_int('NIGHTLY_AUTO_THRESHOLD_LOOKBACK_DAYS', 30)),
+            min_files=max(2, _env_int('NIGHTLY_AUTO_THRESHOLD_MIN_FILES', 5)),
+            min_rows=max(200, _env_int('NIGHTLY_AUTO_THRESHOLD_MIN_ROWS', 500)),
+            min_hr_rows=max(8, _env_int('NIGHTLY_AUTO_THRESHOLD_MIN_HR_ROWS', 24)),
+            recall_floor=float(np.clip(_env_float('NIGHTLY_AUTO_RECALL_FLOOR', 0.45), 0.10, 0.95)),
+            base_quantile=float(np.clip(_env_float('NIGHTLY_AUTO_BASE_QUANTILE', 0.45), 0.05, 0.95)),
+            min_threshold=float(np.clip(_env_float('NIGHTLY_AUTO_THRESHOLD_MIN', 0.03), 0.01, 0.40)),
+            max_threshold=float(np.clip(_env_float('NIGHTLY_AUTO_THRESHOLD_MAX', 0.20), 0.02, 0.50)),
+        )
+        if bool(adaptive_diag.get('applied')):
+            threshold = float(adaptive_diag.get('threshold', 0.15))
+            threshold_source = 'adaptive'
+        else:
+            threshold = float(_env_float('NIGHTLY_PREDICTED_THRESHOLD', 0.15))
+            threshold_source = f"fallback:{adaptive_diag.get('reason', 'unknown')}"
+    else:
+        threshold = float(_env_float('NIGHTLY_PREDICTED_THRESHOLD', 0.15))
+        threshold_source = 'fixed'
+
     threshold = float(np.clip(threshold, 0.01, 0.50))
 
     merged = evaluate_saved_predictions(target_date)
@@ -5785,8 +6142,18 @@ def send_nightly_accuracy_summary(date_str=None, webhook_url=None, predicted_thr
         ),
         f"Total HRs: {total_hrs}",
         f"Predicted by model (>= {threshold * 100:.0f}%): {predicted_count}/{total_hrs} ({hit_rate * 100:.1f}%)",
+        f"Threshold source: {threshold_source}",
         "Full HR list:",
     ]
+
+    if threshold_source == 'adaptive':
+        lines.append(
+            "Adaptive threshold diagnostics: "
+            f"lookback_files={int(adaptive_diag.get('files', 0))}, "
+            f"hr_rows={int(adaptive_diag.get('hr_rows', 0))}, "
+            f"target_recall>={float(adaptive_diag.get('recall_floor', 0.0)):.2f}, "
+            f"realized_recall={float(adaptive_diag.get('realized_recall', 0.0)):.2f}"
+        )
 
     for idx, row in hrs.iterrows():
         batter = str(row.get('batter_name', 'Unknown'))
@@ -6673,14 +7040,48 @@ def detect_pitcher_degradation(statcast_df, days_lookback=7):
 # =====================================================================
 # Bidirectional learning: update weights from both misses and correct predictions
 # so the system adapts to failures without over-reinforcing already-correct behavior.
-def build_feedback_weight_series(train_df, feedback_df):
-    """Create per-row training weights from recent feedback, using game_pk as a fallback when batter/pitcher IDs are missing."""
+def build_feedback_weight_series(train_df, feedback_df, return_diagnostics=False):
+    """Create per-row training weights from recent feedback using strict batter/pitcher identity matching."""
     if train_df is None:
-        return pd.Series([1.0], dtype=float)
+        default = pd.Series([1.0], dtype=float)
+        if return_diagnostics:
+            return default, {
+                'feedback_rows_total': 0,
+                'feedback_rows_matched': 0,
+                'feedback_rows_unmatched': 0,
+                'matched_by_id': 0,
+                'matched_by_name': 0,
+                'matched_by_id_and_game': 0,
+                'matched_by_id_fallback_from_game': 0,
+                'skipped_nonpositive_non_hr': 0,
+            }
+        return default
 
     weights = pd.Series(1.0, index=train_df.index, dtype=float)
     if feedback_df is None or feedback_df.empty:
+        if return_diagnostics:
+            return weights, {
+                'feedback_rows_total': 0,
+                'feedback_rows_matched': 0,
+                'feedback_rows_unmatched': 0,
+                'matched_by_id': 0,
+                'matched_by_name': 0,
+                'matched_by_id_and_game': 0,
+                'matched_by_id_fallback_from_game': 0,
+                'skipped_nonpositive_non_hr': 0,
+            }
         return weights
+
+    diagnostics = {
+        'feedback_rows_total': 0,
+        'feedback_rows_matched': 0,
+        'feedback_rows_unmatched': 0,
+        'matched_by_id': 0,
+        'matched_by_name': 0,
+        'matched_by_id_and_game': 0,
+        'matched_by_id_fallback_from_game': 0,
+        'skipped_nonpositive_non_hr': 0,
+    }
 
     fb = feedback_df.copy()
     fb['actual_hr'] = pd.to_numeric(fb.get('actual_hr', 0), errors='coerce').fillna(0).astype(int)
@@ -6689,19 +7090,39 @@ def build_feedback_weight_series(train_df, feedback_df):
     fb['pitcher'] = pd.to_numeric(fb.get('pitcher', np.nan), errors='coerce')
     fb['game_pk'] = pd.to_numeric(fb.get('game_pk', np.nan), errors='coerce')
     fb['event_date'] = pd.to_datetime(fb.get('event_date', None), errors='coerce')
+    fb['batter_name_norm'] = fb.get('batter_name', '').astype(str).str.strip().str.lower()
+    fb['pitcher_name_norm'] = fb.get('pitcher_name', '').astype(str).str.strip().str.lower()
 
     has_game_pk = 'game_pk' in train_df.columns
     has_batter = 'batter' in train_df.columns
     has_pitcher = 'pitcher' in train_df.columns
+    has_batter_name = 'batter_name' in train_df.columns
+    has_pitcher_name = 'pitcher_name' in train_df.columns
+
+    train_batter_name_norm = (
+        train_df['batter_name'].astype(str).str.strip().str.lower()
+        if has_batter_name else pd.Series('', index=train_df.index)
+    )
+    train_pitcher_name_norm = (
+        train_df['pitcher_name'].astype(str).str.strip().str.lower()
+        if has_pitcher_name else pd.Series('', index=train_df.index)
+    )
 
     for _, row in fb.iterrows():
+        diagnostics['feedback_rows_total'] += 1
         try:
             prob = float(row['pred_hr_prob'])
             actual = int(row['actual_hr'])
         except Exception:
+            diagnostics['feedback_rows_unmatched'] += 1
             continue
 
-        if prob <= 0:
+        # Keep missed-HR feedback even when model_prob is missing/zero.
+        if prob <= 0 and actual == 1:
+            prob = 0.0
+        elif prob <= 0:
+            diagnostics['skipped_nonpositive_non_hr'] += 1
+            diagnostics['feedback_rows_unmatched'] += 1
             continue
 
         multiplier = 1.0
@@ -6718,21 +7139,56 @@ def build_feedback_weight_series(train_df, feedback_df):
             recency = apply_time_decay_weight(row['event_date'], datetime.today(), half_life_days=7)
             multiplier *= max(0.5, min(1.5, float(recency)))
 
-        match_mask = pd.Series(False, index=train_df.index)
+        id_mask = pd.Series(False, index=train_df.index)
         if has_batter and has_pitcher and pd.notna(row['batter']) and pd.notna(row['pitcher']):
-            match_mask |= (train_df['batter'] == row['batter']) & (train_df['pitcher'] == row['pitcher'])
+            id_mask |= (train_df['batter'] == row['batter']) & (train_df['pitcher'] == row['pitcher'])
         elif has_batter and pd.notna(row['batter']):
-            match_mask |= (train_df['batter'] == row['batter'])
+            id_mask |= (train_df['batter'] == row['batter'])
         elif has_pitcher and pd.notna(row['pitcher']):
-            match_mask |= (train_df['pitcher'] == row['pitcher'])
+            id_mask |= (train_df['pitcher'] == row['pitcher'])
 
-        if has_game_pk and pd.notna(row['game_pk']):
-            match_mask |= (train_df['game_pk'] == row['game_pk'])
+        id_or_name_mask = id_mask.copy()
+
+        batter_name_norm = str(row.get('batter_name_norm', '') or '').strip().lower()
+        pitcher_name_norm = str(row.get('pitcher_name_norm', '') or '').strip().lower()
+        used_name_match = False
+        if not id_or_name_mask.any():
+            if has_batter_name and has_pitcher_name and batter_name_norm and pitcher_name_norm and batter_name_norm != 'nan' and pitcher_name_norm != 'nan':
+                id_or_name_mask |= (train_batter_name_norm == batter_name_norm) & (train_pitcher_name_norm == pitcher_name_norm)
+                used_name_match = id_or_name_mask.any()
+            elif has_batter_name and batter_name_norm and batter_name_norm != 'nan':
+                id_or_name_mask |= (train_batter_name_norm == batter_name_norm)
+                used_name_match = id_or_name_mask.any()
+            elif has_pitcher_name and pitcher_name_norm and pitcher_name_norm != 'nan':
+                id_or_name_mask |= (train_pitcher_name_norm == pitcher_name_norm)
+                used_name_match = id_or_name_mask.any()
+
+        # Only use game_pk to narrow an existing identity match. Never upweight whole games.
+        if has_game_pk and pd.notna(row['game_pk']) and id_or_name_mask.any():
+            match_mask = id_or_name_mask & (pd.to_numeric(train_df['game_pk'], errors='coerce') == row['game_pk'])
+            if not match_mask.any():
+                match_mask = id_or_name_mask
+                if id_mask.any():
+                    diagnostics['matched_by_id_fallback_from_game'] += 1
+            elif id_mask.any():
+                diagnostics['matched_by_id_and_game'] += 1
+        else:
+            match_mask = id_or_name_mask
 
         if match_mask.any():
             weights.loc[match_mask] *= multiplier
+            diagnostics['feedback_rows_matched'] += 1
+            if id_mask.any():
+                diagnostics['matched_by_id'] += 1
+            elif used_name_match:
+                diagnostics['matched_by_name'] += 1
+        else:
+            diagnostics['feedback_rows_unmatched'] += 1
 
-    return weights.clip(lower=0.5, upper=15.0)
+    weights = weights.clip(lower=0.5, upper=15.0)
+    if return_diagnostics:
+        return weights, diagnostics
+    return weights
 
 
 def apply_rolling_training_window(train_df):
@@ -7022,7 +7478,7 @@ def load_feedback_weights(train_df, days_lookback=30):
                 fb['event_date'] = file_date.strftime('%Y-%m-%d')
                 fb['actual_hr'] = 1
                 fb['pred_hr_prob'] = pd.to_numeric(fb.get('model_prob', 0), errors='coerce').fillna(0)
-                keep_cols = [c for c in ['event_date', 'game_pk', 'inning', 'batter', 'pitcher', 'actual_hr', 'pred_hr_prob'] if c in fb.columns]
+                keep_cols = [c for c in ['event_date', 'game_pk', 'inning', 'batter', 'pitcher', 'batter_name', 'pitcher_name', 'actual_hr', 'pred_hr_prob'] if c in fb.columns]
                 recent_evals.append(fb[keep_cols])
         except Exception:
             continue
@@ -7036,7 +7492,12 @@ def load_feedback_weights(train_df, days_lookback=30):
     eval_df['inning'] = eval_df.get('inning', '').astype(str).str.lower().str.strip()
     eval_df['batter'] = pd.to_numeric(eval_df.get('batter', None), errors='coerce')
     eval_df['pitcher'] = pd.to_numeric(eval_df.get('pitcher', None), errors='coerce')
-    eval_df = eval_df.dropna(subset=['batter', 'pitcher', 'actual_hr', 'pred_hr_prob'])
+    eval_df['batter_name'] = eval_df.get('batter_name', '').astype(str).str.strip()
+    eval_df['pitcher_name'] = eval_df.get('pitcher_name', '').astype(str).str.strip()
+    id_present = eval_df['batter'].notna() | eval_df['pitcher'].notna()
+    name_present = (eval_df['batter_name'].str.len() > 0) | (eval_df['pitcher_name'].str.len() > 0)
+    eval_df = eval_df[id_present | name_present]
+    eval_df = eval_df.dropna(subset=['actual_hr', 'pred_hr_prob'])
 
     # De-duplicate same observed outcomes across evaluation + live feedback sources.
     before_dedupe = len(eval_df)
@@ -7126,7 +7587,7 @@ def load_feedback_weights(train_df, days_lookback=30):
 
     result = pd.Series(boost.values, index=merged['index'])
     base_weights = result.reindex(train_df.index).fillna(1.0)
-    feedback_weights = build_feedback_weight_series(train_df, eval_df)
+    feedback_weights, feedback_match_diag = build_feedback_weight_series(train_df, eval_df, return_diagnostics=True)
     final_weights = (base_weights * feedback_weights).clip(lower=0.5, upper=15.0).values
     missed_upweighted = int((final_weights > 2.0).sum())
     false_pos_penalized = int((final_weights < 1.0).sum())
@@ -7135,6 +7596,17 @@ def load_feedback_weights(train_df, days_lookback=30):
         f"miss<{missed_cutoff:.3f}, false_pos>{false_pos_cutoff:.3f}, "
         f"skeptical<{skeptical_cutoff:.3f}, confident>{confident_hr_cutoff:.3f}; "
         f"deduped_rows={removed_dupes}"
+    )
+    print(
+        "Feedback matching diagnostics: "
+        f"rows={feedback_match_diag.get('feedback_rows_total', 0)}, "
+        f"matched={feedback_match_diag.get('feedback_rows_matched', 0)}, "
+        f"unmatched={feedback_match_diag.get('feedback_rows_unmatched', 0)}, "
+        f"id_matches={feedback_match_diag.get('matched_by_id', 0)}, "
+        f"name_matches={feedback_match_diag.get('matched_by_name', 0)}, "
+        f"id_and_game={feedback_match_diag.get('matched_by_id_and_game', 0)}, "
+        f"id_fallback_from_game={feedback_match_diag.get('matched_by_id_fallback_from_game', 0)}, "
+        f"skipped_nonpositive_non_hr={feedback_match_diag.get('skipped_nonpositive_non_hr', 0)}"
     )
     print(f"✅ Asymmetric learning: {missed_upweighted} heavily upweighted (FAILURES), {false_pos_penalized} penalized (FALSE CONFIDENCE)")
     return final_weights
@@ -11957,6 +12429,34 @@ def generate_daily_predictions():
         live['overconfidence_guardrail_multiplier'] = float(overconfidence_diag.get('multiplier', 1.0)) if bool(overconfidence_diag.get('applied')) else np.nan
     if 'overconfidence_guardrail_dynamic_cap' not in live.columns:
         live['overconfidence_guardrail_dynamic_cap'] = float(overconfidence_diag.get('dynamic_cap', np.nan)) if bool(overconfidence_diag.get('applied')) else np.nan
+
+    ranking_cal_diag = {'applied': False, 'reason': 'disabled'}
+    ranking_cal_enabled = str(os.getenv('RANKING_CALIBRATION_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    if ranking_cal_enabled:
+        live, ranking_cal_diag = apply_recent_pitcher_ranking_calibration(
+            live,
+            days_lookback=max(7, _env_int('RANKING_CAL_LOOKBACK_DAYS', 21)),
+            min_files=max(2, _env_int('RANKING_CAL_MIN_FILES', 4)),
+            min_rows=max(300, _env_int('RANKING_CAL_MIN_ROWS', 700)),
+            min_pitcher_rows=max(6, _env_int('RANKING_CAL_MIN_PITCHER_ROWS', 14)),
+            shrink_k=float(np.clip(_env_float('RANKING_CAL_SHRINK_K', 22.0), 1.0, 200.0)),
+            scale=float(np.clip(_env_float('RANKING_CAL_SCALE', 1.10), 0.10, 3.0)),
+            min_mult=float(np.clip(_env_float('RANKING_CAL_MIN_MULT', 0.88), 0.50, 1.0)),
+            max_mult=float(np.clip(_env_float('RANKING_CAL_MAX_MULT', 1.12), 1.0, 2.0)),
+        )
+        if ranking_cal_diag.get('applied'):
+            print(
+                "Ranking calibration applied: "
+                f"touched_rows={int(ranking_cal_diag.get('touched_rows', 0))}, "
+                f"up={int(ranking_cal_diag.get('up_rows', 0))}, "
+                f"down={int(ranking_cal_diag.get('down_rows', 0))}, "
+                f"mult_range=[{float(ranking_cal_diag.get('mult_min', 1.0)):.3f}, "
+                f"{float(ranking_cal_diag.get('mult_max', 1.0)):.3f}]"
+            )
+        else:
+            print(f"Ranking calibration skipped: {ranking_cal_diag.get('reason', 'unknown')}")
+    if 'ranking_calibration_multiplier' not in live.columns:
+        live['ranking_calibration_multiplier'] = 1.0
     
     high_conf_count = sum(1 for r in reliability_levels if r == 'HIGH')
     print(f"✅ Calibration complete: {high_conf_count}/{len(live)} predictions HIGH confidence")
@@ -12239,7 +12739,8 @@ def generate_daily_predictions():
         # Recalculate edge % using real market probability
         live['edge_pct'] = live.apply(
             lambda r: round((r['pred_hr_prob'] - r['market_prob']) / r['market_prob'] * 100, 1)
-            if pd.notna(r['market_prob']) else r['edge_pct'], axis=1
+            if pd.notna(r.get('market_prob')) and float(r.get('market_prob')) > 0 else np.nan,
+            axis=1,
         )
         
         # Kelly with real market odds
@@ -12563,6 +13064,34 @@ def generate_daily_predictions():
     effective_radar_n = int(discord_radar_n)
     effective_discord_min_prob = float(discord_min_prob)
     effective_discord_min_ev_pct = float(discord_min_ev_pct)
+
+    auto_prob_enabled = str(os.getenv('DISCORD_AUTO_MIN_PROB_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
+    auto_prob_diag = {'applied': False, 'reason': 'disabled'}
+    if auto_prob_enabled:
+        auto_prob_diag = resolve_adaptive_prediction_threshold(
+            days_lookback=max(7, _env_int('DISCORD_AUTO_MIN_PROB_LOOKBACK_DAYS', 21)),
+            min_files=max(2, _env_int('DISCORD_AUTO_MIN_PROB_MIN_FILES', 4)),
+            min_rows=max(200, _env_int('DISCORD_AUTO_MIN_PROB_MIN_ROWS', 500)),
+            min_hr_rows=max(8, _env_int('DISCORD_AUTO_MIN_PROB_MIN_HR_ROWS', 20)),
+            recall_floor=float(np.clip(_env_float('DISCORD_AUTO_MIN_PROB_RECALL_FLOOR', 0.45), 0.10, 0.95)),
+            base_quantile=float(np.clip(_env_float('DISCORD_AUTO_MIN_PROB_BASE_QUANTILE', 0.45), 0.05, 0.95)),
+            min_threshold=float(np.clip(_env_float('DISCORD_AUTO_MIN_PROB_MIN', 0.012), 0.005, 0.20)),
+            max_threshold=float(np.clip(_env_float('DISCORD_AUTO_MIN_PROB_MAX', 0.10), 0.02, 0.25)),
+        )
+        if bool(auto_prob_diag.get('applied')):
+            tuned = float(auto_prob_diag.get('threshold', discord_min_prob))
+            # Never go below operator's base floor unless explicitly allowed.
+            allow_below_base = str(os.getenv('DISCORD_AUTO_MIN_PROB_ALLOW_BELOW_BASE', 'false')).strip().lower() in {'1', 'true', 'yes'}
+            effective_discord_min_prob = tuned if allow_below_base else max(float(discord_min_prob), tuned)
+            print(
+                "Discord min_prob auto-tuned from recent outcomes: "
+                f"min_prob={effective_discord_min_prob * 100:.2f}% "
+                f"(base {discord_min_prob * 100:.2f}%), "
+                f"target_recall>={float(auto_prob_diag.get('recall_floor', 0.0)):.2f}, "
+                f"realized_recall={float(auto_prob_diag.get('realized_recall', 0.0)):.2f}"
+            )
+        else:
+            print(f"Discord min_prob auto-tune unavailable: {auto_prob_diag.get('reason', 'unknown')}")
     if bool(overconfidence_diag.get('applied')):
         gap_boost = max(0.0, float(overconfidence_diag.get('gap', 0.0)))
         fdr_boost = max(0.0, float(overconfidence_diag.get('false_discovery', 0.0)) - 0.80)
@@ -12618,7 +13147,7 @@ def generate_daily_predictions():
             print(f"Hard precision floor diagnostics unavailable: {precision_diag.get('reason', 'unknown')}")
 
     if hard_budget_enabled:
-        # Keep pre-selection caps aligned with strict daily ceiling.
+        # Bankroll governance is count-only here; it does not alter evaluation thresholds.
         effective_top_prob_n = min(effective_top_prob_n, hard_budget_total)
         effective_top_ev_n = min(effective_top_ev_n, hard_budget_total)
         effective_radar_n = min(effective_radar_n, hard_budget_total)
@@ -13079,7 +13608,9 @@ def generate_daily_predictions():
         blocks = []
         for _, row in df.iterrows():
             pct = f"{row['hr_probability'] * 100:.1f}%"
-            edge = f"{row.get('edge_pct', 0):+.0f}%" if pd.notna(row.get('edge_pct')) else 'N/A'
+            market_prob_row = pd.to_numeric(pd.Series([row.get('market_prob', np.nan)]), errors='coerce').iloc[0]
+            has_market_row = pd.notna(market_prob_row) and float(market_prob_row) > 0
+            edge = f"{row.get('edge_pct', 0):+.0f}%" if has_market_row and pd.notna(row.get('edge_pct')) else 'N/A'
             ev_str = f"{row.get('ev_pct', 0):+.1f}%" if pd.notna(row.get('ev_pct', None)) else 'N/A'
             kelly = f"{float(row.get('kelly_fraction', 0) or 0):.3f}" if pd.notna(row.get('kelly_fraction')) else 'N/A'
             gtime = _safe_display_name(row.get('game_time'), 'TBD')[:8]
@@ -13091,7 +13622,7 @@ def generate_daily_predictions():
 
             header = f"• **{batter_name}** vs {pitcher_name}"
             if detail_mode:
-                market_pct = float(row.get('market_prob', 0.0) or 0.0) * 100.0
+                market_pct_text = f"{float(market_prob_row) * 100.0:.1f}%" if has_market_row else 'N/A'
                 book = _safe_display_name(str(row.get('best_book') or 'N/A').title(), 'N/A')
                 odds_raw = row.get('best_market_odds_american', None)
                 odds_text = 'N/A'
@@ -13103,7 +13634,7 @@ def generate_daily_predictions():
                     stake_text = f" | Stake ${float(stake_val):.0f}"
                 detail = (
                     f"  {gtime} | {win} | Prob {pct} | Conf {conf_emoji}\n"
-                    f"  Book {book} {odds_text} | Market {market_pct:.1f}% | EV {ev_str} | Kelly {kelly}{stake_text}"
+                    f"  Book {book} {odds_text} | Market {market_pct_text} | EV {ev_str} | Kelly {kelly}{stake_text}"
                 )
             else:
                 detail = f"  {gtime} | {win} | Prob {pct} | Conf {conf_emoji} | Edge {edge}"
@@ -13139,6 +13670,16 @@ def generate_daily_predictions():
         discord_window_1_hours,
         discord_window_2_hours,
     )
+
+    wave_hash, wave_payload = _build_prediction_wave_signature(top_prob, top_ev, radar, straight_discrepancies)
+    should_send_wave, send_reason = _should_send_prediction_wave(target_date, wave_hash)
+    if not should_send_wave:
+        print(
+            "Discord prediction wave suppressed: "
+            f"policy={_prediction_wave_policy()}, reason={send_reason}"
+        )
+        return live
+
     if not send_discord_webhook(content="\n".join(summary_lines)):
         print("Failed to transmit Discord summary after trying configured candidates.")
 
@@ -13270,6 +13811,19 @@ def generate_daily_predictions():
 
     if not sent_prob or not sent_ev or not sent_radar or not sent_straight:
         print("Failed to transmit one or more Discord pick tables after trying configured candidates.")
+
+    _mark_prediction_wave_sent(
+        target_date,
+        wave_hash,
+        signature_payload=wave_payload,
+        meta={
+            'send_reason': send_reason,
+            'sent_prob': bool(sent_prob),
+            'sent_ev': bool(sent_ev),
+            'sent_radar': bool(sent_radar),
+            'sent_straight': bool(sent_straight),
+        },
+    )
 
     return live
 
