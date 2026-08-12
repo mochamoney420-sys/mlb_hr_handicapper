@@ -354,6 +354,16 @@ STADIUM_CF_BEARING = {
     'STL': 5,   'TB': 5,    'TEX': 25,  'TOR': 10,  'WSH': 355
 }
 
+# Stadium wall geometry tuned for direct spray-angle overlap checks.
+STADIUM_WALL_GEOMETRY = {
+    'NYY': {'dist': [325, 345, 400, 345, 325], 'height': [21, 8, 7, 8, 21]},
+    'BOS': {'dist': [330, 350, 390, 350, 330], 'height': [37, 37, 5, 5, 5]},
+    'COL': {'dist': [320, 360, 415, 360, 320], 'height': [14, 14, 8, 8, 16]},
+    'SF': {'dist': [330, 360, 400, 360, 330], 'height': [15, 15, 8, 8, 12]},
+    'MIA': {'dist': [330, 345, 400, 345, 330], 'height': [10, 9, 7, 9, 10]},
+    'TB': {'dist': [330, 345, 400, 345, 330], 'height': [8, 8, 7, 8, 8]},
+}
+
 RETRACTABLE_ROOF_VENUES = {
     'Chase Field',
     'Daikin Park',
@@ -611,46 +621,205 @@ def _pressure_mbar_to_inhg(pressure_mbar):
 def compute_micro_atmo_carry_adjustment(
     pressure_mbar,
     humidity_pct,
-    wind_out_mph,
-    team_abbr='',
+    temp_f=None,
+    wind_speed_mph=0.0,
+    wind_dir_deg=0.0,
+    stadium_cf_bearing=0.0,
     roof_sealed=0,
+    team_abbr='',
 ):
-    """Return carry adjustment in feet using micro-atmospheric rules of thumb.
+    """Compute localized aerodynamic carry adjustments from true air density + wind vectors.
 
-    Rules encoded:
-    - Every 0.3 inHg pressure drop from 29.92 adds about +2 ft carry.
-    - Every +50 humidity points adds about +1 ft carry.
-    - Outward wind impact is reduced by stadium wind-shield architecture.
+    The new API supports the advanced stadium physics model while preserving the legacy
+    call pattern used elsewhere in the project.
     """
+    # Legacy compatibility: old callers pass (pressure_mbar, humidity_pct, wind_out_mph, team_abbr)
+    # while the new API calls with temperature + wind vector components.
+    if temp_f is not None and isinstance(temp_f, (int, float)) and wind_speed_mph == 0.0 and wind_dir_deg == 0.0 and stadium_cf_bearing == 0.0:
+        # This is the legacy signature path. Reinterpret the 3rd positional argument as wind.
+        legacy_wind = float(pd.to_numeric(temp_f, errors='coerce')) if pd.notna(temp_f) else 0.0
+        temp_f = None
+        wind_speed_mph = legacy_wind
+
     pressure_inhg = _pressure_mbar_to_inhg(pressure_mbar)
     humidity = float(pd.to_numeric(humidity_pct, errors='coerce')) if pd.notna(humidity_pct) else 50.0
-    wind_out = float(pd.to_numeric(wind_out_mph, errors='coerce')) if pd.notna(wind_out_mph) else 0.0
+    temp_f = float(pd.to_numeric(temp_f, errors='coerce')) if pd.notna(temp_f) else 72.0
+    wind_speed = float(pd.to_numeric(wind_speed_mph, errors='coerce')) if pd.notna(wind_speed_mph) else 0.0
+    wind_dir = float(pd.to_numeric(wind_dir_deg, errors='coerce')) if pd.notna(wind_dir_deg) else 0.0
+    stadium_bearing = float(pd.to_numeric(stadium_cf_bearing, errors='coerce')) if pd.notna(stadium_cf_bearing) else 0.0
     team = str(team_abbr or '').upper().strip()
     shield = float(np.clip(STADIUM_WIND_SHIELDING.get(team, 0.20), 0.0, 0.95))
-    if int(pd.to_numeric(roof_sealed, errors='coerce')) == 1:
+    roof_flag = int(pd.to_numeric(roof_sealed, errors='coerce')) == 1
+    if roof_flag:
         shield = 0.95
 
-    # Pressure effect (+2 ft per 0.3 inHg drop from standard pressure).
-    pressure_drop_inhg = 29.92 - pressure_inhg
-    pressure_ft = (pressure_drop_inhg / 0.3) * 2.0
+    if roof_flag:
+        air_density = 1.225
+        drag_multiplier = 1.0
+        effective_wind_out = 0.0
+        carry_ft = 0.0
+    else:
+        temp_c = (temp_f - 32.0) * 5.0 / 9.0
+        temp_k = temp_c + 273.15
+        pressure_pa = float(pd.to_numeric(pressure_mbar, errors='coerce')) * 100.0
+        p_sat = 611.2 * math.exp((17.67 * temp_c) / (temp_c + 243.5))
+        p_vapor = (humidity / 100.0) * p_sat
+        p_dry = pressure_pa - p_vapor
+        r_dry = 287.058
+        r_vapor = 461.495
+        air_density = (p_dry / (r_dry * temp_k)) + (p_vapor / (r_vapor * temp_k))
+        drag_multiplier = air_density / 1.225
+        atmo_delta_ft = (1.225 - air_density) * 80.0
+        relative_wind_angle = math.radians(wind_dir - stadium_bearing)
+        effective_wind_out = wind_speed * math.cos(relative_wind_angle)
+        if effective_wind_out >= 0:
+            wind_ft = effective_wind_out * 2.8
+        else:
+            wind_ft = effective_wind_out * 3.2
+        carry_ft = float(np.clip(atmo_delta_ft + wind_ft, -12.0, 18.0))
 
-    # Humidity effect (+1 ft per +50% humidity change).
+    legacy_pressure_drop_inhg = 29.92 - pressure_inhg
+    pressure_ft = (legacy_pressure_drop_inhg / 0.3) * 2.0
     humidity_ft = ((humidity - 50.0) / 50.0) * 1.0
+    effective_wind_legacy = max(0.0, wind_speed * (1.0 - shield)) if not roof_flag else 0.0
+    wind_ft_legacy = effective_wind_legacy * 0.60
+    carry_ft_legacy = float(np.clip(pressure_ft + humidity_ft + wind_ft_legacy, -12.0, 18.0))
+    carry_multiplier = float(np.clip(1.0 + (carry_ft_legacy / 400.0), 0.92, 1.12))
 
-    # Wind carry effect in feet, attenuated by stadium shielding.
-    effective_wind_out = wind_out * (1.0 - shield)
-    wind_ft = effective_wind_out * 0.60
-
-    carry_ft = float(np.clip(pressure_ft + humidity_ft + wind_ft, -12.0, 18.0))
-    # Convert carry feet to a conservative multiplicative HR adjustment.
-    carry_multiplier = float(np.clip(1.0 + (carry_ft / 400.0), 0.92, 1.12))
     return {
-        'carry_adjustment_ft': carry_ft,
+        'air_density_kg_m3': round(float(air_density), 4),
+        'drag_multiplier': round(float(drag_multiplier), 4),
+        'effective_wind_out_mph': round(float(effective_wind_out), 2),
+        'carry_adjustment_ft': round(float(carry_ft), 2),
         'carry_multiplier': carry_multiplier,
-        'effective_wind_out_mph': float(effective_wind_out),
         'wind_shield_factor': shield,
         'pressure_inhg': pressure_inhg,
+        'legacy_carry_adjustment_ft': carry_ft_legacy,
     }
+
+
+def compute_spray_geometry_overlap(batter_statcast_history, target_venue_key):
+    """Estimate a personalized spray/park overlap multiplier for a batter in a specific venue."""
+    if batter_statcast_history is None or getattr(batter_statcast_history, 'empty', True):
+        return 1.0
+
+    key = str(target_venue_key or '').upper().strip()
+    park = STADIUM_WALL_GEOMETRY.get(key)
+    if park is None or 'dist' not in park or 'height' not in park:
+        return 1.0
+
+    batted_balls = batter_statcast_history.copy()
+    batted_balls = batted_balls[
+        batted_balls.get('bb_type', pd.Series([''] * len(batted_balls), index=batted_balls.index)).astype(str).str.lower().isin({'fly_ball', 'line_drive'})
+    ].copy()
+    if 'launch_speed' in batted_balls.columns:
+        batted_balls = batted_balls[pd.to_numeric(batted_balls['launch_speed'], errors='coerce') >= 92].copy()
+    if len(batted_balls) < 15:
+        return 1.0
+    if not {'hc_x', 'hc_y'}.issubset(set(batted_balls.columns)):
+        return 1.0
+
+    batted_balls['hc_x_centered'] = pd.to_numeric(batted_balls['hc_x'], errors='coerce') - 125.42
+    batted_balls['hc_y_centered'] = 198.27 - pd.to_numeric(batted_balls['hc_y'], errors='coerce')
+    batted_balls = batted_balls.dropna(subset=['hc_x_centered', 'hc_y_centered']).copy()
+    if batted_balls.empty:
+        return 1.0
+
+    batted_balls['spray_angle'] = np.degrees(np.arctan2(batted_balls['hc_x_centered'], batted_balls['hc_y_centered']))
+    bins = [-45, -22.5, -9, 9, 22.5, 45]
+    batted_balls['sector'] = pd.cut(batted_balls['spray_angle'], bins=bins, labels=[0, 1, 2, 3, 4], include_lowest=True)
+
+    would_be_hr_count = 0
+    for _, ball in batted_balls.dropna(subset=['sector']).iterrows():
+        sector = int(ball['sector'])
+        wall_distance = float(park['dist'][sector])
+        wall_height = float(park['height'][sector])
+        v0 = float(pd.to_numeric(ball.get('launch_speed', 0), errors='coerce'))
+        theta = math.radians(float(pd.to_numeric(ball.get('launch_angle', 0), errors='coerce')))
+        estimated_distance = (v0 ** 2) * math.sin(2 * theta) / 32.174 * 0.75
+        if estimated_distance > wall_distance:
+            remaining_flight = estimated_distance - wall_distance
+            estimated_clearance_height = remaining_flight * math.tan(theta) * 0.5
+            if estimated_clearance_height > wall_height:
+                would_be_hr_count += 1
+
+    realized_xHR_rate = would_be_hr_count / float(len(batted_balls.dropna(subset=['sector'])))
+    baseline_league_rate = 0.055
+    return round(float(np.clip(1.0 + (realized_xHR_rate - baseline_league_rate) * 2.0, 0.80, 1.35)), 3)
+
+
+def compute_pitch_shape_matchup_edge(pitcher_statcast_history, batter_statcast_history):
+    """Return a pitch-shape matchup edge based on pitch-type movement and hitter quality vs that exact shape."""
+    if pitcher_statcast_history is None or getattr(pitcher_statcast_history, 'empty', True):
+        return 0.0
+    if batter_statcast_history is None or getattr(batter_statcast_history, 'empty', True):
+        return 0.0
+
+    if 'pitch_type' not in pitcher_statcast_history.columns:
+        return 0.0
+    pitcher_mix = pitcher_statcast_history['pitch_type'].astype(str)
+    pitcher_usage = pitcher_mix.value_counts(normalize=True)
+    matchup_edge_score = 0.0
+    total_weighted_usage = 0.0
+
+    for pitch_type, usage in pitcher_usage.items():
+        if usage < 0.10:
+            continue
+
+        p_type_data = pitcher_statcast_history[pitcher_statcast_history['pitch_type'].astype(str) == pitch_type].copy()
+        if p_type_data.empty:
+            continue
+        avg_velo = pd.to_numeric(p_type_data.get('release_speed', 0.0), errors='coerce').mean()
+        avg_pfx_x = pd.to_numeric(p_type_data.get('pfx_x', 0.0), errors='coerce').mean()
+        avg_pfx_z = pd.to_numeric(p_type_data.get('pfx_z', 0.0), errors='coerce').mean()
+
+        b_match = batter_statcast_history[
+            batter_statcast_history['pitch_type'].astype(str).eq(pitch_type)
+        ].copy()
+        if b_match.empty:
+            continue
+
+        if 'release_speed' in b_match.columns:
+            b_match = b_match[p_match := pd.to_numeric(b_match['release_speed'], errors='coerce').between(avg_velo - 3, avg_velo + 3)]
+        if 'pfx_x' in b_match.columns:
+            b_match = b_match[pd.to_numeric(b_match['pfx_x'], errors='coerce').between(avg_pfx_x - 2.5, avg_pfx_x + 2.5)]
+        if 'pfx_z' in b_match.columns:
+            b_match = b_match[pd.to_numeric(b_match['pfx_z'], errors='coerce').between(avg_pfx_z - 2.5, avg_pfx_z + 2.5)]
+
+        if b_match.empty:
+            continue
+
+        launch_speed = pd.to_numeric(b_match.get('launch_speed', 0.0), errors='coerce').fillna(0.0)
+        launch_angle = pd.to_numeric(b_match.get('launch_angle', 0.0), errors='coerce').fillna(0.0)
+        hard_hit = (launch_speed >= 95.0).astype(float)
+        sweet_spot = launch_angle.between(8.0, 32.0).astype(float)
+        barrel = (
+            (launch_speed >= 98)
+            & (launch_angle >= 26 - (launch_speed - 98))
+            & (launch_angle <= 30 + (launch_speed - 98))
+        ).astype(float)
+        batter_damage = (hard_hit + sweet_spot + (barrel * 2.0)).mean()
+
+        pitcher_shape = p_type_data.copy()
+        ps_speed = pd.to_numeric(pitcher_shape.get('release_speed', pd.Series([0.0] * len(pitcher_shape))), errors='coerce').fillna(0.0)
+        ps_launch_speed = pd.to_numeric(pitcher_shape.get('launch_speed', pd.Series([0.0] * len(pitcher_shape))), errors='coerce').fillna(0.0)
+        ps_launch_angle = pd.to_numeric(pitcher_shape.get('launch_angle', pd.Series([0.0] * len(pitcher_shape))), errors='coerce').fillna(0.0)
+        ps_hard_hit = (ps_launch_speed >= 95.0).astype(float)
+        ps_sweet_spot = ps_launch_angle.between(8.0, 32.0).astype(float)
+        ps_barrel = (
+            (ps_launch_speed >= 98)
+            & (ps_launch_angle >= 26 - (ps_launch_speed - 98))
+            & (ps_launch_angle <= 30 + (ps_launch_speed - 98))
+        ).astype(float)
+        pitcher_damage = (ps_hard_hit + ps_sweet_spot + (ps_barrel * 2.0)).mean()
+
+        edge = (batter_damage - pitcher_damage) * 0.35 + (usage - 0.10) * 0.25
+        matchup_edge_score += edge * usage
+        total_weighted_usage += usage
+
+    if total_weighted_usage <= 0:
+        return 0.0
+    return float(np.clip(matchup_edge_score / total_weighted_usage, -1.0, 1.0))
 
 
 def build_bullpen_depletion_vulnerability_map(
