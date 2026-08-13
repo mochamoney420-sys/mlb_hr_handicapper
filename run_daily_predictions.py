@@ -9449,6 +9449,8 @@ def _prepare_discord_rankings(live_df):
         work['hr_probability'] = []
         work['ev_pct'] = []
         work['portfolio_action_score'] = []
+        work['slate_z_score'] = []
+        work['relative_slate_rank'] = []
         return work
 
     if 'physics_delta' not in work.columns:
@@ -9479,6 +9481,19 @@ def _prepare_discord_rankings(live_df):
     market_prob = _coerce_numeric_column(work, 'market_prob', default=np.nan)
     prob_edge_abs = (pred_prob - market_prob).fillna(0.0) if 'market_prob' in work.columns else pred_prob * 0.0
 
+    # Slate-relative anomaly check: a player can be a real alert even if their raw
+    # percentage is modest, provided they are an outlier versus the day's slate.
+    slate_mean = pred_prob.mean()
+    slate_std = pred_prob.std(ddof=0)
+    if pd.isna(slate_std) or slate_std <= 0:
+        slate_z = pd.Series(0.0, index=work.index)
+    else:
+        slate_z = (pred_prob - slate_mean) / slate_std
+
+    relative_rank = pd.Series(0.0, index=work.index)
+    if not pred_prob.empty:
+        relative_rank = pred_prob.rank(method='average', pct=True)
+
     out = work.copy()
     if 'pred_hr_prob' in out.columns:
         if 'hr_probability' in out.columns:
@@ -9499,6 +9514,8 @@ def _prepare_discord_rankings(live_df):
     out['ev_pct'] = ev_pct
     out['kelly_fraction'] = kelly
     out['specific_day_upside_score'] = upside
+    out['slate_z_score'] = slate_z
+    out['relative_slate_rank'] = relative_rank
     out['portfolio_action_score'] = (
         (pred_prob * 100.0) * 0.45
         + (edge_pct * 0.55)
@@ -9506,6 +9523,8 @@ def _prepare_discord_rankings(live_df):
         + (kelly * 100.0 * 0.20)
         + (upside * 100.0 * 0.20)
         + (prob_edge_abs * 100.0 * 0.25)
+        + (slate_z * 10.0)
+        + (relative_rank * 20.0)
     )
     return out
 

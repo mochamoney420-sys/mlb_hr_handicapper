@@ -62,3 +62,39 @@ def test_build_portfolio_action_score_handles_empty_radar():
     score = rdp._build_portfolio_action_score(radar)
 
     assert score.empty
+
+
+def test_prepare_discord_rankings_adds_slate_z_score_and_relative_rank():
+    frame = pd.DataFrame({
+        'batter_name': ['A', 'B', 'C', 'D', 'E', 'F'],
+        'pitcher_name': ['P1', 'P2', 'P3', 'P4', 'P5', 'P6'],
+        'pred_hr_prob': [0.01, 0.02, 0.02, 0.03, 0.04, 0.12],
+        'ev_percent': [0.0, 0.0, 0.0, 0.0, 0.0, 10.5],
+        'kelly_fraction': [0.0, 0.0, 0.0, 0.0, 0.0, 0.06],
+        'model_reliability': ['MEDIUM'] * 6,
+    })
+    ranked = rdp._prepare_discord_rankings(frame)
+
+    assert 'slate_z_score' in ranked.columns
+    assert 'relative_slate_rank' in ranked.columns
+    assert ranked['slate_z_score'].iloc[-1] > 2.0
+    assert ranked['relative_slate_rank'].iloc[-1] > 0.80
+
+
+def test_dynamic_discord_gate_allows_high_slate_anomaly_below_static_min_prob():
+    frame = pd.DataFrame({
+        'batter_name': ['A', 'B', 'C'],
+        'pitcher_name': ['P1', 'P2', 'P3'],
+        'pred_hr_prob': [0.018, 0.024, 0.086],
+        'market_prob': [0.045, 0.051, 0.078],
+        'ev_percent': [0.0, 0.0, 8.7],
+        'kelly_fraction': [0.01, 0.015, 0.04],
+        'model_reliability': ['MEDIUM', 'MEDIUM', 'HIGH'],
+    })
+    ranked = rdp._prepare_discord_rankings(frame)
+    dynamic_gate = (
+        (ranked['hr_probability'] >= 0.04)
+        | (ranked['slate_z_score'] >= 2.0)
+    )
+
+    assert ranked.loc[dynamic_gate, 'batter_name'].tolist() == ['C']
