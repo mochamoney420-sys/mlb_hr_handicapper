@@ -1884,13 +1884,13 @@ def _prediction_wave_policy():
     """Return prediction-wave send policy.
 
     Supported values:
-    - first_only (default): send one prediction wave per day
-    - material_change: send only when the pick signature changes
+    - first_only: send one prediction wave per day
+    - material_change (default): send when today's picks materially change
     - always: no suppression
     """
-    policy = str(os.getenv('DISCORD_PREDICTION_WAVE_POLICY', 'first_only')).strip().lower()
+    policy = str(os.getenv('DISCORD_PREDICTION_WAVE_POLICY', 'material_change')).strip().lower()
     if policy not in {'first_only', 'material_change', 'always'}:
-        return 'first_only'
+        return 'material_change'
     return policy
 
 
