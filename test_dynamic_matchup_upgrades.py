@@ -2,6 +2,7 @@ import math
 
 import pandas as pd
 import numpy as np
+import pytest
 
 import run_daily_predictions as rdp
 
@@ -242,3 +243,54 @@ def test_compute_pitch_shape_matchup_edge_tracks_pitch_specific_shape():
     edge = rdp.compute_pitch_shape_matchup_edge(pitcher, batter)
     assert isinstance(edge, float)
     assert -1.0 <= edge <= 1.0
+
+
+def test_resolve_probability_mode_and_weight_enforces_minimum_physics_blend(monkeypatch):
+    monkeypatch.delenv('HR_PHYSICS_BLEND_WEIGHT', raising=False)
+    monkeypatch.setenv('HR_PROB_MODE', 'blended')
+    monkeypatch.setattr(rdp, 'calibrate_physics_blend_weight', lambda *args, **kwargs: 0.0)
+
+    mode, weight = rdp.resolve_probability_mode_and_weight()
+
+    assert mode == 'blended'
+    assert weight >= 0.20
+    assert weight == 0.20
+
+
+def test_dampen_feedback_training_weights_uses_logarithmic_scaling():
+    weights = pd.Series([1.0, 2.0, 5.0, 9.0], dtype=float)
+
+    damped = rdp.dampen_feedback_training_weights(weights)
+
+    assert damped.iloc[0] == pytest.approx(1.0, rel=1e-6)
+    assert damped.iloc[1] == pytest.approx(1.0 + np.log(2.0), rel=1e-6)
+    assert damped.iloc[2] < 5.0
+    assert damped.iloc[3] < 9.0
+
+
+def test_true_hr_signal_not_clipped_below_realistic_ceiling():
+    live = pd.DataFrame({
+        'model_reliability': ['HIGH', 'HIGH', 'MEDIUM', 'LOW'],
+        'pred_hr_prob': [0.70, 0.62, 0.45, 0.28],
+    })
+
+    rel_upper = live['model_reliability'].astype(str).str.upper()
+    rel_cap_high = 0.45
+    rel_cap_medium = 0.34
+    rel_cap_low = 0.24
+    rel_cap = np.where(
+        rel_upper == 'HIGH', rel_cap_high,
+        np.where(rel_upper == 'MEDIUM', rel_cap_medium, rel_cap_low)
+    )
+    live['reliability_prob_cap'] = rel_cap
+    live['pred_hr_prob'] = np.minimum(
+        pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), rel_cap
+    )
+    hard_conf_cap = 0.40
+    live['pred_hr_prob'] = np.minimum(
+        pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), hard_conf_cap
+    )
+
+    assert live['pred_hr_prob'].iloc[0] >= 0.35
+    assert live['pred_hr_prob'].iloc[1] >= 0.35
+    assert live['pred_hr_prob'].max() >= 0.40

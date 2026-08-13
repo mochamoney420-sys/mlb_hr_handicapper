@@ -3176,6 +3176,9 @@ def resolve_probability_mode_and_weight():
     HR_PHYSICS_BLEND_WEIGHT:
       - Optional float 0-1 override for blended mode.
       - If not set, auto-calibrated on recent history.
+
+    Hard floor: keep a minimum physics contribution of 20% in blended mode,
+    even when the recent calibration grid would otherwise recommend 0.0.
     """
     mode = str(os.getenv('HR_PROB_MODE', 'blended')).strip().lower()
     if mode == 'auto':
@@ -3183,16 +3186,21 @@ def resolve_probability_mode_and_weight():
     if mode not in {'base', 'physics', 'blended'}:
         mode = 'blended'
 
+    min_physics_weight = 0.20
     raw_weight = os.getenv('HR_PHYSICS_BLEND_WEIGHT')
     if raw_weight is not None and raw_weight != '':
         try:
             weight = max(0.0, min(1.0, float(raw_weight)))
             print(f"Blend weight override from HR_PHYSICS_BLEND_WEIGHT: {weight:.2f}")
         except Exception:
-            weight = calibrate_physics_blend_weight(days_lookback=30, default_weight=0.45)
+            weight = calibrate_physics_blend_weight(days_lookback=30, default_weight=0.55)
     else:
-        weight = calibrate_physics_blend_weight(days_lookback=30, default_weight=0.45)
+        weight = calibrate_physics_blend_weight(days_lookback=30, default_weight=0.55)
 
+    weight = max(min_physics_weight, weight)
+    if mode != 'blended':
+        weight = 0.0
+    print(f"Resolved physics blend weight: {weight:.2f} (minimum floor={min_physics_weight:.2f})")
     return mode, weight
 
 
@@ -7422,6 +7430,27 @@ def build_feedback_weight_series(train_df, feedback_df, return_diagnostics=False
     return weights
 
 
+def dampen_feedback_training_weights(weights):
+    """Apply a log-scaled dampener so heavy upweight rows do not dominate tree splits.
+
+    Values above 1.0 are reduced using 1 + log(value), which preserves ranking but
+    compresses extreme multipliers. Values below 1.0 remain as-is to avoid
+    over-penalizing already-safe training rows.
+    """
+    if weights is None:
+        return pd.Series([], dtype=float)
+
+    series = pd.Series(weights, dtype=float).copy()
+    if series.empty:
+        return series
+
+    above_one = series > 1.0
+    if above_one.any():
+        series.loc[above_one] = 1.0 + np.log(series.loc[above_one])
+    series = series.clip(lower=0.5, upper=4.0)
+    return series
+
+
 def apply_rolling_training_window(train_df):
     """Filter training rows to a rolling time window to reduce drift/latency.
 
@@ -7819,8 +7848,8 @@ def load_feedback_weights(train_df, days_lookback=30):
     result = pd.Series(boost.values, index=merged['index'])
     base_weights = result.reindex(train_df.index).fillna(1.0)
     feedback_weights, feedback_match_diag = build_feedback_weight_series(train_df, eval_df, return_diagnostics=True)
-    final_weights = (base_weights * feedback_weights).clip(lower=0.5, upper=15.0).values
-    missed_upweighted = int((final_weights > 2.0).sum())
+    final_weights = dampen_feedback_training_weights(base_weights * feedback_weights).clip(lower=0.5, upper=4.0).values
+    missed_upweighted = int((final_weights > 1.5).sum())
     false_pos_penalized = int((final_weights < 1.0).sum())
     print(
         "Adaptive thresholds: "
@@ -11304,7 +11333,7 @@ def generate_daily_predictions():
                 f"override={scale_pos_weight:.2f}"
             )
         except Exception:
-            scale_pos_weight_multiplier = float(np.clip(_env_float('TRAINING_SCALE_POS_WEIGHT_MULTIPLIER', 1.0), 0.1, 1.0))
+            scale_pos_weight_multiplier = float(np.clip(_env_float('TRAINING_SCALE_POS_WEIGHT_MULTIPLIER', 0.65), 0.1, 1.0))
             scale_pos_weight = round(max(1.0, min(50.0, raw_scale_pos_weight * scale_pos_weight_multiplier)), 2)
             print(
                 "Class imbalance control (fit set): "
@@ -11313,7 +11342,7 @@ def generate_daily_predictions():
                 f"multiplier={scale_pos_weight_multiplier:.2f}, scale_pos_weight={scale_pos_weight:.2f}"
             )
     else:
-        scale_pos_weight_multiplier = float(np.clip(_env_float('TRAINING_SCALE_POS_WEIGHT_MULTIPLIER', 1.0), 0.1, 1.0))
+        scale_pos_weight_multiplier = float(np.clip(_env_float('TRAINING_SCALE_POS_WEIGHT_MULTIPLIER', 0.65), 0.1, 1.0))
         scale_pos_weight = round(max(1.0, min(50.0, raw_scale_pos_weight * scale_pos_weight_multiplier)), 2)
         print(
             "Class imbalance control (fit set): "
@@ -12624,17 +12653,18 @@ def generate_daily_predictions():
     live['batter_consistency_score'] = consistency_scores
     live['batter_sample_size_60d'] = batter_sample_sizes
 
-    # Reliability-aware hard ceilings to prevent unsupported top-end inflation.
+    # Reliability-aware hard ceilings: keep them conservative enough to avoid 
+    # unsupported top-end inflation without clipping legitimate HR signal.
     rel_upper = live['model_reliability'].astype(str).str.upper()
-    rel_cap_high = float(np.clip(_env_float('RELIABILITY_CAP_HIGH', 0.32), 0.15, 0.80))
-    rel_cap_medium = float(np.clip(_env_float('RELIABILITY_CAP_MEDIUM', 0.26), 0.12, rel_cap_high))
-    rel_cap_low = float(np.clip(_env_float('RELIABILITY_CAP_LOW', 0.20), 0.08, rel_cap_medium))
+    rel_cap_high = float(np.clip(_env_float('RELIABILITY_CAP_HIGH', 0.45), 0.20, 0.80))
+    rel_cap_medium = float(np.clip(_env_float('RELIABILITY_CAP_MEDIUM', 0.34), 0.15, rel_cap_high))
+    rel_cap_low = float(np.clip(_env_float('RELIABILITY_CAP_LOW', 0.24), 0.10, rel_cap_medium))
     rel_cap = np.where(rel_upper == 'HIGH', rel_cap_high, np.where(rel_upper == 'MEDIUM', rel_cap_medium, rel_cap_low))
     live['reliability_prob_cap'] = rel_cap
     live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), rel_cap)
 
     hard_conf_cap_enabled = str(os.getenv('HARD_CONFIDENCE_CAP_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
-    hard_conf_cap = float(np.clip(_env_float('HARD_CONFIDENCE_CAP', 0.30), 0.12, 0.60))
+    hard_conf_cap = float(np.clip(_env_float('HARD_CONFIDENCE_CAP', 0.40), 0.18, 0.60))
     if hard_conf_cap_enabled:
         live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), hard_conf_cap)
     live['hard_confidence_cap'] = hard_conf_cap if hard_conf_cap_enabled else np.nan
