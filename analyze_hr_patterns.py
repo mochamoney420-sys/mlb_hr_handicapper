@@ -529,11 +529,16 @@ def apply_insights_to_feedback_weights(patterns):
         # Create unique key for this matchup
         key = f"{int(batter_id)}_{int(pitcher_id)}"
         
-        # Missed HRs get heavy boost (model learns to be more bullish)
+        # Limit the extreme weight boost on uncalibrated player profiles.
         if pattern.get('prediction_category', '').startswith('MISSED'):
-            feedback_boost[key] = 3.0  # Triple weight for missed HRs
+            recent_barrel = float(pattern.get('batter_recent_barrel_rate', 0.0) or 0.0)
+            recent_pa = int(pattern.get('batter_pa_count_recent', 0) or 0)
+            if recent_barrel < 0.04 or recent_pa < 5:
+                feedback_boost[key] = 1.75
+            else:
+                feedback_boost[key] = 3.0
         else:
-            feedback_boost[key] = 1.5  # Slight boost for predicted ones (reinforce signal)
+            feedback_boost[key] = 1.5
     
     return feedback_boost
 

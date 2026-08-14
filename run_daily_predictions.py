@@ -438,6 +438,194 @@ def get_lineup_pa_expectation_with_starter_guard(batting_order_slot, is_starter=
     return get_lineup_slot_pa_expectation(slot)
 
 
+def _normalize_mlbam_player_id(value):
+    """Return a clean MLBAM player ID or None when the value is not an MLB player row."""
+    if value is None:
+        return None
+    text = str(value).strip().replace('ID', '').replace('id', '').strip()
+    if not text or not text.isdigit():
+        return None
+    player_id = int(text)
+    if player_id <= 0:
+        return None
+    return player_id
+
+
+def _is_excluded_roster_status(status_value):
+    """Reject minors / IL / restricted-list statuses before PA projection."""
+    if status_value is None:
+        return False
+    status_text = str(status_value).strip().lower()
+    if not status_text:
+        return False
+    excluded_tokens = (
+        'minors', 'minor league', 'aaa', 'aa', 'a+', 'a-', 'il-60', '60-day',
+        'restricted', 'restricted list', 'injured list', 'suspended', 'optioned'
+    )
+    return any(token in status_text for token in excluded_tokens)
+
+
+def _player_roster_status_from_info(player_info, fallback_status=None):
+    """Pull the most informative roster status from a player payload."""
+    if isinstance(player_info, dict):
+        status = player_info.get('status')
+        if isinstance(status, dict):
+            for candidate in [status.get('code'), status.get('description'), status.get('name')]:
+                if candidate not in (None, ''):
+                    return str(candidate)
+        if isinstance(status, str):
+            return status
+        person = player_info.get('person', {})
+        if isinstance(person, dict):
+            for candidate in [person.get('status'), person.get('rosterStatus')]:
+                if candidate not in (None, ''):
+                    return str(candidate)
+    if fallback_status not in (None, ''):
+        return str(fallback_status)
+    return None
+
+
+def _is_valid_mlb_game_record(game_record):
+    """Only allow MLB games unless a caller explicitly opts into a broader league cast."""
+    if not isinstance(game_record, dict):
+        return False
+    for key in ['sportId', 'sport_id', 'league_id', 'leagueId']:
+        value = game_record.get(key)
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text in {'', 'nan', 'none', 'null'}:
+            continue
+        try:
+            numeric = int(float(text))
+        except Exception:
+            numeric = None
+        if numeric is not None and numeric not in {1, 103}:
+            return False
+        if text not in {'1', '103', 'mlb'} and numeric is None:
+            if 'mlb' not in text:
+                return False
+    return True
+
+
+def _team_roster_status_map(team_id, season_year=None):
+    """Fetch a small status map for a given team to filter minors/IL players without noisy score pollution."""
+    if team_id in (None, '', 'nan'):
+        return {}
+    try:
+        team_id_int = int(float(str(team_id).strip()))
+    except Exception:
+        return {}
+    if team_id_int <= 0:
+        return {}
+    season = season_year or datetime.today().year
+    try:
+        roster_payload = statsapi.get('team_roster', {'teamId': team_id_int, 'season': season}) or {}
+    except Exception:
+        return {}
+    roster = roster_payload.get('roster', []) if isinstance(roster_payload, dict) else []
+    status_map = {}
+    for entry in roster:
+        person = entry.get('person', {}) if isinstance(entry, dict) else {}
+        player_id = _normalize_mlbam_player_id(person.get('id'))
+        if player_id is None:
+            continue
+        status_value = None
+        if isinstance(entry, dict):
+            status_value = _player_roster_status_from_info(entry, person.get('status'))
+            if status_value is None:
+                status_value = entry.get('status')
+        status_map[player_id] = status_value
+    return status_map
+
+
+def enforce_strict_mlb_roster(daily_lineup_df, savant_active_mlb_ids):
+    """Strip out non-active prospects and organizational depth-chart leaks."""
+    if daily_lineup_df is None:
+        return pd.DataFrame()
+    if daily_lineup_df.empty:
+        return daily_lineup_df.copy()
+    if 'batter_id' not in daily_lineup_df.columns:
+        return daily_lineup_df.copy()
+
+    active_ids = set()
+    if savant_active_mlb_ids is not None:
+        for value in savant_active_mlb_ids:
+            try:
+                active_ids.add(int(str(value).strip()))
+            except Exception:
+                pass
+    if not active_ids:
+        return daily_lineup_df.copy()
+
+    work = daily_lineup_df.copy()
+    work['batter_id_num'] = pd.to_numeric(work['batter_id'], errors='coerce')
+    clean_df = work[work['batter_id_num'].isin(active_ids)].copy()
+    clean_df = clean_df.drop(columns=['batter_id_num'], errors='ignore')
+
+    leak_count = int(len(work) - len(clean_df))
+    if leak_count > 0:
+        print(f" PIPELINE SANITIZED: Erased {leak_count} minor league prospect leaks.")
+    return clean_df
+
+
+def sanitize_daily_lineup_pool(live_matchups_df, active_mlb_ids=None):
+    """Hard-defense gate to ensure pitchers and non-MLB batters are scrubbed before scoring."""
+    if live_matchups_df is None:
+        return pd.DataFrame()
+    if live_matchups_df.empty:
+        return live_matchups_df.copy()
+
+    sanitized = live_matchups_df.copy()
+    pitcher_positions = {'P', 'SP', 'RP'}
+    position_cols = [col for col in ['batter_position', 'primary_position', 'position', 'pos'] if col in sanitized.columns]
+    if position_cols:
+        mask = pd.Series(True, index=sanitized.index)
+        for col in position_cols:
+            pos = sanitized[col].fillna('').astype(str).str.upper().str.strip()
+            mask &= ~pos.isin(pitcher_positions)
+        sanitized = sanitized[mask].copy()
+
+    if 'batter_id' in sanitized.columns:
+        batter_ids = sanitized['batter_id'].astype(str).str.replace('ID', '', regex=False).str.strip()
+        numeric_mask = batter_ids.str.isdigit() & (batter_ids.astype(int) > 0)
+        sanitized = sanitized.loc[numeric_mask].copy()
+        sanitized['batter_id'] = batter_ids.loc[numeric_mask].astype(int).astype(str)
+
+    if active_mlb_ids is not None and 'batter_id' in sanitized.columns:
+        sanitized = enforce_strict_mlb_roster(sanitized, active_mlb_ids)
+
+    if not sanitized.empty and 'batter_id' in sanitized.columns:
+        valid_count = pd.to_numeric(sanitized['batter_id'], errors='coerce').dropna().astype(int)
+        if len(valid_count) < 5:
+            sanitized = sanitized.iloc[0:0].copy()
+
+    dropped = int(len(live_matchups_df) - len(sanitized))
+    if dropped > 0:
+        print(f" CRITICAL REPAIR: Scrubbed {dropped} invalid or pitcher rows from batter pool.")
+    return sanitized
+
+
+def cap_reliever_matchup_pa(expected_pa, pitcher_is_starter=True, gs_value=None):
+    """Compress reliever volume to a single plate appearance cap to avoid overfitting bullpen role context."""
+    try:
+        pa = float(expected_pa)
+    except Exception:
+        pa = 4.0
+
+    if gs_value is not None:
+        try:
+            gs_num = int(float(gs_value))
+        except Exception:
+            gs_num = 1
+        if gs_num <= 0:
+            return float(np.clip(min(1.1, pa), 0.0, 1.1))
+
+    if not bool(pitcher_is_starter):
+        return float(np.clip(min(1.1, pa), 0.0, 1.1))
+    return float(np.clip(pa, 0.0, 10.0))
+
+
 def _load_roof_status_overrides():
     """Optional manual roof-status overrides from env JSON mapping venue -> status."""
     raw = str(os.getenv('ROOF_STATUS_OVERRIDES_JSON', '') or '').strip()
@@ -611,8 +799,67 @@ def build_bullpen_fatigue_multiplier_map(
     return team_map, debug_info
 
 
-# Stadium architecture wind-shield factors (0=no shield, 1=full shield).
-# Higher values reduce the effective outward-wind carry impact.
+def compute_bullpen_platoon_blend(hitter_profile, starter_profile, bullpen_pool_df, expected_total_pas):
+    """Blend starter barrel profile with a platoon-weighted bullpen profile.
+
+    This routine implements the late-game bullpen platoon edge: relievers who match the
+    hitter's handedness are upweighted, while fatigue reduces the chance of seeing a given arm.
+    """
+    try:
+        if bullpen_pool_df is None:
+            bullpen_pool_df = pd.DataFrame(columns=['player_id', 'throws', 'barrel_allowed_rate', 'recent_usage_3d'])
+        if not isinstance(bullpen_pool_df, pd.DataFrame):
+            bullpen_pool_df = pd.DataFrame(bullpen_pool_df)
+        if bullpen_pool_df.empty:
+            starter_val_raw = pd.to_numeric(starter_profile.get('pitch_barrel_allowed_rate', 0.08), errors='coerce')
+            starter_val = float(starter_val_raw) if pd.notna(starter_val_raw) else 0.08
+            return float(np.clip(starter_val, 0.0, 1.0))
+
+        pa_total = float(pd.to_numeric(expected_total_pas, errors='coerce'))
+        if not np.isfinite(pa_total) or pa_total <= 0:
+            pa_total = 4.22
+        w_start = float(min(1.0, 2.5 / pa_total))
+        w_pen = 1.0 - w_start
+
+        hand = str(hitter_profile.get('stands', hitter_profile.get('batter_hand', 'R')) or '').upper().strip() or 'R'
+        if hand not in {'L', 'R'}:
+            hand = 'R'
+
+        weights = []
+        barrel_values = []
+        for _, reliever in bullpen_pool_df.iterrows():
+            throws = str(reliever.get('throws', reliever.get('pitcher_hand', 'R')) or '').upper().strip() or 'R'
+            if throws not in {'L', 'R'}:
+                throws = 'R'
+
+            usage_val = pd.to_numeric(reliever.get('recent_usage_3d', 0.0), errors='coerce')
+            usage = float(usage_val) if pd.notna(usage_val) else 0.0
+            fatigue_multiplier = max(0.0, 1.0 - np.clip(usage, 0.0, 1.0))
+            platoon_leverage = 3.0 if throws == hand else 1.0
+            sw = platoon_leverage * fatigue_multiplier
+            weights.append(float(sw))
+
+            barrel_val = pd.to_numeric(reliever.get('barrel_allowed_rate', reliever.get('pitch_barrel_allowed_rate', 0.08)), errors='coerce')
+            barrel_value = float(barrel_val) if pd.notna(barrel_val) else 0.08
+            barrel_values.append(barrel_value)
+
+        total_sw = float(sum(weights))
+        if total_sw <= 0:
+            comp_bullpen_barrel = float(pd.to_numeric(bullpen_pool_df['barrel_allowed_rate'].mean(), errors='coerce').fillna(0.08))
+        else:
+            normalized = [w / total_sw for w in weights]
+            comp_bullpen_barrel = float(np.dot(barrel_values, normalized))
+
+        starter_val_raw = pd.to_numeric(starter_profile.get('pitch_barrel_allowed_rate', 0.08), errors='coerce')
+        starter_val = float(starter_val_raw) if pd.notna(starter_val_raw) else 0.08
+        final_blend = (w_start * starter_val) + (w_pen * comp_bullpen_barrel)
+        return round(float(np.clip(final_blend, 0.0, 1.0)), 4)
+    except Exception:
+        starter_val_raw = pd.to_numeric(starter_profile.get('pitch_barrel_allowed_rate', 0.08), errors='coerce')
+        starter_val = float(starter_val_raw) if pd.notna(starter_val_raw) else 0.08
+        return round(float(np.clip(starter_val, 0.0, 1.0)), 4)
+
+
 STADIUM_WIND_SHIELDING = {
     'SF': 0.55,   # Oracle: enclosed geometry + marine layer effects.
     'CHC': 0.05,  # Wrigley: highly wind-sensitive.
@@ -6851,6 +7098,8 @@ def get_today_matchups():
     for game in schedule:
         if game.get('status') in ['Cancelled', 'Postponed']:
             continue
+        if not _is_valid_mlb_game_record(game):
+            continue
 
         game_id = game.get('game_pk') or game.get('game_id')
         if not game_id:
@@ -7086,6 +7335,11 @@ def get_today_matchups():
                 elif not team_info or not opp_info:
                     continue
 
+                home_team_id = game.get('home_id') or (raw_game.get('gameData', {}).get('teams', {}).get('home', {}).get('id') if raw_game else None)
+                away_team_id = game.get('away_id') or (raw_game.get('gameData', {}).get('teams', {}).get('away', {}).get('id') if raw_game else None)
+                team_roster_status = _team_roster_status_map(home_team_id if team_type == 'home' else away_team_id)
+                opp_roster_status = _team_roster_status_map(away_team_id if team_type == 'home' else home_team_id)
+
                 pitchers = opp_info.get('pitchers') or []
                 pitcher_id = pitchers[0] if pitchers else None
                 p_throws = 'R'
@@ -7096,7 +7350,9 @@ def get_today_matchups():
                         p_throws = 'R'
 
                 # In sparse pregame states, roster-proxy batting orders can create noisy/misaligned rows.
-                allow_roster_proxy_lineup = str(os.getenv('ALLOW_ROSTER_PROXY_LINEUP', 'false')).strip().lower() in {'1', 'true', 'yes'}
+                # Hard override: do not allow proxy lineups to satisfy the daily slate. Only confirmed
+                # batting-order IDs or a validated fallback with enough MLBAM IDs are accepted.
+                allow_roster_proxy_lineup = False
 
                 batting_order = team_info.get('battingOrder') or team_info.get('batters') or []
                 fallback_lineup_used = False
@@ -7126,8 +7382,9 @@ def get_today_matchups():
 
                 seen_batters = set()
                 for order_idx, batter_id in enumerate(batting_order):
-                    batter_id = str(batter_id).replace('ID', '')
-                    if not batter_id or batter_id in seen_batters:
+                    batter_id = str(batter_id).replace('ID', '').strip()
+                    batter_id_num = _normalize_mlbam_player_id(batter_id)
+                    if batter_id_num is None or not batter_id or batter_id in seen_batters:
                         continue
                     seen_batters.add(batter_id)
                     batter_player_info = team_info.get('players', {}).get(f"ID{batter_id}", {})
@@ -7135,6 +7392,9 @@ def get_today_matchups():
                         batter_player_info = raw_team_info.get('players', {}).get(f"ID{batter_id}", {})
                     batter_person = batter_player_info.get('person', {})
                     batter_name = batter_person.get('fullName', 'Unknown Batter')
+                    batter_status = _player_roster_status_from_info(batter_player_info, team_roster_status.get(batter_id_num))
+                    if _is_excluded_roster_status(batter_status):
+                        continue
 
                     b_stands = batter_player_info.get('batSide', {}).get('code')
                     if not b_stands:
@@ -7157,6 +7417,16 @@ def get_today_matchups():
                     # Fall back to pre-resolved probable pitcher ID when boxscore hasn't populated yet.
                     if not pitcher_id:
                         pitcher_id = probable_away_pitcher_id if team_type == 'home' else probable_home_pitcher_id
+                    pitcher_id_num = _normalize_mlbam_player_id(pitcher_id)
+                    if pitcher_id_num is None:
+                        continue
+                    pitcher_id = str(pitcher_id_num)
+                    pitcher_status = _player_roster_status_from_info(
+                        opp_info.get('players', {}).get(f"ID{pitcher_id}", {}),
+                        opp_roster_status.get(pitcher_id_num),
+                    )
+                    if _is_excluded_roster_status(pitcher_status):
+                        continue
 
                     # Re-resolve pitcher hand after fallback pitcher assignment.
                     if pitcher_id and (not p_throws or str(p_throws).strip().upper() not in {'R', 'L'}):
@@ -7184,10 +7454,14 @@ def get_today_matchups():
                         order_idx + 1,
                         is_starter=(order_idx < 9),
                     )
+                    if _is_excluded_roster_status(batter_status):
+                        expected_pa = 0.0
 
                     matchups.append({
                         'game_pk': game_id,
                         'game_id': game_id,
+                        'batter_game_id': game_id,
+                        'pitcher_game_id': game_id,
                         'game_time': game_time_str,
                         'venue_id': venue_id,
                         'venue_name': venue_name,
@@ -7237,7 +7511,16 @@ def get_today_matchups():
             "Set REALTIME_WEATHER_FAIL_HARD=false to allow fallback weather."
         )
 
-    return pd.DataFrame(matchups)
+    final_matchups = pd.DataFrame(matchups)
+    if not final_matchups.empty:
+        for game_contract in ['batter_game_id', 'pitcher_game_id']:
+            if game_contract in final_matchups.columns:
+                final_matchups[game_contract] = pd.to_numeric(final_matchups[game_contract], errors='coerce')
+        if {'batter_game_id', 'pitcher_game_id'}.issubset(final_matchups.columns):
+            same_game_mask = final_matchups['batter_game_id'].astype(str).str.strip() == final_matchups['pitcher_game_id'].astype(str).str.strip()
+            final_matchups = final_matchups[same_game_mask].copy()
+        final_matchups = sanitize_daily_lineup_pool(final_matchups)
+    return final_matchups
 
 # =====================================================================
 # PITCHER DEGRADATION DETECTION FOR POWER SPIKE CATCHING
@@ -11232,12 +11515,21 @@ def generate_daily_predictions():
             + ", ".join(features_train)
         )
     
-    # Ensure all required weather columns exist in training data
-    for weather_col, default_val in [('humidity', 50.0), ('precipitation', 0.0), ('pressure', 1013.25)]:
+    # Ensure all required weather columns exist in training data.
+    # These are part of the model contract and must exist before X_train is built.
+    for weather_col, default_val in [
+        ('apparent_temp', 72.0),
+        ('dew_point', 55.0),
+        ('wind_gust', 0.0),
+        ('cloud_cover', 50.0),
+        ('humidity', 50.0),
+        ('precipitation', 0.0),
+        ('pressure', 1013.25),
+    ]:
         if weather_col not in train_df.columns:
             train_df[weather_col] = default_val
         else:
-            train_df[weather_col] = train_df[weather_col].fillna(default_val)
+            train_df[weather_col] = pd.to_numeric(train_df[weather_col], errors='coerce').fillna(default_val)
 
     # Validate training data first; live dataframe is assembled later in the flow.
     dataflow_issues = validate_model_dataflow(
@@ -12124,6 +12416,60 @@ def generate_daily_predictions():
             else:
                 live[col] = live[col].fillna(50.0)
 
+    def _build_team_bullpen_pool(team_abbr, source_df):
+        team_abbr = str(team_abbr or '').strip().upper()
+        if not team_abbr or source_df is None or source_df.empty:
+            return pd.DataFrame(columns=['player_id', 'throws', 'barrel_allowed_rate', 'recent_usage_3d'])
+
+        work = source_df.copy()
+        if 'pitching_team' in work.columns:
+            work = work[work['pitching_team'].astype(str).str.upper().str.strip() == team_abbr].copy()
+        elif {'home_team', 'away_team', 'inning_topbot'}.issubset(set(work.columns)):
+            side = work['inning_topbot'].astype(str).str.lower().str.strip()
+            work = work[(side.str.startswith('top') & (work['home_team'].astype(str).str.upper().str.strip() == team_abbr)) |
+                        (side.str.startswith('bot') & (work['away_team'].astype(str).str.upper().str.strip() == team_abbr))].copy()
+        elif 'team' in work.columns:
+            work = work[work['team'].astype(str).str.upper().str.strip() == team_abbr].copy()
+        if work.empty:
+            return pd.DataFrame(columns=['player_id', 'throws', 'barrel_allowed_rate', 'recent_usage_3d'])
+
+        if 'pitcher' not in work.columns:
+            return pd.DataFrame(columns=['player_id', 'throws', 'barrel_allowed_rate', 'recent_usage_3d'])
+
+        work = work.copy()
+        work['pitcher'] = pd.to_numeric(work['pitcher'], errors='coerce')
+        work = work[work['pitcher'].notna()].copy()
+        if work.empty:
+            return pd.DataFrame(columns=['player_id', 'throws', 'barrel_allowed_rate', 'recent_usage_3d'])
+
+        session = work.groupby('pitcher', as_index=False).agg(
+            pitcher_hand=('pitcher_hand', lambda s: str(s.dropna().astype(str).str.upper().str.strip().iloc[0]) if s.notna().any() else 'R'),
+            barrel_allowed_rate=('is_barrel', 'mean'),
+            recent_usage_3d=('pitcher', lambda s: float(np.clip((len(s) / max(1, len(work))) * 2.0, 0.0, 1.0))),
+        )
+        session['player_id'] = session['pitcher'].astype(int)
+        session['throws'] = session['pitcher_hand'].fillna('R')
+        session['recent_usage_3d'] = pd.to_numeric(session['recent_usage_3d'], errors='coerce').fillna(0.0).clip(0.0, 1.0)
+        session['barrel_allowed_rate'] = pd.to_numeric(session['barrel_allowed_rate'], errors='coerce').fillna(0.08)
+        return session[['player_id', 'throws', 'barrel_allowed_rate', 'recent_usage_3d']].copy()
+
+    live['bullpen_platoon_blended_barrel_rate'] = live.apply(
+        lambda r: compute_bullpen_platoon_blend(
+            hitter_profile={'stands': r.get('batter_hand', r.get('stand', 'R'))},
+            starter_profile={'pitch_barrel_allowed_rate': pd.to_numeric(r.get('pitch_barrel_allowed_rate', 0.08), errors='coerce').fillna(0.08)},
+            bullpen_pool_df=_build_team_bullpen_pool(
+                r.get('away_team') if bool(r.get('is_home_game', False)) else r.get('home_team'),
+                statcast_df,
+            ),
+            expected_total_pas=float(pd.to_numeric(r.get('lineup_pa_expectation', 4.22), errors='coerce').fillna(4.22)),
+        ),
+        axis=1,
+    )
+    live['pitch_barrel_allowed_rate'] = pd.to_numeric(
+        live['bullpen_platoon_blended_barrel_rate'],
+        errors='coerce'
+    ).fillna(pd.to_numeric(live.get('pitch_barrel_allowed_rate', 0.08), errors='coerce').fillna(0.08))
+
     # Pitcher intent pivot variable: out-of-zone avoidance against elite power bats.
     elite_power = set(
         b_stats[
@@ -12215,6 +12561,16 @@ def generate_daily_predictions():
         errors='coerce'
     ).fillna(slot_projected_pas)
 
+    # Defensive role cap: relievers and non-starter contexts should never receive full starter PA volume.
+    if 'pitcher_is_starter' in live.columns:
+        lineups_for_role = live['pitcher_is_starter'].map(lambda v: bool(v) if pd.notna(v) else True)
+        lineup_pa_expectation = lineup_pa_expectation.where(lineups_for_role, 1.1)
+        lineup_pa_expectation = lineup_pa_expectation.clip(lower=0.0, upper=6.8)
+    if 'pitcher_gs' in live.columns:
+        gs_values = pd.to_numeric(live['pitcher_gs'], errors='coerce').fillna(1)
+        lineup_pa_expectation = lineup_pa_expectation.where(gs_values > 0, 1.1)
+        lineup_pa_expectation = lineup_pa_expectation.clip(lower=0.0, upper=6.8)
+
     implied_team_total_col = None
     for candidate in ['team_implied_total', 'implied_team_total', 'vegas_team_total']:
         if candidate in live.columns:
@@ -12231,12 +12587,24 @@ def generate_daily_predictions():
 
     projected_pas = []
     game_level_probs = []
-    for p_pa, base_pa, team_total, game_total in zip(probs, lineup_pa_expectation, implied_team_totals, game_totals):
+    for idx, (p_pa, base_pa, team_total, game_total) in enumerate(zip(probs, lineup_pa_expectation, implied_team_totals, game_totals)):
         expected_pa = adjust_expected_pa_for_context(
             base_pa,
             team_implied_total=team_total,
             game_total=game_total,
         )
+        if 'pitcher_is_starter' in live.columns:
+            expected_pa = cap_reliever_matchup_pa(
+                expected_pa,
+                pitcher_is_starter=bool(live.iloc[idx].get('pitcher_is_starter', True)),
+                gs_value=live.iloc[idx].get('pitcher_gs', 1),
+            )
+        elif 'pitcher_gs' in live.columns:
+            expected_pa = cap_reliever_matchup_pa(
+                expected_pa,
+                pitcher_is_starter=True,
+                gs_value=live.iloc[idx].get('pitcher_gs', 1),
+            )
         pa_dist = build_expected_pa_distribution(expected_pa, spread=pa_dist_spread)
         game_prob = calculate_game_hr_probability(p_pa, pa_dist)
         projected_pas.append(expected_pa)

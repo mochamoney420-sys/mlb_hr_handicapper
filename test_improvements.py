@@ -4,6 +4,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 print("Testing improvements...\n")
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -123,6 +125,38 @@ def test_bench_players_receive_zero_pa_expectation():
 
     assert starter_pa > 0.0
     assert bench_pa == 0.0
+
+
+def test_sanitize_daily_lineup_pool_drops_pitcher_rows_and_requires_minimum_players():
+    df = pd.DataFrame({
+        'batter_id': [101, 102, 103, 104, 105, 106],
+        'batter_position': ['P', 'RF', '1B', 'LF', 'CF', '2B'],
+    })
+
+    clean = rdp.sanitize_daily_lineup_pool(df, active_mlb_ids={101, 102, 103, 104, 105, 106})
+
+    assert len(clean) == 5
+    assert set(clean['batter_position']) == {'RF', '1B', 'LF', 'CF', '2B'}
+
+
+def test_compute_bullpen_platoon_blend_weighting_uses_platoon_and_usage():
+    hitter_profile = {'stands': 'R'}
+    starter_profile = {'pitch_barrel_allowed_rate': 0.08}
+    bullpen_pool_df = pd.DataFrame({
+        'player_id': [1, 2, 3],
+        'throws': ['R', 'L', 'L'],
+        'barrel_allowed_rate': [0.12, 0.15, 0.18],
+        'recent_usage_3d': [0.10, 0.40, 0.60],
+    })
+
+    blended = rdp.compute_bullpen_platoon_blend(
+        hitter_profile=hitter_profile,
+        starter_profile=starter_profile,
+        bullpen_pool_df=bullpen_pool_df,
+        expected_total_pas=4.0,
+    )
+
+    assert blended == pytest.approx(0.0993, abs=1e-4)
 
 
 def test_alert_threshold_is_dynamic_not_hardcoded_12_percent(monkeypatch):
