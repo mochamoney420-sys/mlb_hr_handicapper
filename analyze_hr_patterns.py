@@ -365,13 +365,14 @@ def extract_hr_patterns(actual_hrs, training_data):
         # Batter's recent form
         if not batter_pas.empty:
             batter_pas_sorted = batter_pas.sort_values('game_date', ascending=False).head(20)
-            hr_features['batter_recent_avg_exit_velo'] = float(
-                batter_pas_sorted['launch_speed'].dropna().mean() 
-                if not batter_pas_sorted['launch_speed'].dropna().empty else 0
-            )
-            hr_features['batter_recent_barrel_rate'] = float(
-                (batter_pas_sorted['launch_speed'] >= 98).mean()
-            )
+            valid_ev = pd.to_numeric(batter_pas_sorted.get('launch_speed', pd.Series([np.nan] * len(batter_pas_sorted))), errors='coerce').dropna()
+            valid_ev = valid_ev[valid_ev > 70.0]
+            if valid_ev.empty:
+                hr_features['batter_recent_avg_exit_velo'] = 88.0
+                hr_features['batter_recent_barrel_rate'] = 0.0
+            else:
+                hr_features['batter_recent_avg_exit_velo'] = float(valid_ev.mean())
+                hr_features['batter_recent_barrel_rate'] = float((valid_ev >= 98).mean())
             hr_features['batter_hr_rate_recent'] = float(
                 (batter_pas_sorted['events'] == 'home_run').mean()
             )
@@ -380,12 +381,13 @@ def extract_hr_patterns(actual_hrs, training_data):
         # Pitcher's vulnerability
         if not pitcher_pas.empty:
             pitcher_pas_sorted = pitcher_pas.sort_values('game_date', ascending=False).head(20)
+            valid_ev = pd.to_numeric(pitcher_pas_sorted.get('launch_speed', pd.Series([np.nan] * len(pitcher_pas_sorted))), errors='coerce').dropna()
+            valid_ev = valid_ev[valid_ev > 70.0]
             hr_features['pitcher_recent_hr_allowed_rate'] = float(
                 (pitcher_pas_sorted['events'] == 'home_run').mean()
             )
             hr_features['pitcher_recent_avg_exit_velo_allowed'] = float(
-                pitcher_pas_sorted['launch_speed'].dropna().mean() 
-                if not pitcher_pas_sorted['launch_speed'].dropna().empty else 0
+                valid_ev.mean() if not valid_ev.empty else 88.0
             )
             hr_features['pitcher_pa_count_recent'] = int(len(pitcher_pas_sorted))
         

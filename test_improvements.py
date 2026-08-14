@@ -86,6 +86,54 @@ except Exception as e:
     print(f"   ❌ Tracker integration test failed: {e}")
     sys.exit(1)
 
+import pandas as pd
+import analyze_hr_patterns as ahp
+import run_daily_predictions as rdp
+import update_predictions as upd
+
+
+def test_extract_hr_patterns_ignores_empty_statcast_physics_and_uses_baseline():
+    actual_hrs = pd.DataFrame({
+        'batter': [101],
+        'pitcher': [202],
+        'batter_name': ['CJ Abrams'],
+        'pitcher_name': ['Shota Imanaga'],
+        'model_prob': [0.083],
+    })
+    training_data = pd.DataFrame({
+        'batter': [101] * 5,
+        'pitcher': [202] * 5,
+        'game_date': [
+            '2026-08-08', '2026-08-07', '2026-08-06', '2026-08-05', '2026-08-04'
+        ],
+        'launch_speed': [0.0, 0.0, 0.0, 0.0, 0.0],
+        'events': ['single'] * 5,
+    })
+
+    patterns, _ = ahp.extract_hr_patterns(actual_hrs, training_data)
+
+    assert patterns
+    assert patterns[0]['batter_recent_avg_exit_velo'] == 88.0
+    assert patterns[0]['batter_recent_barrel_rate'] == 0.0
+
+
+def test_bench_players_receive_zero_pa_expectation():
+    starter_pa = rdp.get_lineup_pa_expectation_with_starter_guard(1, is_starter=True)
+    bench_pa = rdp.get_lineup_pa_expectation_with_starter_guard(10, is_starter=False)
+
+    assert starter_pa > 0.0
+    assert bench_pa == 0.0
+
+
+def test_alert_threshold_is_dynamic_not_hardcoded_12_percent(monkeypatch):
+    monkeypatch.setenv('DISCORD_MIN_PROB', '0.06')
+    monkeypatch.delenv('DISCORD_ALERT_THRESHOLD', raising=False)
+    threshold = upd.get_live_alert_threshold()
+
+    assert threshold < 0.12
+    assert threshold >= 0.05
+
+
 print("\n" + "=" * 70)
 print("✅ ALL TESTS PASSED")
 print("=" * 70)

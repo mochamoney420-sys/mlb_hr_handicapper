@@ -46,6 +46,45 @@ def load_current_predictions():
         print(f"✗ Error loading predictions: {e}")
         return pd.DataFrame()
 
+
+def get_live_alert_threshold():
+    """Return the current live Discord alert threshold.
+
+    Prefer an explicit override, then the model's own Discord min-prob setting,
+    and finally a modest default so real alerts are not suppressed by a strict
+    hardcoded 12% gate.
+    """
+    env_keys = ['DISCORD_ALERT_THRESHOLD', 'DISCORD_ALERT_MIN_PROB', 'DISCORD_MIN_PROB']
+    for key in env_keys:
+        raw = os.getenv(key)
+        if raw is not None and str(raw).strip() != '':
+            try:
+                value = float(raw)
+                if np.isfinite(value):
+                    return float(np.clip(value, 0.05, 0.12))
+            except Exception:
+                continue
+
+    default = 0.06
+    try:
+        from run_daily_predictions import resolve_adaptive_prediction_threshold
+        diag = resolve_adaptive_prediction_threshold(
+            days_lookback=21,
+            min_files=2,
+            min_rows=200,
+            min_hr_rows=8,
+            min_threshold=0.05,
+            max_threshold=0.10,
+        )
+        if bool(diag.get('applied')):
+            tuned = float(diag.get('threshold', default))
+            return float(np.clip(tuned, 0.05, 0.10))
+    except Exception:
+        pass
+
+    return float(default)
+
+
 def get_todays_lineups():
     """Get current lineups for today's games."""
     try:

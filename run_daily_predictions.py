@@ -420,6 +420,24 @@ def get_lineup_slot_pa_expectation(batting_order_slot):
     return float(slot_map.get(max(1, min(9, slot)), 4.22))
 
 
+def get_lineup_pa_expectation_with_starter_guard(batting_order_slot, is_starter=True):
+    """Guard against ghost bench hitters inheriting PAs from a 9-slot lineup.
+
+    Non-starters should not receive projected plate appearances, even when a sparse
+    feed includes extra roster batters beyond the real lineup. This prevents bench
+    players from inflating volume and diluting the true HR signal.
+    """
+    try:
+        slot = int(batting_order_slot)
+    except Exception:
+        slot = 5
+    if not bool(is_starter):
+        return 0.0
+    if slot > 9:
+        return 0.0
+    return get_lineup_slot_pa_expectation(slot)
+
+
 def _load_roof_status_overrides():
     """Optional manual roof-status overrides from env JSON mapping venue -> status."""
     raw = str(os.getenv('ROOF_STATUS_OVERRIDES_JSON', '') or '').strip()
@@ -4826,7 +4844,7 @@ def _parse_retry_after_seconds(resp):
         return None
 
 
-def _compute_odds_request_wait_seconds(history, *, max_per_minute=500, now_ts=None):
+def _compute_odds_request_wait_seconds(history, *, max_per_minute=1000, now_ts=None):
     """Return how long to wait before the next odds request to stay under a per-minute cap."""
     if not history:
         return 0.0
@@ -4846,7 +4864,7 @@ def _throttle_odds_requests(*, max_per_minute=None, now_ts=None):
     """Pause briefly when the odds provider request history is approaching the minute cap."""
     global _ODDS_API_REQUEST_HISTORY
     if max_per_minute is None:
-        max_per_minute = max(1, int(str(os.getenv('ODDS_API_MAX_PER_MINUTE', '500')).strip() or '500'))
+        max_per_minute = max(1, int(str(os.getenv('ODDS_API_MAX_PER_MINUTE', '1000')).strip() or '1000'))
 
     now_ts = now_ts if now_ts is not None else time.time()
     _ODDS_API_REQUEST_HISTORY = [ts for ts in _ODDS_API_REQUEST_HISTORY if now_ts - float(ts) <= 60.0]
@@ -7162,6 +7180,11 @@ def get_today_matchups():
                     ):
                         continue
 
+                    expected_pa = get_lineup_pa_expectation_with_starter_guard(
+                        order_idx + 1,
+                        is_starter=(order_idx < 9),
+                    )
+
                     matchups.append({
                         'game_pk': game_id,
                         'game_id': game_id,
@@ -7182,7 +7205,7 @@ def get_today_matchups():
                         'pitcher_hand': p_throws,
                         'has_platoon_advantage': int(b_stands != p_throws),
                         'batting_order_slot': order_idx + 1,
-                        'lineup_pa_expectation': get_lineup_slot_pa_expectation(order_idx + 1),
+                        'lineup_pa_expectation': expected_pa,
                         'wind_out_component': wind_out_component,
                         'park_factor': handed_park_factor,
                         'temp': weather['temp'],
@@ -11839,8 +11862,22 @@ def generate_daily_predictions():
         live['bat_hr_rate_vs_lhp'] = live['bat_hr_rate_vs_lhp'].fillna(0.033)
     if 'lineup_pa_expectation' in live.columns:
         live['lineup_pa_expectation'] = pd.to_numeric(live['lineup_pa_expectation'], errors='coerce').fillna(4.22)
+        if 'is_starter' in live.columns:
+            live['lineup_pa_expectation'] = live.apply(
+                lambda r: get_lineup_pa_expectation_with_starter_guard(
+                    r.get('batting_order_slot', 1),
+                    is_starter=bool(r.get('is_starter', True)),
+                ) if pd.notna(r.get('batting_order_slot')) else 0.0,
+                axis=1,
+            )
+        else:
+            live['lineup_pa_expectation'] = live.get('batting_order_slot', pd.Series([5] * len(live))).apply(
+                lambda slot: get_lineup_pa_expectation_with_starter_guard(slot, is_starter=(slot <= 9))
+            )
     else:
-        live['lineup_pa_expectation'] = live.get('batting_order_slot', pd.Series([5] * len(live))).apply(get_lineup_slot_pa_expectation)
+        live['lineup_pa_expectation'] = live.get('batting_order_slot', pd.Series([5] * len(live))).apply(
+            lambda slot: get_lineup_pa_expectation_with_starter_guard(slot, is_starter=(slot <= 9))
+        )
     live['game_time'] = live['game_time'].fillna('') if 'game_time' in live.columns else ''
     live['home_team'] = live['home_team'].fillna('') if 'home_team' in live.columns else ''
     live['away_team'] = live['away_team'].fillna('') if 'away_team' in live.columns else ''
@@ -13408,6 +13445,7 @@ def generate_daily_predictions():
     hard_min_recent_precision = float(np.clip(_env_float('HARD_MIN_RECENT_PRECISION', 0.08), 0.01, 0.50))
     hard_precision_floor_min_prob = float(np.clip(_env_float('HARD_PRECISION_FLOOR_MIN_PROB', 0.07), 0.02, 0.25))
     hard_precision_floor_min_ev_pct = float(np.clip(_env_float('HARD_PRECISION_FLOOR_MIN_EV_PCT', 10.0), 0.0, 40.0))
+    precision_floor_soft_mode = str(os.getenv('HARD_PRECISION_FLOOR_SOFT_MODE', 'true')).strip().lower() not in {'0', 'false', 'no'}
     effective_top_prob_n = int(discord_top_prob_n)
     effective_top_ev_n = int(discord_top_ev_n)
     effective_radar_n = int(discord_radar_n)
@@ -13477,21 +13515,38 @@ def generate_daily_predictions():
             recent_precision = float(precision_diag.get('precision', 0.0))
             if recent_precision < hard_min_recent_precision:
                 pressure = float(np.clip((hard_min_recent_precision - recent_precision) / max(0.01, hard_min_recent_precision), 0.0, 1.5))
-                effective_discord_min_prob = max(effective_discord_min_prob, hard_precision_floor_min_prob)
-                effective_discord_min_ev_pct = max(effective_discord_min_ev_pct, hard_precision_floor_min_ev_pct)
-                tighten_mult = float(np.clip(1.0 - (0.60 * pressure), 0.35, 1.0))
-                effective_top_prob_n = max(6, int(round(effective_top_prob_n * tighten_mult)))
-                effective_top_ev_n = max(2, int(round(effective_top_ev_n * tighten_mult)))
-                effective_radar_n = max(4, int(round(effective_radar_n * tighten_mult)))
-                if hard_budget_enabled:
-                    hard_budget_total = max(8, int(round(hard_budget_total * tighten_mult)))
-                print(
-                    "Hard precision floor triggered: "
-                    f"recent_precision={recent_precision:.3f} < floor={hard_min_recent_precision:.3f}; "
-                    f"min_prob={effective_discord_min_prob * 100:.2f}%, "
-                    f"min_ev={effective_discord_min_ev_pct:.1f}%, "
-                    f"tighten_mult={tighten_mult:.2f}"
-                )
+                if precision_floor_soft_mode:
+                    effective_discord_min_prob = max(effective_discord_min_prob, min(hard_precision_floor_min_prob, discord_min_prob + 0.025))
+                    effective_discord_min_ev_pct = max(effective_discord_min_ev_pct, min(hard_precision_floor_min_ev_pct, discord_min_ev_pct + 4.0))
+                    tighten_mult = float(np.clip(1.0 - (0.35 * pressure), 0.55, 1.0))
+                    effective_top_prob_n = max(6, int(round(effective_top_prob_n * tighten_mult)))
+                    effective_top_ev_n = max(2, int(round(effective_top_ev_n * tighten_mult)))
+                    effective_radar_n = max(4, int(round(effective_radar_n * tighten_mult)))
+                    if hard_budget_enabled:
+                        hard_budget_total = max(8, int(round(hard_budget_total * tighten_mult)))
+                    print(
+                        "Soft precision floor applied: "
+                        f"recent_precision={recent_precision:.3f} < floor={hard_min_recent_precision:.3f}; "
+                        f"min_prob={effective_discord_min_prob * 100:.2f}%, "
+                        f"min_ev={effective_discord_min_ev_pct:.1f}%, "
+                        f"tighten_mult={tighten_mult:.2f}"
+                    )
+                else:
+                    effective_discord_min_prob = max(effective_discord_min_prob, hard_precision_floor_min_prob)
+                    effective_discord_min_ev_pct = max(effective_discord_min_ev_pct, hard_precision_floor_min_ev_pct)
+                    tighten_mult = float(np.clip(1.0 - (0.60 * pressure), 0.35, 1.0))
+                    effective_top_prob_n = max(6, int(round(effective_top_prob_n * tighten_mult)))
+                    effective_top_ev_n = max(2, int(round(effective_top_ev_n * tighten_mult)))
+                    effective_radar_n = max(4, int(round(effective_radar_n * tighten_mult)))
+                    if hard_budget_enabled:
+                        hard_budget_total = max(8, int(round(hard_budget_total * tighten_mult)))
+                    print(
+                        "Hard precision floor triggered: "
+                        f"recent_precision={recent_precision:.3f} < floor={hard_min_recent_precision:.3f}; "
+                        f"min_prob={effective_discord_min_prob * 100:.2f}%, "
+                        f"min_ev={effective_discord_min_ev_pct:.1f}%, "
+                        f"tighten_mult={tighten_mult:.2f}"
+                    )
         else:
             print(f"Hard precision floor diagnostics unavailable: {precision_diag.get('reason', 'unknown')}")
 
