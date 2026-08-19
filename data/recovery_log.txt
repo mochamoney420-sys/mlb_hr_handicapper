@@ -27,3 +27,115 @@
 [2026-08-12T15:15:36.704665] ✅ Live monitor restarted successfully
 [2026-08-13T07:00:07.570302] Triggering daily predictions pipeline...
 [2026-08-13T07:09:39.058320] ✅ Daily predictions completed successfully
+[2026-08-14T15:49:04.615399] Attempting to restart live HR monitor...
+[2026-08-14T15:49:06.674786] ✅ Live monitor restarted successfully
+[2026-08-15T01:57:34.294466] Triggering daily predictions pipeline...
+[2026-08-15T03:00:05.358565] Triggering daily predictions pipeline...
+[2026-08-15T03:03:53.435891] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  4.79it/s]
+100%|##########| 1/1 [00:00<00:00,  4.74it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-15T03:03:53.531618] Attempting to restart live HR monitor...
+[2026-08-15T03:03:55.691119] ✅ Live monitor restarted successfully
+[2026-08-15T13:36:36.578973] Triggering daily predictions pipeline...
+[2026-08-15T13:45:19.074616] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  1.18it/s]
+100%|##########| 1/1 [00:00<00:00,  1.18it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-15T16:05:28.689544] Triggering daily predictions pipeline...
+[2026-08-15T16:07:35.420791] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|          | 0/1 [00:00<?, ?it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|          | 0/1 [00:00<?, ?it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|  
+[2026-08-16T11:00:04.824421] Triggering daily predictions pipeline...
+[2026-08-16T11:01:57.406395] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|          | 0/1 [00:00<?, ?it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|          | 0/1 [00:00<?, ?it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|  
+[2026-08-17T05:00:51.630922] Triggering daily predictions pipeline...
+[2026-08-17T05:03:20.619386] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|          | 0/1 [00:00<?, ?it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|          | 0/1 [00:00<?, ?it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+  0%|  
+[2026-08-17T07:57:04.052957] Triggering daily predictions pipeline...
+[2026-08-17T15:00:03.638385] Triggering daily predictions pipeline...
+[2026-08-17T15:03:08.860468] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  4.54it/s]
+100%|##########| 1/1 [00:00<00:00,  4.42it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-17T15:03:08.916734] Attempting to restart live HR monitor...
+[2026-08-17T15:03:10.958531] ✅ Live monitor restarted successfully
+[2026-08-17T19:00:05.380962] Triggering daily predictions pipeline...
+[2026-08-17T19:04:04.349023] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  5.66it/s]
+100%|##########| 1/1 [00:00<00:00,  5.48it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-18T03:53:04.140203] Triggering daily predictions pipeline...
+[2026-08-18T06:15:33.251666] ❌ Predictions timed out (>10 min)
+[2026-08-18T07:00:07.955104] Triggering daily predictions pipeline...
+[2026-08-18T07:05:21.901337] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  1.59it/s]
+100%|##########| 1/1 [00:00<00:00,  1.59it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-18T15:30:27.145831] Triggering daily predictions pipeline...
+[2026-08-18T15:33:51.913025] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  6.05it/s]
+100%|##########| 1/1 [00:00<00:00,  6.03it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-18T19:22:15.616783] Triggering daily predictions pipeline...
+[2026-08-18T19:26:32.638050] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  5.47it/s]
+100%|##########| 1/1 [00:00<00:00,  5.32it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-19T11:00:05.153640] Triggering daily predictions pipeline...
+[2026-08-19T11:04:11.563868] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  1.54it/s]
+100%|##########| 1/1 [00:00<00:00,  1.54it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00
+[2026-08-19T15:00:02.661712] Triggering daily predictions pipeline...
+[2026-08-19T15:03:46.933206] ❌ Predictions failed: 
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00:00,  4.90it/s]
+100%|##########| 1/1 [00:00<00:00,  4.82it/s]
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|##########| 1/1 [00:00<00

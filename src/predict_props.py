@@ -1,13 +1,20 @@
 import datetime
+import os
+
 import pandas as pd
 import requests
 
 # 1. Fetch today's MLB matchups from a sports API
 # Note: Replace with your chosen provider (e.g., The Odds API, SportsDataIO, or MLB Stats API)
 API_URL = "https://the-odds-api.com"
-API_KEY = "f983b6d08915175390d5e308e1207041"
+API_KEY = os.getenv("ODDS_API_KEY")
+
 
 def get_todays_games():
+    if not API_KEY:
+        print("Missing ODDS_API_KEY in environment; refusing to call the live provider.")
+        return None
+
     params = {"apiKey": API_KEY, "regions": "us", "markets": "h2h"}
     response = requests.get(API_URL, params=params)
     print("Status Code:", response.status_code)

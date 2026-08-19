@@ -112,6 +112,28 @@ def _env_float(name, default):
         return float(default)
 
 
+def _safe_numeric_scalar(value, default=0.0):
+    """Return a Python float from scalar or pandas-like numeric input.
+
+    This avoids the live crash where `pd.to_numeric(v, errors='coerce')` may
+    produce a bare float for scalar inputs, which does not support `.fillna()`.
+    """
+    try:
+        if value is None:
+            return float(default)
+        number = pd.to_numeric(value, errors='coerce')
+        if isinstance(number, pd.Series):
+            number = number.fillna(default)
+            if number.empty:
+                return float(default)
+            return float(number.iloc[0])
+        if number is None or (isinstance(number, float) and (np.isnan(number))):
+            return float(default)
+        return float(number)
+    except Exception:
+        return float(default)
+
+
 def _normalise_hand_value(value):
     """Return a canonical handedness code for common MLB inputs."""
     if pd.isna(value):
@@ -2087,8 +2109,21 @@ def enrich_training_weather_from_history(pa_df):
     return pa_df
 
 
+def _resolve_run_date(date_str=None, default_today=None):
+    """Resolve the active run date, honoring explicit historical overrides."""
+    default_today = default_today or datetime.today()
+    raw = date_str or os.getenv('MLB_HR_TARGET_DATE') or os.getenv('PREDICTION_DATE_OVERRIDE') or os.getenv('MODEL_DATE_OVERRIDE')
+    if not raw:
+        return default_today
+    try:
+        return datetime.strptime(str(raw).strip(), '%Y-%m-%d')
+    except Exception:
+        return default_today
+
+
 def persist_daily_predictions(predictions_df, date_str=None):
-    date_str = date_str or datetime.today().strftime('%Y-%m-%d')
+    resolved_date = _resolve_run_date(date_str)
+    date_str = resolved_date.strftime('%Y-%m-%d')
     Path('data').mkdir(parents=True, exist_ok=True)
     filename = Path('data') / f'predictions_{date_str}.csv'
     predictions_df.to_csv(filename, index=False)
@@ -3290,7 +3325,17 @@ def calculate_probability_metrics(y_true, probs):
     if log_loss is None:
         logloss_value = float('nan')
     else:
-        logloss_value = float(log_loss(labels, probs_array))
+        unique_labels = np.unique(labels)
+        if len(unique_labels) < 2:
+            logloss_value = float('nan')
+        else:
+            try:
+                logloss_value = float(log_loss(labels, probs_array, labels=[0, 1]))
+            except Exception:
+                try:
+                    logloss_value = float(log_loss(labels, probs_array))
+                except Exception:
+                    logloss_value = float('nan')
 
     brier_value = float(np.mean((probs_array - labels) ** 2))
     return {'log_loss': logloss_value, 'brier_score': brier_value}
@@ -4175,6 +4220,53 @@ def run_model_self_check(days_lookback=30):
             for fail in silent_failures:
                 print(f"   {fail}")
         return False
+
+
+def evaluate_runtime_guardrails(module_status=None, raw_odds=None, source_age_seconds=None, live_data_ok=True):
+    """Fail closed on silent degradation, stale market data, or placeholder payloads.
+
+    This is a lightweight runtime validation layer that prevents the system from
+    continuing with obviously bad live inputs while everything still appears green.
+    """
+    module_status = module_status or {}
+    reasons = []
+    status = 'ok'
+
+    dependency_gate = module_status.get('core_dependencies_ok', True)
+    if not dependency_gate:
+        reasons.append('core dependencies unavailable')
+        status = 'warning'
+
+    if live_data_ok is False:
+        reasons.append('live data unavailable')
+        status = 'warning'
+
+    if source_age_seconds is not None:
+        try:
+            source_age_seconds = float(source_age_seconds)
+            if np.isfinite(source_age_seconds) and source_age_seconds > 1800:
+                reasons.append(f'stale source data age={source_age_seconds:.0f}s')
+                status = 'blocked' if status != 'warning' else 'warning'
+        except Exception:
+            pass
+
+    if isinstance(raw_odds, dict):
+        placeholder_tokens = {'player a', 'player b', 'player c', 'unknown', 'n/a', 'null', ''}
+        names = [str(k).strip().lower() for k in raw_odds.keys()]
+        nonempty = [n for n in names if n and n not in placeholder_tokens]
+        if len(nonempty) < 2:
+            reasons.append('placeholder or empty odds payload')
+            status = 'blocked' if status != 'warning' else 'warning'
+
+    if not reasons:
+        return {'status': 'ok', 'reasons': [], 'should_block': False}
+
+    should_block = status == 'blocked'
+    return {
+        'status': status,
+        'reasons': reasons,
+        'should_block': should_block,
+    }
 
 
 def _repo_data_dir():
@@ -11137,7 +11229,10 @@ def calculate_ev_premium(model_prob, market_prob, market_odds_american=None):
     return (ev_value, decimal_odds, ev_percent)
 
 
-def generate_daily_predictions():
+def generate_daily_predictions(date_str=None):
+    active_run_date = _resolve_run_date(date_str)
+    active_date_str = active_run_date.strftime('%Y-%m-%d')
+
     def _env_int(name, default):
         try:
             return int(float(os.getenv(name, str(default))))
@@ -11150,6 +11245,12 @@ def generate_daily_predictions():
         except Exception:
             return float(default)
 
+    def _runtime_today():
+        return active_run_date
+
+    def _runtime_date_str(offset_days=0):
+        return (active_run_date + timedelta(days=offset_days)).strftime('%Y-%m-%d')
+
     # =====================================================================
     # PHASE 0: LEARN FROM YESTERDAY'S HOME RUNS (Automatic Pattern Analysis)
     # =====================================================================
@@ -11158,7 +11259,7 @@ def generate_daily_predictions():
     print("="*70)
     learning_result = {}
     try:
-        yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+        yesterday_str = _runtime_date_str(-1)
         pre_eval_status = ensure_evaluation_file_for_date(yesterday_str, auto_repair=True)
         if pre_eval_status.get('exists'):
             print(
@@ -11337,7 +11438,7 @@ def generate_daily_predictions():
     train_df = apply_rolling_training_window(train_df)
 
     # Auto-evaluate yesterday's predictions to feed the learning loop
-    yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+    yesterday_str = _runtime_date_str(-1)
     eval_backfill = ensure_evaluation_file_for_date(yesterday_str, auto_repair=True)
     if eval_backfill.get('exists'):
         print(
@@ -12442,9 +12543,25 @@ def generate_daily_predictions():
         if work.empty:
             return pd.DataFrame(columns=['player_id', 'throws', 'barrel_allowed_rate', 'recent_usage_3d'])
 
+        # Historical / cached data is not guaranteed to have every raw Statcast field used by
+        # the bullpen blend. Guard the aggregation with sensible defaults so backfills do not
+        # crash on partial or older snapshots.
+        hand_col = 'pitcher_hand' if 'pitcher_hand' in work.columns else 'p_throws' if 'p_throws' in work.columns else None
+        if hand_col is not None:
+            work['pitcher_hand'] = work[hand_col].astype(str).str.upper().str.strip().fillna('R')
+        else:
+            work['pitcher_hand'] = 'R'
+
+        if 'is_barrel' in work.columns:
+            work['barrel_allowed_rate'] = pd.to_numeric(work['is_barrel'], errors='coerce').fillna(0.08)
+        elif 'barrel_allowed_rate' in work.columns:
+            work['barrel_allowed_rate'] = pd.to_numeric(work['barrel_allowed_rate'], errors='coerce').fillna(0.08)
+        else:
+            work['barrel_allowed_rate'] = 0.08
+
         session = work.groupby('pitcher', as_index=False).agg(
             pitcher_hand=('pitcher_hand', lambda s: str(s.dropna().astype(str).str.upper().str.strip().iloc[0]) if s.notna().any() else 'R'),
-            barrel_allowed_rate=('is_barrel', 'mean'),
+            barrel_allowed_rate=('barrel_allowed_rate', 'mean'),
             recent_usage_3d=('pitcher', lambda s: float(np.clip((len(s) / max(1, len(work))) * 2.0, 0.0, 1.0))),
         )
         session['player_id'] = session['pitcher'].astype(int)
@@ -12456,12 +12573,12 @@ def generate_daily_predictions():
     live['bullpen_platoon_blended_barrel_rate'] = live.apply(
         lambda r: compute_bullpen_platoon_blend(
             hitter_profile={'stands': r.get('batter_hand', r.get('stand', 'R'))},
-            starter_profile={'pitch_barrel_allowed_rate': pd.to_numeric(r.get('pitch_barrel_allowed_rate', 0.08), errors='coerce').fillna(0.08)},
+            starter_profile={'pitch_barrel_allowed_rate': _safe_numeric_scalar(r.get('pitch_barrel_allowed_rate', 0.08), 0.08)},
             bullpen_pool_df=_build_team_bullpen_pool(
                 r.get('away_team') if bool(r.get('is_home_game', False)) else r.get('home_team'),
                 statcast_df,
             ),
-            expected_total_pas=float(pd.to_numeric(r.get('lineup_pa_expectation', 4.22), errors='coerce').fillna(4.22)),
+            expected_total_pas=_safe_numeric_scalar(r.get('lineup_pa_expectation', 4.22), 4.22),
         ),
         axis=1,
     )
@@ -13784,7 +13901,7 @@ def generate_daily_predictions():
                                     'sidecar_max_delta', 'sidecar_update_count',
                                     'sidecar_training_applied', 'sidecar_training_update_count',
                                     'confidence_lower_95pct', 'confidence_upper_95pct', 'model_reliability', 'batter_consistency_score',
-                                    'model_name', 'prediction_timestamp']])
+                                    'model_name', 'prediction_timestamp']], active_date_str)
 
     # Professional daily filter stack: market + availability first, then environment,
     # then matchup, then power. This prevents wasting compute and reduces look-ahead bias.
@@ -14179,7 +14296,7 @@ def generate_daily_predictions():
 
     discrepancy_top_n = max(3, _env_int('STRAIGHT_DISCREPANCY_TOP_N', 12))
     straight_discrepancies = build_single_straight_market_discrepancies(live, top_n=discrepancy_top_n)
-    target_date = datetime.today().strftime('%Y-%m-%d')
+    target_date = active_date_str
     if straight_discrepancies.empty:
         print("Single-straight discrepancy scan: no rows passed discrepancy filters.")
     else:

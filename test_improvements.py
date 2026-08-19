@@ -88,6 +88,7 @@ except Exception as e:
     print(f"   ❌ Tracker integration test failed: {e}")
     sys.exit(1)
 
+import numpy as np
 import pandas as pd
 import analyze_hr_patterns as ahp
 import run_daily_predictions as rdp
@@ -166,6 +167,35 @@ def test_alert_threshold_is_dynamic_not_hardcoded_12_percent(monkeypatch):
 
     assert threshold < 0.12
     assert threshold >= 0.05
+
+
+def test_runtime_guardrails_block_placeholder_or_stale_data(monkeypatch):
+    monkeypatch.setenv('ODDS_API_KEY', 'dummy-key')
+    guard = rdp.evaluate_runtime_guardrails(
+        module_status={'core_dependencies_ok': True},
+        raw_odds={
+            'Player A': {'draftkings': -110},
+            'Player B': {'draftkings': -110},
+        },
+        source_age_seconds=3600,
+        live_data_ok=True,
+    )
+
+    assert guard['status'] in {'blocked', 'warning'}
+    assert any('stale' in reason.lower() or 'placeholder' in reason.lower() for reason in guard['reasons'])
+
+
+def test_predict_props_uses_env_key_not_hardcoded_secret():
+    text = (REPO_ROOT / 'src' / 'predict_props.py').read_text(encoding='utf-8', errors='ignore')
+    assert 'API_KEY = "' not in text
+    assert 'os.getenv("ODDS_API_KEY"' in text or 'os.getenv(\'ODDS_API_KEY\'' in text
+
+
+def test_calculate_probability_metrics_handles_single_class_labels():
+    metrics = rdp.calculate_probability_metrics([0, 0, 0], [0.05, 0.10, 0.15])
+
+    assert metrics['brier_score'] == pytest.approx(0.0116666667, abs=1e-6)
+    assert np.isnan(metrics['log_loss'])
 
 
 print("\n" + "=" * 70)
