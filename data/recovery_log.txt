@@ -139,3 +139,9 @@
 
   0%|          | 0/1 [00:00<?, ?it/s]
 100%|##########| 1/1 [00:00<00
+[2026-08-20T08:31:27.132130] Triggering daily predictions pipeline...
+[2026-08-20T08:41:28.026698] ❌ Predictions timed out (>10 min)
+[2026-08-20T11:56:27.737841] Triggering daily predictions pipeline...
+[2026-08-20T12:06:27.940199] ❌ Predictions timed out (>10 min)
+[2026-08-20T12:06:28.074936] Attempting to restart live HR monitor...
+[2026-08-20T12:06:32.204956] ✅ Live monitor restarted successfully

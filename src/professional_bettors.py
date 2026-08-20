@@ -35,52 +35,75 @@ def get_pitcher_platoon_splits(pitcher_id, statcast_data):
     """
     if statcast_data is None or statcast_data.empty:
         return {'rh_hitters': {}, 'lh_hitters': {}}
-    
+
     pitcher_data = statcast_data[statcast_data['pitcher'] == pitcher_id].copy()
-    
     if pitcher_data.empty:
         return {'rh_hitters': {}, 'lh_hitters': {}}
-    
+
     splits = {'rh_hitters': {}, 'lh_hitters': {}}
-    
+
+    def _safe_rate(frame, *, key_prefix=''):
+        if frame.empty:
+            return 0.0
+        ball_count = len(frame)
+        if ball_count == 0:
+            return 0.0
+        if 'launch_speed' in frame.columns:
+            launch_speed = pd.to_numeric(frame['launch_speed'], errors='coerce')
+            hard_hit_mask = launch_speed >= 95
+            hard_hit_rate = float(hard_hit_mask.sum()) / float(ball_count)
+        else:
+            hard_hit_rate = 0.0
+        if 'launch_speed' in frame.columns and 'launch_angle' in frame.columns:
+            launch_speed = pd.to_numeric(frame['launch_speed'], errors='coerce')
+            launch_angle = pd.to_numeric(frame['launch_angle'], errors='coerce')
+            barrel_mask = (launch_speed >= 98) & (launch_angle.between(26, 30))
+            barrel_rate = float(barrel_mask.sum()) / float(ball_count)
+        else:
+            barrel_rate = 0.0
+        if key_prefix == 'hr_per_fb':
+            fly_balls = frame[frame.get('bb_type', pd.Series([''], index=frame.index)) == 'fly_ball'] if 'bb_type' in frame.columns else frame.iloc[0:0]
+            return float(len(frame[frame['events'] == 'home_run']) / max(len(fly_balls), 1))
+        return hard_hit_rate if key_prefix == 'hard_hit_rate' else barrel_rate
+
     # RHH splits
     rhh_data = pitcher_data[pitcher_data['stand'] == 'R']
     if len(rhh_data) > 0:
         rhh_batted = rhh_data[rhh_data['type'] == 'pitch']
         if len(rhh_batted) > 0:
             rhh_hrs = len(rhh_batted[rhh_batted['events'] == 'home_run'])
-            rhh_fly_balls = len(rhh_batted[rhh_batted['bb_type'] == 'fly_ball'])
-            
+            rhh_fly_balls = len(rhh_batted[rhh_batted['bb_type'] == 'fly_ball']) if 'bb_type' in rhh_batted.columns else 0
+            rhh_barrel_rate = _safe_rate(rhh_batted)
+            rhh_hard_hit_rate = _safe_rate(rhh_batted, key_prefix='hard_hit_rate')
             splits['rh_hitters'] = {
                 'plate_appearances': len(rhh_data),
                 'batted_balls': len(rhh_batted),
                 'home_runs': rhh_hrs,
                 'fly_balls': rhh_fly_balls,
                 'hr_per_fb': rhh_hrs / max(rhh_fly_balls, 1),
-                'barrel_rate': len(rhh_batted[(rhh_batted['launch_speed'] >= 98) & 
-                                             (rhh_batted['launch_angle'].between(26, 30))]) / len(rhh_batted),
-                'hard_hit_rate': len(rhh_batted[rhh_batted['launch_speed'] >= 95]) / len(rhh_batted)
+                'barrel_rate': rhh_barrel_rate,
+                'hard_hit_rate': rhh_hard_hit_rate,
             }
-    
+
     # LHH splits
     lhh_data = pitcher_data[pitcher_data['stand'] == 'L']
     if len(lhh_data) > 0:
         lhh_batted = lhh_data[lhh_data['type'] == 'pitch']
         if len(lhh_batted) > 0:
             lhh_hrs = len(lhh_batted[lhh_batted['events'] == 'home_run'])
-            lhh_fly_balls = len(lhh_batted[lhh_batted['bb_type'] == 'fly_ball'])
-            
+            lhh_fly_balls = len(lhh_batted[lhh_batted['bb_type'] == 'fly_ball']) if 'bb_type' in lhh_batted.columns else 0
+            lhh_barrel_rate = _safe_rate(lhh_batted)
+            lhh_hard_hit_rate = _safe_rate(lhh_batted, key_prefix='hard_hit_rate')
             splits['lh_hitters'] = {
                 'plate_appearances': len(lhh_data),
                 'batted_balls': len(lhh_batted),
                 'home_runs': lhh_hrs,
                 'fly_balls': lhh_fly_balls,
                 'hr_per_fb': lhh_hrs / max(lhh_fly_balls, 1),
-                'barrel_rate': len(lhh_batted[(lhh_batted['launch_speed'] >= 98) & 
-                                             (lhh_batted['launch_angle'].between(26, 30))]) / len(lhh_batted),
-                'hard_hit_rate': len(lhh_batted[lhh_batted['launch_speed'] >= 95]) / len(lhh_batted)
+                'barrel_rate': lhh_barrel_rate,
+                'hard_hit_rate': lhh_hard_hit_rate,
             }
-    
+
     return splits
 
 
@@ -108,11 +131,10 @@ def identify_platoon_mismatches(batter_id, pitcher_id, batter_hand, statcast_dat
     
     if not splits or splits.get('batted_balls', 0) < 10:
         return 1.0  # Insufficient data
-    
-    # Calculate edge multiplier
-    hr_fb = splits.get('hr_per_fb', 0)
-    barrel_rate = splits.get('barrel_rate', 0)
-    
+
+    hr_fb = float(np.nan_to_num(splits.get('hr_per_fb', 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+    barrel_rate = float(np.nan_to_num(splits.get('barrel_rate', 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+
     # Base multiplier from HR/FB
     if hr_fb >= 0.15:  # 15%+ HR/FB is elite vulnerability
         multiplier = 1.3  # 30% probability uplift
@@ -122,18 +144,17 @@ def identify_platoon_mismatches(batter_id, pitcher_id, batter_hand, statcast_dat
         multiplier = 1.1  # 10% uplift
     else:
         multiplier = 1.0
-    
+
     # Sightline bonus for opposite-handed matchups
     if is_opposite_handed and barrel_rate >= 0.08:
-        # Opposite-handed batters see fastballs better
-        multiplier *= 1.15  # Additional +15% for sightline advantage
-    
+        multiplier *= 1.15
+
     # Reverse-split anomaly detection (same-handed guy crushing it)
     if not is_opposite_handed and hr_fb >= 0.13:
-        # Same-handed hitter with unusually high HR/FB = pitcher weakness
-        multiplier *= 1.12  # +12% bonus for reverse-split anomaly
-    
-    return min(multiplier, 1.5)  # Cap at 50% total uplift
+        multiplier *= 1.12
+
+    final_multiplier = float(np.nan_to_num(multiplier, nan=1.0, posinf=1.5, neginf=1.0))
+    return min(final_multiplier, 1.5)
 
 
 def detect_breaking_pitch_vulnerability(pitcher_id, batter_hand, statcast_data):

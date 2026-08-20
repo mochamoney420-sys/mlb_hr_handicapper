@@ -710,7 +710,7 @@ _auto_load_savant_ballpark_dimensions()
 
 
 def _resolve_ballpark_key(team):
-    """Resolve BALLPARK_DATA key from canonical key, team abbrev, or stadium name."""
+    """Resolve BALLPARK_DATA key from canonical key, team abbrev, stadium name, or common alias."""
     if team in BALLPARK_DATA:
         return team
 
@@ -718,13 +718,61 @@ def _resolve_ballpark_key(team):
     if not team_str:
         return None
 
+    alias_map = {
+        'BOS': 'Red Sox', 'Boston': 'Red Sox', 'RED SOX': 'Red Sox',
+        'NYY': 'Yankees', 'New York Yankees': 'Yankees', 'YANKEES': 'Yankees',
+        'PHI': 'Phillies', 'Philadelphia': 'Phillies', 'PHILLIES': 'Phillies',
+        'SF': 'Giants', 'San Francisco': 'Giants', 'GIANTS': 'Giants',
+        'LAD': 'Dodgers', 'Los Angeles Dodgers': 'Dodgers', 'DODGERS': 'Dodgers',
+        'TB': 'Rays', 'Tampa Bay': 'Rays', 'RAYS': 'Rays',
+        'BAL': 'Orioles', 'Baltimore': 'Orioles', 'ORIOLES': 'Orioles',
+        'TOR': 'Blue Jays', 'Toronto': 'Blue Jays', 'BLUE JAYS': 'Blue Jays',
+        'CWS': 'White Sox', 'Chicago White Sox': 'White Sox', 'WHITE SOX': 'White Sox',
+        'CLE': 'Guardians', 'Cleveland': 'Guardians', 'GUARDIANS': 'Guardians',
+        'DET': 'Tigers', 'Detroit': 'Tigers', 'TIGERS': 'Tigers',
+        'MIN': 'Twins', 'Minnesota': 'Twins', 'TWINS': 'Twins',
+        'KC': 'Royals', 'Kansas City': 'Royals', 'ROYALS': 'Royals',
+        'TEX': 'Rangers', 'Texas': 'Rangers', 'RANGERS': 'Rangers',
+        'HOU': 'Astros', 'Houston': 'Astros', 'ASTROS': 'Astros',
+        'OAK': 'Athletics', 'Oakland': 'Athletics', 'ATHLETICS': 'Athletics',
+        'SEA': 'Mariners', 'Seattle': 'Mariners', 'MARINERS': 'Mariners',
+        'LAA': 'Angels', 'Los Angeles Angels': 'Angels', 'ANGELS': 'Angels',
+        'MIA': 'Marlins', 'Miami': 'Marlins', 'MARLINS': 'Marlins',
+        'ATL': 'Braves', 'Atlanta': 'Braves', 'BRAVES': 'Braves',
+        'NYM': 'Mets', 'New York Mets': 'Mets', 'METS': 'Mets',
+        'WAS': 'Nationals', 'Washington': 'Nationals', 'NATIONALS': 'Nationals',
+        'MIL': 'Brewers', 'Milwaukee': 'Brewers', 'BREWERS': 'Brewers',
+        'CHC': 'Cubs', 'Chicago Cubs': 'Cubs', 'CUBS': 'Cubs',
+        'CIN': 'Reds', 'Cincinnati': 'Reds', 'REDS': 'Reds',
+        'PIT': 'Pirates', 'Pittsburgh': 'Pirates', 'PIRATES': 'Pirates',
+        'STL': 'Cardinals', 'St. Louis': 'Cardinals', 'CARDINALS': 'Cardinals',
+        'ARI': 'Diamondbacks', 'Arizona': 'Diamondbacks', 'DIAMONDBACKS': 'Diamondbacks',
+        'COL': 'Rockies', 'Colorado': 'Rockies', 'ROCKIES': 'Rockies',
+        'SD': 'Padres', 'San Diego': 'Padres', 'PADRES': 'Padres',
+        'ATL': 'Braves', 'Atlanta Braves': 'Braves', 'BRAVES': 'Braves',
+    }
+
     upper = team_str.upper()
     if upper in TEAM_TO_BALLPARK_KEY:
         return TEAM_TO_BALLPARK_KEY[upper]
+    if team_str in alias_map:
+        alias = alias_map[team_str]
+        if alias in BALLPARK_DATA:
+            return alias
+    if upper in alias_map:
+        alias = alias_map[upper]
+        if alias in BALLPARK_DATA:
+            return alias
+    if upper in {'RED SOX', 'YANKEES', 'PHILLIES', 'GIANTS', 'DODGERS', 'RAYS', 'ORIOLES', 'BLUE JAYS', 'WHITE SOX', 'GUARDIANS', 'TIGERS', 'TWINS', 'ROYALS', 'RANGERS', 'ASTROS', 'ATHLETICS', 'MARINERS', 'ANGELS', 'MARLINS', 'BRAVES', 'METS', 'NATIONALS', 'BREWERS', 'CUBS', 'REDS', 'PIRATES', 'CARDINALS', 'DIAMONDBACKS', 'ROCKIES', 'PADRES'}:
+        return alias_map.get(upper)
 
     lower = team_str.lower()
     if lower in STADIUM_NAME_TO_BALLPARK_KEY:
         return STADIUM_NAME_TO_BALLPARK_KEY[lower]
+
+    for key, park_key in BALLPARK_DATA.items():
+        if key.lower() == lower or park_key.get('name', '').lower() == lower:
+            return key
 
     return None
 

@@ -941,6 +941,11 @@ def compute_micro_atmo_carry_adjustment(
         shield = 0.95
 
     if roof_flag:
+        temp_f = 71.5
+        humidity = 45.0
+        pressure_mbar = 1013.25
+        wind_speed = 0.0
+        wind_dir = 0.0
         air_density = 1.225
         drag_multiplier = 1.0
         effective_wind_out = 0.0
@@ -5207,11 +5212,15 @@ def _throttle_odds_requests(*, max_per_minute=None, now_ts=None):
 
     now_ts = now_ts if now_ts is not None else time.time()
     _ODDS_API_REQUEST_HISTORY = [ts for ts in _ODDS_API_REQUEST_HISTORY if now_ts - float(ts) <= 60.0]
+    if len(_ODDS_API_REQUEST_HISTORY) > 10000:
+        _ODDS_API_REQUEST_HISTORY = _ODDS_API_REQUEST_HISTORY[-10000:]
     wait_seconds = _compute_odds_request_wait_seconds(_ODDS_API_REQUEST_HISTORY, max_per_minute=max_per_minute, now_ts=now_ts)
     if wait_seconds > 0:
         time.sleep(wait_seconds)
         now_ts = time.time()
         _ODDS_API_REQUEST_HISTORY = [ts for ts in _ODDS_API_REQUEST_HISTORY if now_ts - float(ts) <= 60.0]
+        if len(_ODDS_API_REQUEST_HISTORY) > 10000:
+            _ODDS_API_REQUEST_HISTORY = _ODDS_API_REQUEST_HISTORY[-10000:]
     _ODDS_API_REQUEST_HISTORY.append(time.time())
 
 
@@ -5294,13 +5303,22 @@ def _has_viable_lineup_fallback(lineup_ids, *, min_players=5):
     return len(valid_ids) >= min_players
 
 
-def _filter_current_slate_sgo_events(events_payload):
+def _filter_current_slate_sgo_events(events_payload, *, now=None):
     """Keep only current slate events from Sportsgameodds payload."""
     events_payload = list(events_payload or [])
     if not events_payload:
         return []
 
-    today_local = datetime.today().date()
+    now_dt = now or datetime.now(timezone.utc)
+    if not isinstance(now_dt, datetime):
+        try:
+            now_dt = datetime.fromisoformat(str(now_dt).replace('Z', '+00:00'))
+        except Exception:
+            now_dt = datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+
+    today_local = now_dt.astimezone(timezone.utc).date()
     allowed_dates = {today_local, (today_local + timedelta(days=1))}
     kept = []
     stale_count = 0
@@ -5312,7 +5330,9 @@ def _filter_current_slate_sgo_events(events_payload):
         if dt is None:
             unknown_count += 1
             continue
-        d = dt.date()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        d = dt.astimezone(timezone.utc).date()
         if d < today_local:
             stale_count += 1
             continue
@@ -7435,11 +7455,12 @@ def get_today_matchups():
                 pitchers = opp_info.get('pitchers') or []
                 pitcher_id = pitchers[0] if pitchers else None
                 p_throws = 'R'
+
+                # Do not finalize handedness until the resolved pitcher ID is stable.
+                # This prevents a stale default from surviving the pregame fallback path.
                 if pitcher_id:
                     pitcher_player_info = opp_info.get('players', {}).get(f"ID{pitcher_id}", {})
-                    p_throws = pitcher_player_info.get('stats', {}).get('pitching', {}).get('pitchHand', 'R')
-                    if not p_throws:
-                        p_throws = 'R'
+                    p_throws = pitcher_player_info.get('stats', {}).get('pitching', {}).get('pitchHand', 'R') or 'R'
 
                 # In sparse pregame states, roster-proxy batting orders can create noisy/misaligned rows.
                 # Hard override: do not allow proxy lineups to satisfy the daily slate. Only confirmed
@@ -7520,8 +7541,14 @@ def get_today_matchups():
                     if _is_excluded_roster_status(pitcher_status):
                         continue
 
-                    # Re-resolve pitcher hand after fallback pitcher assignment.
-                    if pitcher_id and (not p_throws or str(p_throws).strip().upper() not in {'R', 'L'}):
+                    # Re-resolve the pitcher hand only after the fallback ID is finalized.
+                    opp_pitcher_info = opp_info.get('players', {}).get(f"ID{pitcher_id}", {})
+                    p_throws = str(
+                        opp_pitcher_info.get('stats', {}).get('pitching', {}).get('pitchHand', 'R')
+                        or opp_pitcher_info.get('pitchHand', {}).get('code', 'R')
+                        or 'R'
+                    ).strip().upper() or 'R'
+                    if p_throws not in {'R', 'L'}:
                         try:
                             pp_info = statsapi.lookup_player(str(pitcher_name), gameType='R') if pitcher_name else []
                             if pp_info:
@@ -8247,6 +8274,7 @@ def load_feedback_weights(train_df, days_lookback=30):
     base_weights = result.reindex(train_df.index).fillna(1.0)
     feedback_weights, feedback_match_diag = build_feedback_weight_series(train_df, eval_df, return_diagnostics=True)
     final_weights = dampen_feedback_training_weights(base_weights * feedback_weights).clip(lower=0.5, upper=4.0).values
+    final_weights = final_weights / max(float(np.mean(final_weights)), 1e-9)
     missed_upweighted = int((final_weights > 1.5).sum())
     false_pos_penalized = int((final_weights < 1.0).sum())
     print(
@@ -10250,7 +10278,7 @@ def apply_recent_empirical_calibration(
         if np.unique(np.round(x, 6)).size < max(5, int(min_unique_probs)):
             return work, {'applied': False, 'reason': 'insufficient_unique_probs'}
 
-        iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='linear')
         iso.fit(x, y)
 
         base_probs = pd.to_numeric(work.get('pred_hr_prob', 0.0), errors='coerce').fillna(0.0).clip(0.0, 0.99)
@@ -10891,12 +10919,13 @@ def apply_expert_signal_boosts(live_df, base_probs):
     if live_df is None:
         return np.asarray(base_probs, dtype=float)
 
-    probs = np.asarray(base_probs, dtype=float).reshape(-1)
-    if len(probs) != len(live_df):
-        probs = np.resize(probs, len(live_df))
-
     if len(live_df) == 0:
-        return probs
+        return np.asarray(base_probs, dtype=float).reshape(-1)
+
+    probs = pd.Series(base_probs, index=live_df.index, dtype=float).reindex(live_df.index).fillna(0.0).to_numpy()
+    if probs.size != len(live_df):
+        probs = np.resize(np.asarray(base_probs, dtype=float).reshape(-1), len(live_df))
+        probs = pd.Series(probs, index=live_df.index, dtype=float).fillna(0.0).to_numpy()
 
     def _series_or_default(column, default):
         if column in live_df.columns:
@@ -11994,7 +12023,7 @@ def generate_daily_predictions(date_str=None):
 
                 holdout_calibrated = None
                 if calibration_method == 'isotonic' and IsotonicRegression is not None:
-                    calibration_model = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+                    calibration_model = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='linear')
                     calibration_model.fit(np.asarray(holdout_raw).reshape(-1), holdout_labels)
                     holdout_calibrated = np.asarray(calibration_model.predict(np.asarray(holdout_raw).reshape(-1)))
                 elif calibration_method == 'none':
@@ -16251,7 +16280,8 @@ def _detect_live_odds_inversion_signal(game, play_by_play, power_profile, best_o
     if not best_odds_now or not best_odds_prev:
         return alerts
 
-    min_jump = _safe_int(os.getenv('LIVE_ODDS_SPIKE_MIN_JUMP', '200'), 200) or 200
+    min_implied_move = max(0.005, _env_float('LIVE_ODDS_SPIKE_MIN_IMPLIED_DELTA', 0.020))
+    legacy_min_jump = _safe_int(os.getenv('LIVE_ODDS_SPIKE_MIN_JUMP', '200'), 200) or 200
     from_max = _safe_int(os.getenv('LIVE_ODDS_SPIKE_FROM_MAX', '500'), 500) or 500
     to_min = _safe_int(os.getenv('LIVE_ODDS_SPIKE_TO_MIN', '650'), 650) or 650
     next_hitters_n = max(1, _safe_int(os.getenv('LIVE_ODDS_NEXT_HITTERS', '3'), 3) or 3)
@@ -16294,7 +16324,14 @@ def _detect_live_odds_inversion_signal(game, play_by_play, power_profile, best_o
             continue
         if prev_odds <= 0 or now_odds <= 0:
             continue
-        if not (prev_odds <= from_max and now_odds >= to_min and (now_odds - prev_odds) >= min_jump):
+
+        try:
+            implied_move = max(0.0, american_to_implied_prob(now_odds) - american_to_implied_prob(prev_odds))
+        except Exception:
+            implied_move = 0.0
+
+        legacy_jump = (now_odds - prev_odds) >= legacy_min_jump
+        if not (prev_odds <= from_max and now_odds >= to_min and (implied_move >= min_implied_move or legacy_jump)):
             continue
 
         prof = by_name.get(norm, {})

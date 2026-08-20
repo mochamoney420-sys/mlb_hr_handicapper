@@ -28,6 +28,8 @@ $settings1 = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
     -StartWhenAvailable `
     -RunOnlyIfNetworkAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 5) `
     -MultipleInstances IgnoreNew
 
 Register-ScheduledTask `
@@ -55,6 +57,8 @@ $settings2 = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 12) `
     -StartWhenAvailable `
     -RunOnlyIfNetworkAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 5) `
     -MultipleInstances IgnoreNew
 
 Register-ScheduledTask `
@@ -81,7 +85,9 @@ $trigger3 = New-ScheduledTaskTrigger -Daily -At "12:00PM"
 $settings3 = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 12) `
     -StartWhenAvailable `
-    -RunOnlyIfNetworkAvailable
+    -RunOnlyIfNetworkAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 5)
 
 Register-ScheduledTask `
     -TaskName "MLB_HR_LiveWatcher" `
@@ -108,6 +114,8 @@ $settings4 = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
     -StartWhenAvailable `
     -RunOnlyIfNetworkAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 5) `
     -MultipleInstances IgnoreNew
 
 Register-ScheduledTask `
