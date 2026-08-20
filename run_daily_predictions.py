@@ -9558,7 +9558,12 @@ def _ensure_discord_radar_columns(rankings_df):
             work['hr_probability'] = 0.0
 
     if 'physics_delta' not in work.columns:
-        work['physics_delta'] = 0.0
+        final_prob = pd.to_numeric(work.get('hr_probability', work.get('pred_hr_prob', 0.0)), errors='coerce').fillna(0.0)
+        base_prob = pd.to_numeric(work.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
+        if 'base_model_prob' in work.columns or 'hr_probability' in work.columns:
+            work['physics_delta'] = final_prob - base_prob
+        else:
+            work['physics_delta'] = 0.0
 
     if 'ev_pct' not in work.columns:
         if 'ev_percent' in work.columns:
@@ -9880,16 +9885,13 @@ def _prepare_discord_rankings(live_df):
         return work
 
     if 'physics_delta' not in work.columns:
-        if {'physics_hr_prob', 'base_model_prob'}.issubset(set(work.columns)):
-            work['physics_delta'] = (
-                pd.to_numeric(work['physics_hr_prob'], errors='coerce').fillna(0.0)
-                - pd.to_numeric(work['base_model_prob'], errors='coerce').fillna(0.0)
-            )
-        elif 'pred_hr_prob' in work.columns and 'base_model_prob' in work.columns:
-            work['physics_delta'] = (
-                pd.to_numeric(work['pred_hr_prob'], errors='coerce').fillna(0.0)
-                - pd.to_numeric(work['base_model_prob'], errors='coerce').fillna(0.0)
-            )
+        final_prob = pd.to_numeric(
+            work.get('pred_hr_prob', work.get('physics_hr_prob', work.get('hr_probability', 0.0))),
+            errors='coerce'
+        ).fillna(0.0)
+        base_prob = pd.to_numeric(work.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
+        if 'base_model_prob' in work.columns or 'pred_hr_prob' in work.columns or 'physics_hr_prob' in work.columns or 'hr_probability' in work.columns:
+            work['physics_delta'] = final_prob - base_prob
         else:
             work['physics_delta'] = 0.0
 
@@ -12635,7 +12637,8 @@ def generate_daily_predictions(date_str=None):
 
     print_x_today_diagnostics(live, features_train, tag='X_today', sample_rows=5)
 
-    X_live = live[features_train]
+    X_live = live[features_train].copy()
+    X_live = _apply_live_weather_guardrail(X_model_fit, X_live)
 
     # Train-serving skew diagnostics: compare numeric feature distributions at fit vs live inference.
     try:
@@ -12759,9 +12762,12 @@ def generate_daily_predictions(date_str=None):
     live['projected_pas'] = pd.Series(projected_pas, index=live.index).round(3)
     live['pa_distribution_std'] = pa_dist_spread
     live['pa_conversion_method'] = 'poisson_weighted_pa_dist'
+    live['analytic_game_prob_diagnostic'] = np.asarray(game_level_probs, dtype=float)
 
-    # Convert HR/PA into single-game HR probability analytically.
-    probs = np.asarray(game_level_probs)
+    # Preserve the raw per-PA probability signal here. The game-level conversion is
+    # diagnostic only and must not replace the underlying ensemble output that later
+    # blend, calibration, and EV logic expects to operate on.
+    probs = np.asarray(probs, dtype=float)
     base_model_probs = probs.copy()
     
     # =====================================================================
@@ -13042,7 +13048,9 @@ def generate_daily_predictions(date_str=None):
     live['sidecar_training_applied'] = int(bool(online_sidecar_diag.get('applied', False)))
     live['sidecar_training_update_count'] = int(online_sidecar_diag.get('update_count', 0) or 0)
 
-    live['pred_hr_prob'] = probs
+    live['raw_per_pa_hr_prob'] = pd.to_numeric(pd.Series(probs, index=live.index), errors='coerce').fillna(0.0)
+    if 'pred_hr_prob' not in live.columns:
+        live['pred_hr_prob'] = live['raw_per_pa_hr_prob']
     if not simple_baseline_mode:
         if 'game_pk' in live.columns:
             game_count_value = int(pd.to_numeric(live['game_pk'], errors='coerce').dropna().nunique())
@@ -13746,6 +13754,20 @@ def generate_daily_predictions(date_str=None):
         live['no_hr_kelly_fraction'] = 0.0
         live['no_hr_has_market_odds'] = False
 
+    # Convert raw per-PA probabilities into final game-level HR probabilities once,
+    # immediately before EV, edge, and Kelly calculations. This preserves the model's
+    # intra-game PA structure while preventing the early conversion -> second conversion bug.
+    raw_pa_probs = pd.to_numeric(live.get('raw_per_pa_hr_prob', live.get('pred_hr_prob', 0.0)), errors='coerce').fillna(0.0)
+    pa_dist_spread = float(np.clip(_env_float('PA_DISTRIBUTION_STD', 0.70), 0.30, 1.20))
+    final_game_probs = []
+    expected_pas = pd.to_numeric(live.get('projected_pas', 3.0), errors='coerce').fillna(3.0)
+    for idx, p_pa in enumerate(raw_pa_probs):
+        expected_pa = float(expected_pas.iloc[idx]) if hasattr(expected_pas, 'iloc') else float(expected_pas)
+        pa_dist = build_expected_pa_distribution(expected_pa, spread=pa_dist_spread)
+        final_game_probs.append(calculate_game_hr_probability(float(p_pa), pa_dist))
+    live['analytic_game_prob_diagnostic'] = np.asarray(final_game_probs, dtype=float)
+    live['pred_hr_prob'] = np.asarray(final_game_probs, dtype=float)
+
     physics_output_defaults = {
         'physics_hr_prob': 0.0,
         'physics_per_pa_hr_prob': 0.0,
@@ -14091,12 +14113,14 @@ def generate_daily_predictions(date_str=None):
         print(f"No predictions met the minimum Discord confidence threshold ({effective_discord_min_prob * 100:.0f}%).")
 
     if 'physics_delta' not in live.columns:
-        live['physics_delta'] = 0.0
+        final_prob = pd.to_numeric(live.get('pred_hr_prob', live.get('hr_probability', 0.0)), errors='coerce').fillna(0.0)
+        base_prob = pd.to_numeric(live.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
+        live['physics_delta'] = final_prob - base_prob
 
     radar = _prepare_discord_rankings(
         live[[
             'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
-            'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta'
+            'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta', 'base_model_prob'
         ]]
     ).copy()
     radar = _finalize_discord_radar_frame(radar)
@@ -14202,7 +14226,9 @@ def generate_daily_predictions(date_str=None):
         print(f"Pair integrity validation skipped: {_pair_integrity_exc}")
 
     # Show largest movers caused by physics/context simulation.
-    if 'physics_delta' in live.columns:
+    if {'base_model_prob', 'pred_hr_prob'}.issubset(set(live.columns)):
+        live = live.copy()
+        live['physics_delta'] = pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0) - pd.to_numeric(live['base_model_prob'], errors='coerce').fillna(0.0)
         movers = live[['batter_name', 'pitcher_name', 'physics_delta', 'base_model_prob', 'pred_hr_prob']].copy()
         movers = movers.sort_values(by='physics_delta', key=lambda s: s.abs(), ascending=False).head(5)
         print("\nTop 5 Physics-Driven Movers (absolute delta vs base model):")
@@ -15518,6 +15544,71 @@ def _extract_date_from_prefixed_stem(stem, prefix):
 
 def _normalize_player_name(name):
     return str(name or '').strip().lower()
+
+
+def _apply_live_weather_guardrail(X_train, X_live):
+    """Guard against severe live-feature drift without masking real weather enrichment.
+
+    Rule: historical weather enrichment remains the source of truth. Missing values are
+    filled using the training contract, and only truly out-of-band live values are clamped
+    back inside the training quantile bounds before inference.
+    """
+    if X_live is None or X_live.empty:
+        return X_live
+    if X_train is None or X_train.empty:
+        return X_live
+
+    X_live = X_live.copy()
+    weather_columns = [
+        'apparent_temp', 'dew_point', 'wind_gust', 'humidity', 'precipitation', 'pressure',
+        'cloud_cover', 'density_altitude_factor', 'wind_speed', 'wind_out_component', 'temp'
+    ]
+    diagnostic_rows = []
+
+    for col in weather_columns:
+        if col not in X_live.columns:
+            continue
+
+        s = pd.to_numeric(X_live[col], errors='coerce')
+        if col in X_train.columns:
+            ref = pd.to_numeric(X_train[col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+            if ref.empty:
+                continue
+            q01 = float(ref.quantile(0.01))
+            q99 = float(ref.quantile(0.99))
+            if not np.isfinite(q01) or not np.isfinite(q99) or q99 <= q01:
+                continue
+
+            missing_mask = s.isna() | ~np.isfinite(s.to_numpy())
+            missing_count = int(missing_mask.sum())
+            if missing_count:
+                fill_value = float(np.nanmedian(ref.to_numpy())) if np.isfinite(np.nanmedian(ref.to_numpy())) else float(ref.median())
+                s.loc[missing_mask] = fill_value
+
+            outlier_mask = (s < q01) | (s > q99)
+            clip_count = int(outlier_mask.sum())
+            if clip_count:
+                s = s.clip(lower=q01, upper=q99)
+
+            if missing_count or clip_count:
+                diagnostic_rows.append({
+                    'feature': col,
+                    'missing_rows': missing_count,
+                    'clipped_rows': clip_count,
+                    'q01': q01,
+                    'q99': q99,
+                })
+
+            X_live[col] = s
+        else:
+            X_live[col] = pd.to_numeric(X_live[col], errors='coerce').fillna(np.nan)
+
+    if diagnostic_rows:
+        diag_df = pd.DataFrame(diagnostic_rows)
+        print("Live weather guardrail summary (missing or clipped rows):")
+        print(diag_df[['feature', 'missing_rows', 'clipped_rows', 'q01', 'q99']].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+    return X_live
 
 
 def _best_line_from_book_map(book_map):
