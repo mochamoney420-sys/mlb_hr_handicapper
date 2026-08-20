@@ -12636,8 +12636,8 @@ def generate_daily_predictions(date_str=None):
 
     print_x_today_diagnostics(live, features_train, tag='X_today', sample_rows=5)
 
+    live = _apply_live_weather_guardrail(X_model_fit, live)
     X_live = live[features_train].copy()
-    X_live = _apply_live_weather_guardrail(X_model_fit, X_live)
 
     # Train-serving skew diagnostics: compare numeric feature distributions at fit vs live inference.
     try:
@@ -13050,6 +13050,25 @@ def generate_daily_predictions(date_str=None):
     live['raw_per_pa_hr_prob'] = pd.to_numeric(pd.Series(probs, index=live.index), errors='coerce').fillna(0.0)
     if 'pred_hr_prob' not in live.columns:
         live['pred_hr_prob'] = live['raw_per_pa_hr_prob']
+
+    # Final mathematical translation gate: keep the raw per-PA signal for downstream
+    # diagnostics, but convert it once to the fully volume-adjusted game-level probability
+    # before EV, edge, and ranking calculations are built.
+    raw_pa_value = live.get('raw_per_pa_hr_prob', live.get('pred_hr_prob', 0.0))
+    raw_pa_probs = pd.to_numeric(pd.Series(raw_pa_value, index=live.index), errors='coerce').fillna(0.0)
+    pa_dist_spread = float(np.clip(_env_float('PA_DISTRIBUTION_STD', 0.70), 0.30, 1.20))
+    final_game_probs = []
+    expected_pas = pd.to_numeric(live.get('projected_pas', 3.0), errors='coerce').fillna(3.0)
+    for idx, p_pa in enumerate(raw_pa_probs):
+        expected_pa = float(expected_pas.iloc[idx]) if hasattr(expected_pas, 'iloc') else float(expected_pas)
+        pa_dist = build_expected_pa_distribution(expected_pa, spread=pa_dist_spread)
+        final_game_probs.append(calculate_game_hr_probability(float(p_pa), pa_dist))
+    live['analytic_game_prob_diagnostic'] = np.asarray(final_game_probs, dtype=float)
+    live['pred_hr_prob'] = np.asarray(final_game_probs, dtype=float)
+    if 'base_model_prob' in live.columns:
+        base_prob = pd.to_numeric(live['base_model_prob'], errors='coerce').fillna(0.0)
+        live['physics_delta'] = pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0) - base_prob
+
     if not simple_baseline_mode:
         if 'game_pk' in live.columns:
             game_count_value = int(pd.to_numeric(live['game_pk'], errors='coerce').dropna().nunique())
@@ -13752,21 +13771,6 @@ def generate_daily_predictions(date_str=None):
         live['no_hr_ev_percent'] = 0.0
         live['no_hr_kelly_fraction'] = 0.0
         live['no_hr_has_market_odds'] = False
-
-    # Convert raw per-PA probabilities into final game-level HR probabilities once,
-    # immediately before EV, edge, and Kelly calculations. This preserves the model's
-    # intra-game PA structure while preventing the early conversion -> second conversion bug.
-    raw_pa_value = live.get('raw_per_pa_hr_prob', live.get('pred_hr_prob', 0.0))
-    raw_pa_probs = pd.to_numeric(pd.Series(raw_pa_value, index=live.index), errors='coerce').fillna(0.0)
-    pa_dist_spread = float(np.clip(_env_float('PA_DISTRIBUTION_STD', 0.70), 0.30, 1.20))
-    final_game_probs = []
-    expected_pas = pd.to_numeric(live.get('projected_pas', 3.0), errors='coerce').fillna(3.0)
-    for idx, p_pa in enumerate(raw_pa_probs):
-        expected_pa = float(expected_pas.iloc[idx]) if hasattr(expected_pas, 'iloc') else float(expected_pas)
-        pa_dist = build_expected_pa_distribution(expected_pa, spread=pa_dist_spread)
-        final_game_probs.append(calculate_game_hr_probability(float(p_pa), pa_dist))
-    live['analytic_game_prob_diagnostic'] = np.asarray(final_game_probs, dtype=float)
-    live['pred_hr_prob'] = np.asarray(final_game_probs, dtype=float)
 
     physics_output_defaults = {
         'physics_hr_prob': 0.0,
