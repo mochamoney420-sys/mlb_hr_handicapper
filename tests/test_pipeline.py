@@ -12,10 +12,10 @@ from model import train_hr_model
 from alerts import alert_discord
 
 if __name__ == "__main__":
-    print("🤖 Simulating 2025-2026 Statcast Data for Quick Test...")
-    
-    # Generate 50 rows of dummy data matching the feature list format
-    mock_data = pd.DataFrame({
+    print("🤖 Running a lightweight feature-contract smoke test...")
+
+    # Create a compact validation fixture with the expected schema.
+    feature_fixture = pd.DataFrame({
         'batter_barrel_rate': [0.15] * 50,
         'batter_hard_hit_rate': [0.45] * 50,
         'batter_fb_rate': [0.38] * 50,
@@ -25,11 +25,11 @@ if __name__ == "__main__":
         'park_factor_hr': [105] * 50,
         'temperature': [82.0] * 50,
         'wind_speed_outward': [12.5] * 50,
-        'hit_home_run': [0, 1] * 25  # Alternate 0 and 1 targets to satisfy XGBoost criteria
+        'hit_home_run': [0, 1] * 25  # Alternate 0/1 target labels to satisfy XGBoost criteria
     })
-    
-    # Train model using mock dataset
-    trained_model = train_hr_model(mock_data)
+
+    # Train model using the feature-contract validation fixture.
+    trained_model = train_hr_model(feature_fixture)
     
     # Simulate a value bet trigger condition
     test_message = (

@@ -9885,11 +9885,10 @@ def _prepare_discord_rankings(live_df):
         return work
 
     if 'physics_delta' not in work.columns:
-        final_prob = pd.to_numeric(
-            work.get('pred_hr_prob', work.get('physics_hr_prob', work.get('hr_probability', 0.0))),
-            errors='coerce'
-        ).fillna(0.0)
-        base_prob = pd.to_numeric(work.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
+        final_value = work.get('pred_hr_prob', work.get('physics_hr_prob', work.get('hr_probability', 0.0)))
+        base_value = work.get('base_model_prob', 0.0)
+        final_prob = pd.to_numeric(pd.Series(final_value, index=work.index), errors='coerce').fillna(0.0)
+        base_prob = pd.to_numeric(pd.Series(base_value, index=work.index), errors='coerce').fillna(0.0)
         if 'base_model_prob' in work.columns or 'pred_hr_prob' in work.columns or 'physics_hr_prob' in work.columns or 'hr_probability' in work.columns:
             work['physics_delta'] = final_prob - base_prob
         else:
@@ -13757,7 +13756,8 @@ def generate_daily_predictions(date_str=None):
     # Convert raw per-PA probabilities into final game-level HR probabilities once,
     # immediately before EV, edge, and Kelly calculations. This preserves the model's
     # intra-game PA structure while preventing the early conversion -> second conversion bug.
-    raw_pa_probs = pd.to_numeric(live.get('raw_per_pa_hr_prob', live.get('pred_hr_prob', 0.0)), errors='coerce').fillna(0.0)
+    raw_pa_value = live.get('raw_per_pa_hr_prob', live.get('pred_hr_prob', 0.0))
+    raw_pa_probs = pd.to_numeric(pd.Series(raw_pa_value, index=live.index), errors='coerce').fillna(0.0)
     pa_dist_spread = float(np.clip(_env_float('PA_DISTRIBUTION_STD', 0.70), 0.30, 1.20))
     final_game_probs = []
     expected_pas = pd.to_numeric(live.get('projected_pas', 3.0), errors='coerce').fillna(3.0)
@@ -14113,8 +14113,10 @@ def generate_daily_predictions(date_str=None):
         print(f"No predictions met the minimum Discord confidence threshold ({effective_discord_min_prob * 100:.0f}%).")
 
     if 'physics_delta' not in live.columns:
-        final_prob = pd.to_numeric(live.get('pred_hr_prob', live.get('hr_probability', 0.0)), errors='coerce').fillna(0.0)
-        base_prob = pd.to_numeric(live.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
+        final_value = live.get('pred_hr_prob', live.get('hr_probability', 0.0))
+        base_value = live.get('base_model_prob', 0.0)
+        final_prob = pd.to_numeric(pd.Series(final_value, index=live.index), errors='coerce').fillna(0.0)
+        base_prob = pd.to_numeric(pd.Series(base_value, index=live.index), errors='coerce').fillna(0.0)
         live['physics_delta'] = final_prob - base_prob
 
     radar = _prepare_discord_rankings(
