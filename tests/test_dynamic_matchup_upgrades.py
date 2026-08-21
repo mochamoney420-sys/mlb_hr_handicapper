@@ -257,6 +257,17 @@ def test_resolve_probability_mode_and_weight_enforces_minimum_physics_blend(monk
     assert weight == 0.20
 
 
+def test_resolve_probability_mode_and_weight_honors_active_blend_override_even_in_base_mode(monkeypatch):
+    monkeypatch.setenv('HR_PHYSICS_BLEND_WEIGHT', '0.25')
+    monkeypatch.setenv('HR_PROB_MODE', 'base')
+    monkeypatch.setattr(rdp, 'calibrate_physics_blend_weight', lambda *args, **kwargs: 0.0)
+
+    mode, weight = rdp.resolve_probability_mode_and_weight()
+
+    assert mode == 'blended'
+    assert weight == pytest.approx(0.25)
+
+
 def test_dampen_feedback_training_weights_uses_logarithmic_scaling():
     weights = pd.Series([1.0, 2.0, 5.0, 9.0], dtype=float)
 

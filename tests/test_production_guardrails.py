@@ -11,6 +11,7 @@ from run_daily_predictions import (
     _power_law_devig_prob,
     _reconcile_physics_delta,
     _sanitize_active_starters,
+    make_baseball_true,
 )
 
 
@@ -64,6 +65,14 @@ def test_power_law_devig_prob_returns_fair_probability_in_range():
 
     assert 0.0 < fair < 1.0
     assert 0.35 < fair < 0.65
+
+
+def test_make_baseball_true_scales_to_realistic_xwoba_ranges():
+    base, delta, final = make_baseball_true(1.000, -0.934)
+
+    assert 0.30 <= base <= 0.40
+    assert -0.10 <= delta <= 0.0
+    assert 0.25 <= final <= 0.40
 
 
 def test_unit_based_kelly_cap_fences_risk_by_reliability():

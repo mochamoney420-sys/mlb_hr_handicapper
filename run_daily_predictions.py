@@ -3567,7 +3567,9 @@ def resolve_probability_mode_and_weight():
 
     min_physics_weight = 0.20
     raw_weight = os.getenv('HR_PHYSICS_BLEND_WEIGHT')
-    if raw_weight is not None and raw_weight != '':
+    has_active_weight_override = raw_weight is not None and str(raw_weight).strip() != ''
+
+    if has_active_weight_override:
         try:
             weight = max(0.0, min(1.0, float(raw_weight)))
             print(f"Blend weight override from HR_PHYSICS_BLEND_WEIGHT: {weight:.2f}")
@@ -3576,9 +3578,15 @@ def resolve_probability_mode_and_weight():
     else:
         weight = calibrate_physics_blend_weight(days_lookback=30, default_weight=0.55)
 
+    # The minimum floor must be enforced before any strict mode override.
+    # When a non-zero override is active, base mode is treated as blended so the
+    # requested physics contribution is not silently discarded.
     weight = max(min_physics_weight, weight)
+    if mode == 'base' and has_active_weight_override and weight > min_physics_weight:
+        mode = 'blended'
     if mode != 'blended':
         weight = 0.0
+
     print(f"Resolved physics blend weight: {weight:.2f} (minimum floor={min_physics_weight:.2f})")
     return mode, weight
 
@@ -6276,6 +6284,24 @@ def _power_law_devig_prob(odds_values, exponent=1.35):
         return fair
     except Exception:
         return np.nan
+
+
+def make_baseball_true(abstract_base, abstract_delta):
+    """Map abstract 0-1 model outputs onto a realistic MLB xwOBA-style scale.
+
+    The base is anchored near league-normal xwOBA values (~.220 to .365) and the delta
+    is shrunk to a realistic matchup shift range of roughly -5% to -15%.
+    """
+    try:
+        base = float(abstract_base)
+        delta = float(abstract_delta)
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+    true_base = 0.220 + (float(np.clip(base, 0.0, 1.0)) * 0.145)
+    true_delta = float(np.clip(delta * 0.060, -0.10, 0.0))
+    true_final = float(np.clip(true_base + true_delta, 0.0, 0.60))
+    return round(true_base, 3), round(true_delta, 3), round(true_final, 3)
 
 
 def _apply_unit_based_kelly_cap(kelly_fraction, model_reliability='MEDIUM', sportsbook_value_score=1.0, bankroll_usd=1000.0):
@@ -13182,6 +13208,10 @@ def generate_daily_predictions(date_str=None):
     live['sidecar_update_count'] = int(sidecar_blend_diag.get('update_count', 0) or 0)
     live['sidecar_training_applied'] = int(bool(online_sidecar_diag.get('applied', False)))
     live['sidecar_training_update_count'] = int(online_sidecar_diag.get('update_count', 0) or 0)
+
+    # Fallback if the probability mode never enters the blended/physics conversion branch.
+    if 'final_game_probs' not in locals():
+        final_game_probs = np.asarray(probs, dtype=float)
 
     live['raw_per_pa_hr_prob'] = pd.to_numeric(pd.Series(probs, index=live.index), errors='coerce').fillna(0.0)
     live['base_model_per_pa_prob'] = pd.to_numeric(live.get('base_model_per_pa_prob', pd.Series(probs, index=live.index)), errors='coerce').fillna(0.0)
