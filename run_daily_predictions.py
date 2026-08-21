@@ -6079,18 +6079,12 @@ def _build_devigged_probs_from_raw_books(player_all_odds):
         if not implied_probs:
             continue
 
-        # Multiple one-sided book prices still embed bookmaker margin. Use each
-        # book's share of the total implied mass as a simple cross-book devig,
-        # then take a robust central estimate.
+        # Use a smooth power-law devig to shrink longshot book skew without
+        # flattening the true market signal or letting a single public book dominate.
         if len(implied_probs) == 1:
             final_prob = float(implied_probs[0])
         else:
-            total_implied = float(sum(implied_probs))
-            if total_implied > 0:
-                normalized_probs = [p / total_implied for p in implied_probs if p > 0]
-                final_prob = float(np.median(normalized_probs)) if normalized_probs else float(np.median(implied_probs))
-            else:
-                final_prob = float(np.median(implied_probs))
+            final_prob = float(_power_law_devig_prob(implied_probs, exponent=1.35))
         player_probs[name] = round(float(np.clip(final_prob, 0.0, 1.0)), 4)
     return player_probs
 
@@ -6260,6 +6254,42 @@ def american_to_implied_prob(odds):
     if odds > 0:
         return 100.0 / (odds + 100.0)
     return abs(odds) / (abs(odds) + 100.0)
+
+
+def _power_law_devig_prob(odds_values, exponent=1.35):
+    """Collapse multiple sportsbook prices into a fair no-vig probability using a smooth power-law shrinkage.
+
+    This keeps the market edge estimate conservative and prevents a single public book from
+    dominating the consensus on longshot props.
+    """
+    try:
+        values = [float(v) for v in (odds_values if isinstance(odds_values, (list, tuple, np.ndarray, pd.Series)) else [odds_values])]
+        cleaned = [float(v) for v in values if pd.notna(v) and np.isfinite(v)]
+        if not cleaned:
+            return np.nan
+        implied = np.asarray([american_to_implied_prob(v) for v in cleaned], dtype=float)
+        if implied.size == 1:
+            return float(np.clip(implied[0], 0.0, 1.0))
+        k = max(1.01, float(exponent))
+        reduced = np.power(np.clip(implied, 1e-6, 1.0), 1.0 / k)
+        fair = float(np.clip(np.mean(reduced), 0.0, 1.0))
+        return fair
+    except Exception:
+        return np.nan
+
+
+def _apply_unit_based_kelly_cap(kelly_fraction, model_reliability='MEDIUM', sportsbook_value_score=1.0, bankroll_usd=1000.0):
+    """Cap fractional Kelly to a unit-based risk fence by reliability tier."""
+    raw_fraction = max(0.0, float(_safe_float(kelly_fraction, 0.0) or 0.0))
+    reliability = str(model_reliability or 'MEDIUM').upper()
+    max_units = {'HIGH': 3.0, 'MEDIUM': 1.5, 'LOW': 0.5}.get(reliability, 1.5)
+    value_score = max(1.0, float(_safe_float(sportsbook_value_score, 1.0) or 1.0))
+    bankroll = max(0.0, float(_safe_float(bankroll_usd, 1000.0) or 1000.0))
+    raw_units = raw_fraction * 100.0 * value_score
+    final_units = min(float(raw_units), float(max_units))
+    capped_fraction = (final_units / 100.0) / value_score if value_score > 0 else 0.0
+    stake_usd = bankroll * capped_fraction
+    return float(final_units), float(stake_usd), float(capped_fraction)
 
 
 def prob_to_fair_american(prob):
@@ -13491,6 +13521,24 @@ def generate_daily_predictions(date_str=None):
     high_conf_count = sum(1 for r in reliability_levels if r == 'HIGH')
     print(f"✅ Calibration complete: {high_conf_count}/{len(live)} predictions HIGH confidence")
     live['kelly_fraction'] = live['pred_hr_prob'].apply(_kelly)
+    live['kelly_cap_units'] = live.apply(
+        lambda r: _apply_unit_based_kelly_cap(
+            r.get('kelly_fraction', 0.0),
+            model_reliability=r.get('model_reliability', 'MEDIUM'),
+            sportsbook_value_score=r.get('sportsbook_value_score', 1.0),
+            bankroll_usd=_env_float('BET_STAKE_BANKROLL_USD', 1000.0),
+        )[0],
+        axis=1,
+    )
+    live['kelly_fraction'] = live.apply(
+        lambda r: _apply_unit_based_kelly_cap(
+            r.get('kelly_fraction', 0.0),
+            model_reliability=r.get('model_reliability', 'MEDIUM'),
+            sportsbook_value_score=r.get('sportsbook_value_score', 1.0),
+            bankroll_usd=_env_float('BET_STAKE_BANKROLL_USD', 1000.0),
+        )[2],
+        axis=1,
+    )
     live['kelly_multiplier'] = kelly_multiplier
     live['model_name'] = '+'.join(model_names)
     live['prediction_timestamp'] = datetime.now().isoformat()
@@ -13782,6 +13830,24 @@ def generate_daily_predictions(date_str=None):
             edge = row['pred_hr_prob'] * b - (1 - row['pred_hr_prob'])
             return max(round(edge / b * kelly_multiplier, 4), 0.0) if edge > 0 else 0.0
         live['kelly_fraction'] = live.apply(_kelly_real, axis=1)
+        live['kelly_cap_units'] = live.apply(
+            lambda r: _apply_unit_based_kelly_cap(
+                r.get('kelly_fraction', 0.0),
+                model_reliability=r.get('model_reliability', 'MEDIUM'),
+                sportsbook_value_score=r.get('sportsbook_value_score', 1.0),
+                bankroll_usd=_env_float('BET_STAKE_BANKROLL_USD', 1000.0),
+            )[0],
+            axis=1,
+        )
+        live['kelly_fraction'] = live.apply(
+            lambda r: _apply_unit_based_kelly_cap(
+                r.get('kelly_fraction', 0.0),
+                model_reliability=r.get('model_reliability', 'MEDIUM'),
+                sportsbook_value_score=r.get('sportsbook_value_score', 1.0),
+                bankroll_usd=_env_float('BET_STAKE_BANKROLL_USD', 1000.0),
+            )[2],
+            axis=1,
+        )
 
         # NO-HR side markets (under 0.5) for dedicated no-HR card.
         no_hr_book_lines = live['batter_name'].apply(lambda n: _match_raw_book_lines_from_source(no_hr_market_odds_raw, n))
@@ -16030,7 +16096,7 @@ def _estimate_actionability_score(row):
         return 0.0
 
 
-def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=None, max_stake_usd=None, kelly_multiplier=None):
+def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=None, max_stake_usd=None, kelly_multiplier=None, model_reliability='MEDIUM', sportsbook_value_score=1.0):
     """Estimate a practical stake from a bankroll and Kelly fraction.
 
     This keeps the staking logic reusable for both auto-wager execution and
@@ -16042,7 +16108,14 @@ def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=Non
     stake_cap = max(stake_floor, _env_float('BET_STAKE_MAX_USD', max_stake_usd if max_stake_usd is not None else 50.0))
     kelly_mult = max(0.0, _env_float('BET_STAKE_KELLY_MULTIPLIER', kelly_multiplier if kelly_multiplier is not None else 0.25))
     kf = max(0.0, _safe_float(kelly_fraction, 0.0) or 0.0)
-    stake = bankroll * kf * kelly_mult
+    unit_cap = _apply_unit_based_kelly_cap(
+        kf,
+        model_reliability=model_reliability,
+        sportsbook_value_score=sportsbook_value_score,
+        bankroll_usd=bankroll,
+    )
+    _, _, capped_fraction = unit_cap
+    stake = bankroll * capped_fraction * kelly_mult
     if stake <= 0:
         return 0.0
     return float(np.clip(stake, stake_floor, stake_cap))

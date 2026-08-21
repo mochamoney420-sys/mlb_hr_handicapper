@@ -6,7 +6,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from run_daily_predictions import (
+    _apply_unit_based_kelly_cap,
     _compute_isolated_wager_metrics,
+    _power_law_devig_prob,
     _reconcile_physics_delta,
     _sanitize_active_starters,
 )
@@ -55,3 +57,23 @@ def test_isolated_wager_metrics_use_true_production_probability():
     assert ev_percent > 0
     assert kelly >= 0
     assert abs(ev_value - ((0.20 / 0.18) - 1.0)) < 1e-9
+
+
+def test_power_law_devig_prob_returns_fair_probability_in_range():
+    fair = _power_law_devig_prob([-110, +120], exponent=1.35)
+
+    assert 0.0 < fair < 1.0
+    assert 0.35 < fair < 0.65
+
+
+def test_unit_based_kelly_cap_fences_risk_by_reliability():
+    final_units, stake_usd, capped_fraction = _apply_unit_based_kelly_cap(
+        kelly_fraction=0.08,
+        model_reliability='HIGH',
+        sportsbook_value_score=1.2,
+        bankroll_usd=1000.0,
+    )
+
+    assert final_units <= 3.0
+    assert stake_usd <= 30.0
+    assert capped_fraction <= 0.08
