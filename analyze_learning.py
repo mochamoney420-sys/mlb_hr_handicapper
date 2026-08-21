@@ -72,8 +72,8 @@ learning_reports = sorted(Path('data').glob('hr_learning_report_*.json'), revers
 
 for report_file in reversed(learning_reports):
     import json
-    date = report_file.stem.split('_')[3]
-    
+    date = report_file.stem.split('_')[-1]
+
     with open(report_file) as f:
         data = json.load(f)
     

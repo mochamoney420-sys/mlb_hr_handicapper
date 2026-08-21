@@ -345,12 +345,12 @@ def extract_hr_patterns(actual_hrs, training_data):
             # If no exact matchup in history, look at general player stats
             batter_pas = training_data[training_data['batter'] == batter_id]
             pitcher_pas = training_data[training_data['pitcher'] == pitcher_id]
-            
+
             if batter_pas.empty or pitcher_pas.empty:
                 continue
         else:
-            batter_pas = training_data[training_data['batter'] == batter_id]
-            pitcher_pas = training_data[training_data['pitcher'] == pitcher_id]
+            batter_pas = matching_pas
+            pitcher_pas = matching_pas
         
         # Extract key features that led to this HR
         hr_features = {
@@ -375,7 +375,7 @@ def extract_hr_patterns(actual_hrs, training_data):
                 hr_features['batter_recent_barrel_rate'] = float((valid_ev >= 98).mean())
             hr_features['batter_hr_rate_recent'] = float(
                 (batter_pas_sorted['events'] == 'home_run').mean()
-            )
+            ) if not batter_pas_sorted.empty else 0.0
             hr_features['batter_pa_count_recent'] = int(len(batter_pas_sorted))
         
         # Pitcher's vulnerability

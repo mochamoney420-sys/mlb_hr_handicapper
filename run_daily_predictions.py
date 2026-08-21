@@ -460,6 +460,70 @@ def get_lineup_pa_expectation_with_starter_guard(batting_order_slot, is_starter=
     return get_lineup_slot_pa_expectation(slot)
 
 
+def _sanitize_active_starters(live_df):
+    """Keep only the active 9-man starting lineup before inference."""
+    if live_df is None:
+        return pd.DataFrame()
+
+    work = live_df.copy()
+    if work.empty:
+        return work.reset_index(drop=True)
+
+    if 'batting_order_slot' in work.columns:
+        slot_values = pd.to_numeric(work['batting_order_slot'], errors='coerce')
+        mask = slot_values.between(1, 9)
+        if 'is_starter' in work.columns:
+            mask = mask & pd.to_numeric(work['is_starter'], errors='coerce').fillna(1).astype(bool)
+        work = work.loc[mask].reset_index(drop=True)
+    elif 'is_starter' in work.columns:
+        mask = pd.to_numeric(work['is_starter'], errors='coerce').fillna(1).astype(bool)
+        work = work.loc[mask].reset_index(drop=True)
+
+    return work
+
+
+def _reconcile_physics_delta(frame):
+    """Compute delta from the raw per-PA baseline instead of a game-level field."""
+    if frame is None:
+        return pd.DataFrame()
+
+    work = frame.copy()
+    raw_base = pd.to_numeric(
+        work.get('raw_per_pa_hr_prob', work.get('base_model_per_pa_prob', work.get('base_model_prob', 0.0))),
+        errors='coerce',
+    ).fillna(0.0)
+    per_pa_base = pd.to_numeric(
+        work.get('base_model_per_pa_prob', work.get('base_model_prob', 0.0)),
+        errors='coerce',
+    ).fillna(0.0)
+
+    if 'base_model_per_pa_prob' not in work.columns:
+        work['base_model_per_pa_prob'] = per_pa_base
+    if 'raw_per_pa_hr_prob' not in work.columns:
+        work['raw_per_pa_hr_prob'] = raw_base
+
+    work['physics_delta'] = (
+        pd.to_numeric(work['raw_per_pa_hr_prob'], errors='coerce').fillna(0.0)
+        - pd.to_numeric(work['base_model_per_pa_prob'], errors='coerce').fillna(0.0)
+    )
+    return work
+
+
+def _compute_isolated_wager_metrics(row, kelly_multiplier=1.0):
+    """Compute EV and Kelly strictly from the true production probability vector."""
+    p = float(row.get('production_prob', row.get('pred_hr_prob', 0.0)))
+    mp = _safe_float(row.get('market_prob'), np.nan)
+    if not np.isfinite(mp) or mp <= 0 or mp >= 1:
+        return 0.0, 0.0, 0.0
+
+    dec_odds = 1.0 / mp
+    ev_value = (p * dec_odds) - 1.0
+    b_coeff = dec_odds - 1.0
+    edge = (p * b_coeff) - (1.0 - p)
+    kelly = max(round((edge / b_coeff) * float(kelly_multiplier), 4), 0.0) if edge > 0 else 0.0
+    return ev_value, ev_value * 100.0, kelly
+
+
 def _normalize_mlbam_player_id(value):
     """Return a clean MLBAM player ID or None when the value is not an MLB player row."""
     if value is None:
@@ -9551,16 +9615,33 @@ def _ensure_discord_radar_columns(rankings_df):
         return pd.DataFrame()
 
     work = rankings_df.copy()
+    final_prob_source = (
+        'production_prob'
+        if 'production_prob' in work.columns else
+        'pred_hr_prob'
+        if 'pred_hr_prob' in work.columns else
+        'hr_probability'
+        if 'hr_probability' in work.columns else
+        'betting_prob'
+        if 'betting_prob' in work.columns else
+        None
+    )
     if 'hr_probability' not in work.columns:
-        if 'pred_hr_prob' in work.columns:
-            work['hr_probability'] = pd.to_numeric(work['pred_hr_prob'], errors='coerce').fillna(0.0)
+        if final_prob_source is not None:
+            work['hr_probability'] = pd.to_numeric(work[final_prob_source], errors='coerce').fillna(0.0)
         else:
             work['hr_probability'] = 0.0
 
     if 'physics_delta' not in work.columns:
-        final_prob = pd.to_numeric(work.get('hr_probability', work.get('pred_hr_prob', 0.0)), errors='coerce').fillna(0.0)
-        base_prob = pd.to_numeric(work.get('base_model_prob', 0.0), errors='coerce').fillna(0.0)
-        if 'base_model_prob' in work.columns or 'hr_probability' in work.columns:
+        final_prob = pd.to_numeric(work.get('hr_probability', work.get(final_prob_source, 0.0) if final_prob_source else 0.0), errors='coerce').fillna(0.0)
+        base_prob = pd.to_numeric(
+            work.get(
+                'raw_per_pa_hr_prob',
+                work.get('base_model_per_pa_prob', work.get('base_model_prob', 0.0)),
+            ),
+            errors='coerce',
+        ).fillna(0.0)
+        if final_prob_source is not None or 'raw_per_pa_hr_prob' in work.columns or 'base_model_prob' in work.columns:
             work['physics_delta'] = final_prob - base_prob
         else:
             work['physics_delta'] = 0.0
@@ -9884,18 +9965,36 @@ def _prepare_discord_rankings(live_df):
         work['relative_slate_rank'] = []
         return work
 
+    production_source = (
+        'production_prob'
+        if 'production_prob' in work.columns else
+        'pred_hr_prob'
+        if 'pred_hr_prob' in work.columns else
+        'betting_prob'
+        if 'betting_prob' in work.columns else
+        'hr_probability'
+        if 'hr_probability' in work.columns else
+        'physics_hr_prob'
+        if 'physics_hr_prob' in work.columns else
+        None
+    )
+
     if 'physics_delta' not in work.columns:
-        final_value = work.get('pred_hr_prob', work.get('physics_hr_prob', work.get('hr_probability', 0.0)))
-        base_value = work.get('base_model_prob', 0.0)
+        final_value = work.get(production_source, work.get('hr_probability', 0.0)) if production_source else work.get('hr_probability', 0.0)
+        base_value = work.get('raw_per_pa_hr_prob', work.get('base_model_per_pa_prob', work.get('base_model_prob', 0.0)))
         final_prob = pd.to_numeric(pd.Series(final_value, index=work.index), errors='coerce').fillna(0.0)
         base_prob = pd.to_numeric(pd.Series(base_value, index=work.index), errors='coerce').fillna(0.0)
-        if 'base_model_prob' in work.columns or 'pred_hr_prob' in work.columns or 'physics_hr_prob' in work.columns or 'hr_probability' in work.columns:
+        if production_source or 'raw_per_pa_hr_prob' in work.columns or 'base_model_prob' in work.columns or 'base_model_per_pa_prob' in work.columns:
             work['physics_delta'] = final_prob - base_prob
         else:
             work['physics_delta'] = 0.0
 
-    pred_prob = _coerce_numeric_column(work, 'pred_hr_prob', default=0.0)
-    if 'hr_probability' in work.columns and 'pred_hr_prob' not in work.columns:
+    pred_prob = _coerce_numeric_column(work, 'production_prob', default=0.0)
+    if 'production_prob' not in work.columns:
+        pred_prob = _coerce_numeric_column(work, 'pred_hr_prob', default=0.0)
+    if 'pred_hr_prob' not in work.columns and 'production_prob' not in work.columns:
+        pred_prob = _coerce_numeric_column(work, 'hr_probability', default=0.0)
+    if 'hr_probability' in work.columns and 'production_prob' not in work.columns and 'pred_hr_prob' not in work.columns:
         pred_prob = _coerce_numeric_column(work, 'hr_probability', default=0.0)
 
     edge_pct = _coerce_numeric_column(work, 'edge_pct', default=0.0)
@@ -12179,6 +12278,7 @@ def generate_daily_predictions(date_str=None):
             f"{pitch_mix_vuln_debug.get('pitchers_seen', 0)}"
         )
 
+    live = _sanitize_active_starters(live)
     live_dataflow_issues = validate_model_dataflow(
         train_df,
         live,
@@ -12673,6 +12773,9 @@ def generate_daily_predictions(date_str=None):
     all_probs = [_extract_positive_class_probabilities(m, X_live) for m in inference_models]
     probs = weighted_ensemble_probabilities(all_probs, ensemble_weights)
     live['ensemble_raw_prob'] = np.asarray(probs).reshape(-1)
+    live['raw_model_prob'] = pd.to_numeric(pd.Series(np.asarray(probs).reshape(-1), index=live.index), errors='coerce').fillna(0.0)
+    live['base_model_per_pa_prob'] = live['raw_model_prob'].copy()
+    live['calibrated_prob'] = live['raw_model_prob'].copy()
 
     use_prior_correction = str(os.getenv('PRIOR_CORRECTION_ENABLED', 'true')).strip().lower() in {'1', 'true', 'yes'}
     if use_prior_correction:
@@ -12768,6 +12871,8 @@ def generate_daily_predictions(date_str=None):
     # blend, calibration, and EV logic expects to operate on.
     probs = np.asarray(probs, dtype=float)
     base_model_probs = probs.copy()
+    live['production_prob'] = pd.to_numeric(pd.Series(np.asarray(game_level_probs, dtype=float), index=live.index), errors='coerce').fillna(0.0)
+    live['betting_prob'] = live['production_prob'].copy()
     
     # =====================================================================
     # IMPROVEMENTS #1-3: PITCHER FORM, BATTER STREAKS, PARK ADJUSTMENT
@@ -12848,6 +12953,7 @@ def generate_daily_predictions(date_str=None):
         print(f"Pitcher degradation boosts applied: {(degradation_boosts > 0).sum()} matchups")
     
     live['base_model_prob'] = base_model_probs
+    live['base_model_per_pa_prob'] = pd.to_numeric(live.get('base_model_per_pa_prob', pd.Series(base_model_probs, index=live.index)), errors='coerce').fillna(0.0)
     physics_probs = base_model_probs.copy()
 
     # =====================================================================
@@ -13048,8 +13154,11 @@ def generate_daily_predictions(date_str=None):
     live['sidecar_training_update_count'] = int(online_sidecar_diag.get('update_count', 0) or 0)
 
     live['raw_per_pa_hr_prob'] = pd.to_numeric(pd.Series(probs, index=live.index), errors='coerce').fillna(0.0)
+    live['base_model_per_pa_prob'] = pd.to_numeric(live.get('base_model_per_pa_prob', pd.Series(probs, index=live.index)), errors='coerce').fillna(0.0)
+    live['production_prob'] = pd.to_numeric(live.get('production_prob', pd.Series(final_game_probs, index=live.index)), errors='coerce').fillna(0.0)
+    live['betting_prob'] = live['production_prob'].copy()
     if 'pred_hr_prob' not in live.columns:
-        live['pred_hr_prob'] = live['raw_per_pa_hr_prob']
+        live['pred_hr_prob'] = live['betting_prob']
 
     # Final mathematical translation gate: keep the raw per-PA signal for downstream
     # diagnostics, but convert it once to the fully volume-adjusted game-level probability
@@ -13065,9 +13174,10 @@ def generate_daily_predictions(date_str=None):
         final_game_probs.append(calculate_game_hr_probability(float(p_pa), pa_dist))
     live['analytic_game_prob_diagnostic'] = np.asarray(final_game_probs, dtype=float)
     live['pred_hr_prob'] = np.asarray(final_game_probs, dtype=float)
+    live = _reconcile_physics_delta(live)
     if 'base_model_prob' in live.columns:
         base_prob = pd.to_numeric(live['base_model_prob'], errors='coerce').fillna(0.0)
-        live['physics_delta'] = pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0) - base_prob
+        live['base_model_prob'] = base_prob
 
     if not simple_baseline_mode:
         if 'game_pk' in live.columns:
@@ -14125,8 +14235,9 @@ def generate_daily_predictions(date_str=None):
 
     radar = _prepare_discord_rankings(
         live[[
-            'batter_name', 'pitcher_name', 'pred_hr_prob', 'edge_pct',
-            'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta', 'base_model_prob'
+            'batter_name', 'pitcher_name', 'production_prob', 'pred_hr_prob', 'betting_prob', 'edge_pct',
+            'kelly_fraction', 'ev_percent', 'game_time', 'model_reliability', 'physics_delta',
+            'raw_per_pa_hr_prob', 'base_model_per_pa_prob', 'base_model_prob'
         ]]
     ).copy()
     radar = _finalize_discord_radar_frame(radar)
@@ -14232,17 +14343,18 @@ def generate_daily_predictions(date_str=None):
         print(f"Pair integrity validation skipped: {_pair_integrity_exc}")
 
     # Show largest movers caused by physics/context simulation.
-    if {'base_model_prob', 'pred_hr_prob'}.issubset(set(live.columns)):
-        live = live.copy()
-        live['physics_delta'] = pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0) - pd.to_numeric(live['base_model_prob'], errors='coerce').fillna(0.0)
-        movers = live[['batter_name', 'pitcher_name', 'physics_delta', 'base_model_prob', 'pred_hr_prob']].copy()
+    if {'batter_name', 'pitcher_name'}.issubset(set(live.columns)):
+        live = _reconcile_physics_delta(live.copy())
+        base_col = 'base_model_per_pa_prob' if 'base_model_per_pa_prob' in live.columns else 'base_model_prob'
+        final_col = 'raw_per_pa_hr_prob' if 'raw_per_pa_hr_prob' in live.columns else 'pred_hr_prob'
+        movers = live[['batter_name', 'pitcher_name', 'physics_delta', base_col, final_col]].copy()
         movers = movers.sort_values(by='physics_delta', key=lambda s: s.abs(), ascending=False).head(5)
         print("\nTop 5 Physics-Driven Movers (absolute delta vs base model):")
         for _, mr in movers.iterrows():
             print(
                 f"  {mr['batter_name']} vs {mr['pitcher_name']} | "
                 f"delta={mr['physics_delta']:+.3f} | "
-                f"base={mr['base_model_prob']:.3f} -> final={mr['pred_hr_prob']:.3f}"
+                f"base={mr[base_col]:.3f} -> final={mr[final_col]:.3f}"
             )
 
     if 'elite_ev_signal' in live.columns:
