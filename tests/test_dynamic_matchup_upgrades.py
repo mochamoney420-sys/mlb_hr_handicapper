@@ -7,6 +7,47 @@ import pytest
 import run_daily_predictions as rdp
 
 
+def test_explicit_three_layer_baseline_physics_environment_is_bounded():
+    live = pd.DataFrame({
+        'batter': [101, 102],
+        'bat_hr_rate': [0.042, 0.051],
+        'bat_pa_count': [240, 310],
+        'pitcher_avg_vaa_4seam': [-5.5, -3.8],
+        'pitcher_induced_vertical_break': [16.5, 18.0],
+        'hitter_avg_attack_angle': [12.0, 14.0],
+        'pitcher_true_spin_efficiency_pct': [56.0, 52.0],
+        'game_weather_temperature_f': [92.0, 76.0],
+        'ballpark_elevation_ft': [5000.0, 120.0],
+        'ballpark_hr_factor_3yr': [1.22, 1.08],
+        'umpire_called_strike_percentage': [63.2, 66.1],
+    })
+
+    baseline = rdp.compute_baseline_hr_rate('101', live, tracking_db=None)
+    physics = rdp.evaluate_ball_flight_physics(live)
+    environment = rdp.calculate_environmental_scalar(live)
+
+    assert len(baseline) == len(live)
+    assert baseline.min() >= 0.0
+    assert physics.min() >= 0.65
+    assert physics.max() <= 1.35
+    assert environment.min() >= 0.70
+    assert environment.max() <= 1.40
+
+
+def test_explicit_three_layer_probability_engine_handles_missing_inputs():
+    live = pd.DataFrame(index=[0, 1, 2])
+
+    baseline = rdp.compute_baseline_hr_rate('missing-hitter', live, tracking_db=None)
+    physics = rdp.evaluate_ball_flight_physics(live)
+    environment = rdp.calculate_environmental_scalar(live)
+
+    assert len(baseline) == 3
+    assert np.isfinite(physics).all()
+    assert np.isfinite(environment).all()
+    assert physics.min() >= 0.65
+    assert environment.min() >= 0.70
+
+
 def test_compute_micro_atmo_carry_adjustment_uses_real_density():
     out = rdp.compute_micro_atmo_carry_adjustment(
         pressure_mbar=1013.25,

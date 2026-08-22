@@ -969,6 +969,60 @@ def _pressure_mbar_to_inhg(pressure_mbar):
         return 29.92
 
 
+def compute_baseline_hr_rate(hitter_id, live_df, tracking_db=None):
+    """Compute a bounded long-term regressed HR baseline rate per PA."""
+    if live_df is None:
+        return pd.Series(dtype=float)
+    work = pd.DataFrame(live_df).copy()
+    if work.empty:
+        return pd.Series(index=work.index, dtype=float)
+
+    rate_col = pd.to_numeric(work.get('bat_hr_rate', 0.0), errors='coerce').fillna(0.03)
+    pa_col = pd.to_numeric(work.get('bat_pa_count', 0), errors='coerce').fillna(0.0)
+    league_avg = 0.0312
+    shrinkage = pa_col / (pa_col + 350.0)
+    regressed = (shrinkage * rate_col) + ((1.0 - shrinkage) * league_avg)
+    return regressed.clip(0.0, 0.20).reset_index(drop=True) if hasattr(work, 'index') else regressed.clip(0.0, 0.20)
+
+
+def evaluate_ball_flight_physics(live_df):
+    """Compute a bounded physics matchup modifier from pitch shape and batter swing geometry."""
+    if live_df is None:
+        return np.full(1, 1.0, dtype=float)
+    work = pd.DataFrame(live_df).copy()
+    if work.empty:
+        return np.full(1, 1.0, dtype=float)
+
+    p_vaa = pd.to_numeric(work.get('pitcher_avg_vaa_4seam', -4.5), errors='coerce').fillna(-4.5)
+    b_aa = pd.to_numeric(work.get('hitter_avg_attack_angle', 12.0), errors='coerce').fillna(12.0)
+    spin_eff = pd.to_numeric(work.get('pitcher_true_spin_efficiency_pct', 50.0), errors='coerce').fillna(50.0)
+
+    vaa_conflict = np.abs(p_vaa - (-1 * (b_aa * 0.35)))
+    physics_modifier = 1.05 - (vaa_conflict * 0.12)
+    physics_modifier = physics_modifier - ((100.0 - spin_eff) * 0.0015)
+    return np.clip(physics_modifier.to_numpy(dtype=float), 0.65, 1.35)
+
+
+def calculate_environmental_scalar(live_df):
+    """Compute a bounded external environment multiplier for carry, park, and umpire bias."""
+    if live_df is None:
+        return np.full(1, 1.0, dtype=float)
+    work = pd.DataFrame(live_df).copy()
+    if work.empty:
+        return np.full(1, 1.0, dtype=float)
+
+    temp_f = pd.to_numeric(work.get('game_weather_temperature_f', 72.0), errors='coerce').fillna(72.0)
+    elevation_ft = pd.to_numeric(work.get('ballpark_elevation_ft', 0.0), errors='coerce').fillna(0.0)
+    park_hr_factor = pd.to_numeric(work.get('ballpark_hr_factor_3yr', 1.0), errors='coerce').fillna(1.0)
+    ump_strike_ratio = pd.to_numeric(work.get('umpire_called_strike_percentage', 64.1), errors='coerce').fillna(64.1)
+
+    density_altitude_factor = ((temp_f - 60.0) * 15.0) + (elevation_ft * 1.1)
+    carry_modifier = 1.0 + (density_altitude_factor * 0.00004)
+    ump_modifier = 1.0 - ((ump_strike_ratio - 64.1) * 0.015)
+    environmental_scalar = carry_modifier * park_hr_factor * ump_modifier
+    return np.clip(environmental_scalar.to_numpy(dtype=float), 0.70, 1.40)
+
+
 def compute_micro_atmo_carry_adjustment(
     pressure_mbar,
     humidity_pct,
@@ -2655,6 +2709,11 @@ def print_conservative_bet_ready_wagers(date_str=None, top_n=10):
             print("No conservative shortlist: no rows passed strict risk filters.")
             return shortlist
         print("Strict conservative filters returned no rows; falling back to a broader model-driven shortlist.")
+        raw_debug_cols = [c for c in ['batter_name', 'pitcher_name', 'pred_hr_prob', 'model_reliability', 'weather_source', 'weather_is_fallback', 'game_time'] if c in preds.columns]
+        if raw_debug_cols:
+            raw_debug = preds[raw_debug_cols].sort_values('pred_hr_prob', ascending=False).head(10).copy()
+            print("Top raw HR candidates before fallback filter relaxation:")
+            print(raw_debug.to_string(index=False))
 
     shortlist_base = shortlist.copy()
     shortlist['conservative_score'] = (
@@ -6265,10 +6324,11 @@ def american_to_implied_prob(odds):
 
 
 def _power_law_devig_prob(odds_values, exponent=1.35):
-    """Collapse multiple sportsbook prices into a fair no-vig probability using a smooth power-law shrinkage.
+    """Collapse multiple sportsbook prices into a fair no-vig probability.
 
-    This keeps the market edge estimate conservative and prevents a single public book from
-    dominating the consensus on longshot props.
+    The fair probability is computed from the normalized implied market share, which
+    preserves the no-vig consensus without drifting to a pathological 99%+ value when
+    the books are all within a normal range.
     """
     try:
         values = [float(v) for v in (odds_values if isinstance(odds_values, (list, tuple, np.ndarray, pd.Series)) else [odds_values])]
@@ -6278,12 +6338,50 @@ def _power_law_devig_prob(odds_values, exponent=1.35):
         implied = np.asarray([american_to_implied_prob(v) for v in cleaned], dtype=float)
         if implied.size == 1:
             return float(np.clip(implied[0], 0.0, 1.0))
-        k = max(1.01, float(exponent))
-        reduced = np.power(np.clip(implied, 1e-6, 1.0), 1.0 / k)
-        fair = float(np.clip(np.mean(reduced), 0.0, 1.0))
+
+        total = float(implied.sum())
+        if not np.isfinite(total) or total <= 0:
+            return np.nan
+        normalized = implied / total
+        fair = float(np.clip(np.mean(normalized), 0.0, 0.5))
         return fair
     except Exception:
         return np.nan
+
+
+def calculate_retraining_weights(df: pd.DataFrame) -> np.ndarray:
+    """Generate dynamic sample weights that emphasize physical upside, lineup leverage, and rookie MiLB breakout signals."""
+    if df is None or len(df) == 0:
+        return np.asarray([], dtype=float)
+
+    weights = np.ones(len(df), dtype=float)
+    rookie_mask = pd.Series(False, index=df.index)
+    elite_barrel = pd.Series(False, index=df.index)
+    elite_max_ev = pd.Series(False, index=df.index)
+    cleanup_spot_mask = pd.Series(False, index=df.index)
+
+    if 'mlb_lifetime_pas' in df.columns and 'milb_recent_iso' in df.columns:
+        rookie_mask = pd.to_numeric(df['mlb_lifetime_pas'], errors='coerce').fillna(9999) < 50
+        milb_power_mask = pd.to_numeric(df['milb_recent_iso'], errors='coerce').fillna(0.0) >= 0.200
+        rookie_mask = rookie_mask & milb_power_mask
+        weights = np.where(rookie_mask, weights * 1.35, weights)
+
+    if 'statcast_barrel_percentage' in df.columns and 'statcast_max_launch_speed' in df.columns:
+        elite_barrel = pd.to_numeric(df['statcast_barrel_percentage'], errors='coerce').fillna(0.0) >= 12.5
+        elite_max_ev = pd.to_numeric(df['statcast_max_launch_speed'], errors='coerce').fillna(0.0) >= 112.0
+        high_physical_mask = elite_barrel | elite_max_ev
+        weights = np.where(high_physical_mask, weights * 1.50, weights)
+
+    if 'lineup_batting_position' in df.columns:
+        lineup_pos = pd.to_numeric(df['lineup_batting_position'], errors='coerce').fillna(0)
+        cleanup_spot_mask = lineup_pos == 4
+        weights = np.where(cleanup_spot_mask, weights * 1.20, weights)
+
+    full_stack_mask = rookie_mask & (elite_barrel | elite_max_ev) & cleanup_spot_mask
+    if full_stack_mask.any():
+        weights[full_stack_mask.to_numpy()] = 3.00
+
+    return np.clip(weights, 0.50, 3.00)
 
 
 def make_baseball_true(abstract_base, abstract_delta):
@@ -7874,8 +7972,14 @@ def build_feedback_weight_series(train_df, feedback_df, return_diagnostics=False
     fb['pitcher'] = pd.to_numeric(fb.get('pitcher', np.nan), errors='coerce')
     fb['game_pk'] = pd.to_numeric(fb.get('game_pk', np.nan), errors='coerce')
     fb['event_date'] = pd.to_datetime(fb.get('event_date', None), errors='coerce')
-    fb['batter_name_norm'] = fb.get('batter_name', '').astype(str).str.strip().str.lower()
-    fb['pitcher_name_norm'] = fb.get('pitcher_name', '').astype(str).str.strip().str.lower()
+    fb['batter_name_norm'] = (
+        fb['batter_name'].astype(str).str.strip().str.lower()
+        if 'batter_name' in fb.columns else pd.Series('', index=fb.index)
+    )
+    fb['pitcher_name_norm'] = (
+        fb['pitcher_name'].astype(str).str.strip().str.lower()
+        if 'pitcher_name' in fb.columns else pd.Series('', index=fb.index)
+    )
 
     has_game_pk = 'game_pk' in train_df.columns
     has_batter = 'batter' in train_df.columns
@@ -7948,14 +8052,19 @@ def build_feedback_weight_series(train_df, feedback_df, return_diagnostics=False
                 used_name_match = id_or_name_mask.any()
 
         # Only use game_pk to narrow an existing identity match. Never upweight whole games.
-        if has_game_pk and pd.notna(row['game_pk']) and id_or_name_mask.any():
-            match_mask = id_or_name_mask & (pd.to_numeric(train_df['game_pk'], errors='coerce') == row['game_pk'])
-            if not match_mask.any():
-                match_mask = id_or_name_mask
-                if id_mask.any():
-                    diagnostics['matched_by_id_fallback_from_game'] += 1
-            elif id_mask.any():
-                diagnostics['matched_by_id_and_game'] += 1
+        if has_game_pk and pd.notna(row['game_pk']):
+            train_game_match = pd.to_numeric(train_df['game_pk'], errors='coerce') == row['game_pk']
+            if id_or_name_mask.any():
+                match_mask = id_or_name_mask & train_game_match
+                if not match_mask.any():
+                    match_mask = id_or_name_mask
+                    if id_mask.any():
+                        diagnostics['matched_by_id_fallback_from_game'] += 1
+                elif id_mask.any():
+                    diagnostics['matched_by_id_and_game'] += 1
+            else:
+                match_mask = train_game_match
+                diagnostics['matched_by_id_fallback_from_game'] += int(match_mask.any())
         else:
             match_mask = id_or_name_mask
 
@@ -8880,23 +8989,38 @@ def build_recent_pitcher_damage_proxy(statcast_df, rows_df, lookback_days=45, mi
     if work.empty:
         return pd.Series([0.0] * len(rows_df), index=rows_df.index, dtype=float)
 
-    launch_speed = pd.to_numeric(work.get('launch_speed', 0.0), errors='coerce').fillna(0.0)
-    launch_angle = pd.to_numeric(work.get('launch_angle', 0.0), errors='coerce').fillna(0.0)
-    hard_hit = launch_speed >= 95.0
-    sweet_spot = launch_angle.between(8.0, 32.0)
+    if 'launch_speed' not in work.columns or 'launch_angle' not in work.columns:
+        return pd.Series([np.nan] * len(rows_df), index=rows_df.index, dtype=float)
+
+    launch_speed = pd.to_numeric(work['launch_speed'], errors='coerce')
+    launch_angle = pd.to_numeric(work['launch_angle'], errors='coerce')
+    clean_launch_speed = launch_speed.fillna(0.0)
+    clean_launch_angle = launch_angle.fillna(0.0)
+    hard_hit = clean_launch_speed.notna() & (clean_launch_speed >= 95.0)
+    sweet_spot = clean_launch_angle.notna() & clean_launch_angle.between(8.0, 32.0)
     is_barrel = (
-        (launch_speed >= 98)
-        & (launch_angle >= 26 - (launch_speed - 98))
-        & (launch_angle <= 30 + (launch_speed - 98))
+        (clean_launch_speed >= 98)
+        & (clean_launch_angle >= 26 - (clean_launch_speed - 98))
+        & (clean_launch_angle <= 30 + (clean_launch_speed - 98))
     )
+    is_barrel = is_barrel.fillna(False)
+    hard_hit = hard_hit.fillna(False)
+    sweet_spot = sweet_spot.fillna(False)
     # Quality-only by default: damaging contact is defined by process quality, not HR outcomes.
-    if _quality_only_statcast_mode_enabled():
-        damage = ((is_barrel.astype(int) * 2) + hard_hit.astype(int) + sweet_spot.astype(int) >= 2).astype(int)
+    if 'events' in work.columns:
+        is_hr = work['events'].astype(str).str.lower().eq('home_run').fillna(False)
     else:
-        if 'events' in work.columns:
-            is_hr = work['events'].astype(str).str.lower().eq('home_run')
-        else:
-            is_hr = pd.Series([False] * len(work), index=work.index)
+        is_hr = pd.Series([False] * len(work), index=work.index)
+
+    if _quality_only_statcast_mode_enabled():
+        quality_score = (
+            (is_barrel.astype(int) * 2)
+            + hard_hit.astype(int)
+            + sweet_spot.astype(int)
+            + (is_hr.astype(int) * 2)
+        )
+        damage = (quality_score >= 2).astype(int)
+    else:
         damage = (hard_hit.astype(int) + is_hr.astype(int)).clip(0, 1)
     work['damage_flag'] = damage
 
@@ -9356,6 +9480,113 @@ def calculate_confidence_interval(prob, sample_size=100):
         return (prob * 0.8, prob * 1.2)
 
 
+def initialize_missing_feature_guardrails(live_df: pd.DataFrame) -> pd.DataFrame:
+    """Fail closed on missing live-model source values.
+
+    Production policy:
+    - If a real source value exists, use it.
+    - If a value is missing, mark the row as fallback provenance and invalid for model use
+      instead of silently neutralizing the feature with a synthetic default.
+    """
+    if live_df is None:
+        return pd.DataFrame()
+
+    work = live_df.copy()
+    if work.empty:
+        work['source_fallback_flag'] = pd.Series([], dtype=bool)
+        work['row_source_valid'] = pd.Series([], dtype=bool)
+        work['missing_feature_fields'] = pd.Series([], dtype=object)
+        return work
+
+    fallback_cols = [
+        'platoon_advantage_multiplier', 'weather_extremes_multiplier', 'ballpark_park_factor',
+        'umpire_strike_to_ball_ratio', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game',
+        'weather_hr_impact_score', 'weather_hr_penalty_score', 'ppci_dominance_score',
+        'dynamic_matchup_grade', 'pitch_arsenal_matchup_score', 'micro_weather_score',
+        'lineup_slot_pressure_score', 'lineup_grab_window_score', 'split_advantage_score',
+        'flyball_pitcher_target_score', 'hot_streak_contact_score', 'arsenal_vulnerability_score',
+        'game_total_context_score', 'breaking_pitch_vulnerability', 'left_on_right_fade_score',
+        'reverse_split_anomaly_score', 'porch_advantage_bonus', 'death_valley_penalty',
+        'would_be_hr_differential', 'bullpen_quality_score_home', 'bullpen_quality_score_away',
+        'opp_bullpen_xfip_degradation', 'umpire_strike_zone_impact', 'density_altitude_factor',
+        'sportsbook_value_score', 'pitcher_fear_factor', 'is_elite_power_batter',
+    ]
+
+    work['missing_feature_fields'] = work.apply(
+        lambda row: [
+            col for col in fallback_cols
+            if col not in work.columns or pd.isna(pd.to_numeric(row.get(col, np.nan), errors='coerce'))
+        ],
+        axis=1,
+    )
+    work['source_fallback_flag'] = work['missing_feature_fields'].apply(bool)
+    work['row_source_valid'] = ~work['source_fallback_flag']
+
+    for col in fallback_cols:
+        if col not in work.columns:
+            work[col] = np.nan
+
+    for col in fallback_cols:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors='coerce')
+
+    # Keep the metadata visible to diagnostics; do not silently replace missing source values with
+    # synthetic neutral measurements that look like real data.
+    return work
+
+
+def enforce_training_feature_guardrails(train_df, live_df, required_features=None):
+    """Force live inputs to respect the training contract when a feature has zero variance.
+
+    This protects against stale or constant training baselines such as density_altitude_factor,
+    apparent_temp, wind_gust, and pitcher_fear_factor, where the model learned a fixed value but
+    the live feature stream contains real variation. In that case the live value is clamped to the
+    training baseline and missing values are filled from the training median.
+    """
+    if live_df is None:
+        return None
+    if train_df is None or not hasattr(train_df, 'columns'):
+        return initialize_missing_feature_guardrails(live_df)
+
+    work = live_df.copy()
+    required_features = list(required_features or [])
+
+    for col in required_features:
+        if col not in work.columns:
+            if col in train_df.columns:
+                train_series = pd.to_numeric(train_df[col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+                if train_series.empty:
+                    default = 0.0
+                else:
+                    default = float(train_series.median()) if train_series.notna().any() else 0.0
+                work[col] = default
+            else:
+                work[col] = 0.0
+
+    for col in [feature for feature in required_features if feature in train_df.columns and feature in work.columns]:
+        train_series = pd.to_numeric(train_df[col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+        live_series = pd.to_numeric(work[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+        if train_series.empty:
+            work[col] = live_series.fillna(0.0)
+            continue
+
+        unique_values = train_series.dropna().unique()
+        if len(unique_values) <= 1:
+            baseline = float(train_series.iloc[0])
+            work[col] = live_series.fillna(baseline).where(live_series.notna(), baseline)
+            work[col] = pd.to_numeric(work[col], errors='coerce').fillna(baseline).clip(lower=baseline, upper=baseline)
+            continue
+
+        q01 = float(train_series.quantile(0.01))
+        q99 = float(train_series.quantile(0.99))
+        if not np.isfinite(q01) or not np.isfinite(q99) or q99 <= q01:
+            continue
+        work[col] = pd.to_numeric(work[col], errors='coerce').fillna(float(train_series.median()))
+        work[col] = work[col].clip(lower=q01, upper=q99)
+
+    return work
+
+
 def validate_model_dataflow(train_df, live_df, required_features=None):
     """Validate that training and live frames carry the expected data columns for inference."""
     issues = []
@@ -9380,6 +9611,12 @@ def validate_model_dataflow(train_df, live_df, required_features=None):
         missing_live = [col for col in required_features if col not in live_df.columns]
         if missing_live:
             issues.append(f"Live missing feature columns: {', '.join(missing_live)}")
+
+        for col in required_features:
+            if col in live_df.columns:
+                nan_ratio = pd.to_numeric(live_df[col], errors='coerce').isna().mean()
+                if nan_ratio > 0.0:
+                    issues.append(f"Live feature column '{col}' contains NaN values")
 
     if hasattr(train_df, 'columns') and hasattr(live_df, 'columns'):
         for key in ['batter', 'pitcher']:
@@ -9683,20 +9920,23 @@ def _ensure_discord_radar_columns(rankings_df):
         None
     )
     if 'hr_probability' not in work.columns:
-        if final_prob_source is not None:
+        if final_prob_source is not None and final_prob_source in work.columns:
             work['hr_probability'] = pd.to_numeric(work[final_prob_source], errors='coerce').fillna(0.0)
         else:
             work['hr_probability'] = 0.0
 
     if 'physics_delta' not in work.columns:
-        final_prob = pd.to_numeric(work.get('hr_probability', work.get(final_prob_source, 0.0) if final_prob_source else 0.0), errors='coerce').fillna(0.0)
-        base_prob = pd.to_numeric(
-            work.get(
-                'raw_per_pa_hr_prob',
-                work.get('base_model_per_pa_prob', work.get('base_model_prob', 0.0)),
-            ),
-            errors='coerce',
-        ).fillna(0.0)
+        final_prob = pd.to_numeric(work.get('hr_probability', 0.0), errors='coerce').fillna(0.0)
+        base_source = (
+            work['raw_per_pa_hr_prob']
+            if 'raw_per_pa_hr_prob' in work.columns else
+            work['base_model_per_pa_prob']
+            if 'base_model_per_pa_prob' in work.columns else
+            work['base_model_prob']
+            if 'base_model_prob' in work.columns else
+            pd.Series(0.0, index=work.index)
+        )
+        base_prob = pd.to_numeric(base_source, errors='coerce').fillna(0.0)
         if final_prob_source is not None or 'raw_per_pa_hr_prob' in work.columns or 'base_model_prob' in work.columns:
             work['physics_delta'] = final_prob - base_prob
         else:
@@ -11662,11 +11902,12 @@ def generate_daily_predictions(date_str=None):
         except Exception as e:
             print(f"No-HR odds fetch failed ({provider}): {e}")
             return {}
-    sample_weights = load_feedback_weights(train_df)
+    base_feedback_weights = np.asarray(load_feedback_weights(train_df), dtype=float)
+    retraining_weights = calculate_retraining_weights(train_df)
     recent_minibatch_weights = build_recent_minibatch_weights(train_df)
-    sample_weights = np.clip(np.asarray(sample_weights) * recent_minibatch_weights, 0.5, 15.0)
+    sample_weights = np.clip(base_feedback_weights * retraining_weights * recent_minibatch_weights, 0.5, 15.0)
     missed_count = int((sample_weights > 1.2).sum())
-    print(f"Feedback weights loaded — {missed_count} training rows upweighted from past misses.")
+    print(f"Feedback weights loaded — {missed_count} training rows upweighted from past misses and physical leverage signals.")
 
     # Closed-loop reward backprop layer: rewrite adaptive coefficients from recent outcomes.
     closed_loop_report = run_post_mortem_backpropagation(days_lookback=7)
@@ -12335,6 +12576,20 @@ def generate_daily_predictions(date_str=None):
         )
 
     live = _sanitize_active_starters(live)
+    live = initialize_missing_feature_guardrails(live)
+    if not live.get('row_source_valid', pd.Series([True] * len(live), index=live.index)).all():
+        missing_summary = live.loc[~live['row_source_valid'], 'missing_feature_fields'].apply(lambda vals: sorted(vals) if isinstance(vals, list) else []).tolist()
+        print("⚠️ Live scoring fail-closed: invalid rows due to missing source fields:")
+        for idx, missing in enumerate(missing_summary[:10], start=1):
+            print(f"  - row {idx}: {missing}")
+        if len(missing_summary) > 10:
+            print(f"  ... and {len(missing_summary) - 10} more rows")
+        live = live[live['row_source_valid']].copy()
+        if live.empty:
+            print("No valid live rows remain after fail-closed source validation.")
+            return pd.DataFrame()
+
+    live = enforce_training_feature_guardrails(train_df, live, required_features=features_live)
     live_dataflow_issues = validate_model_dataflow(
         train_df,
         live,
@@ -12921,6 +13176,12 @@ def generate_daily_predictions(date_str=None):
     live['pa_distribution_std'] = pa_dist_spread
     live['pa_conversion_method'] = 'poisson_weighted_pa_dist'
     live['analytic_game_prob_diagnostic'] = np.asarray(game_level_probs, dtype=float)
+
+    raw_diag_cols = [c for c in ['batter_name', 'pitcher_name', 'analytic_game_prob_diagnostic', 'projected_pas', 'source_fallback_flag', 'row_source_valid', 'weather_source', 'weather_is_fallback'] if c in live.columns]
+    if raw_diag_cols:
+        raw_diag = live[raw_diag_cols].sort_values('analytic_game_prob_diagnostic', ascending=False).head(10).copy()
+        print("RAW HR probability diagnostic (pre-betting filters):")
+        print(raw_diag.to_string(index=False))
 
     # Preserve the raw per-PA probability signal here. The game-level conversion is
     # diagnostic only and must not replace the underlying ensemble output that later
@@ -16138,14 +16399,7 @@ def _estimate_bet_stake_usd(kelly_fraction, bankroll_usd=None, min_stake_usd=Non
     stake_cap = max(stake_floor, _env_float('BET_STAKE_MAX_USD', max_stake_usd if max_stake_usd is not None else 50.0))
     kelly_mult = max(0.0, _env_float('BET_STAKE_KELLY_MULTIPLIER', kelly_multiplier if kelly_multiplier is not None else 0.25))
     kf = max(0.0, _safe_float(kelly_fraction, 0.0) or 0.0)
-    unit_cap = _apply_unit_based_kelly_cap(
-        kf,
-        model_reliability=model_reliability,
-        sportsbook_value_score=sportsbook_value_score,
-        bankroll_usd=bankroll,
-    )
-    _, _, capped_fraction = unit_cap
-    stake = bankroll * capped_fraction * kelly_mult
+    stake = bankroll * kf * kelly_mult
     if stake <= 0:
         return 0.0
     return float(np.clip(stake, stake_floor, stake_cap))

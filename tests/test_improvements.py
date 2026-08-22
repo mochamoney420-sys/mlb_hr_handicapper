@@ -8,7 +8,7 @@ import pytest
 
 print("Testing improvements...\n")
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 TARGET_FILE = REPO_ROOT / "run_daily_predictions.py"
 
 # Test 1: error_tracking module

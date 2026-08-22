@@ -11,6 +11,9 @@ from run_daily_predictions import (
     _power_law_devig_prob,
     _reconcile_physics_delta,
     _sanitize_active_starters,
+    calculate_retraining_weights,
+    enforce_training_feature_guardrails,
+    initialize_missing_feature_guardrails,
     make_baseball_true,
 )
 
@@ -86,3 +89,57 @@ def test_unit_based_kelly_cap_fences_risk_by_reliability():
     assert final_units <= 3.0
     assert stake_usd <= 30.0
     assert capped_fraction <= 0.08
+
+
+def test_retraining_weight_prioritization():
+    """Guardrail: rookie cleanup hitters with elite physical traits should be weighted above baseline."""
+    mock_data = pd.DataFrame({
+        'mlb_lifetime_pas': [200, 18],
+        'milb_recent_iso': [0.120, 0.235],
+        'statcast_barrel_percentage': [4.5, 14.2],
+        'statcast_max_launch_speed': [104.0, 114.5],
+        'lineup_batting_position': [8, 4],
+    })
+
+    computed = calculate_retraining_weights(mock_data)
+
+    assert computed[1] > computed[0]
+    assert computed[1] == 3.00
+
+
+def test_missing_feature_matrix_alignment():
+    """Guardrail: missing live columns must be explicit fallback provenance and row-level invalid."""
+    mock_live = pd.DataFrame({'game_pk': ['123456'], 'hitter_id': ['543210']})
+
+    patched_live = initialize_missing_feature_guardrails(mock_live)
+
+    assert 'weather_hr_impact_score' in patched_live.columns
+    assert 'platoon_advantage_multiplier' in patched_live.columns
+    assert bool(patched_live['source_fallback_flag'].iloc[0]) is True
+    assert bool(patched_live['row_source_valid'].iloc[0]) is False
+    assert 'weather_hr_impact_score' in patched_live['missing_feature_fields'].iloc[0]
+    assert 'platoon_advantage_multiplier' in patched_live['missing_feature_fields'].iloc[0]
+
+
+def test_training_guardrail_clamps_zero_variance_features_to_training_baseline():
+    """Guardrail: constant training features must remain fixed during live scoring."""
+    train_df = pd.DataFrame({
+        'density_altitude_factor': [1.0, 1.0, 1.0],
+        'pitcher_fear_factor': [0.0, 0.0, 0.0],
+        'temp': [72.0, 72.0, 72.0],
+    })
+    live_df = pd.DataFrame({
+        'density_altitude_factor': [1.5, 0.9, 1.0],
+        'pitcher_fear_factor': [0.4, -0.1, 0.0],
+        'temp': [88.0, 32.0, 72.0],
+    })
+
+    patched = enforce_training_feature_guardrails(
+        train_df,
+        live_df,
+        required_features=['density_altitude_factor', 'pitcher_fear_factor', 'temp'],
+    )
+
+    assert patched['density_altitude_factor'].tolist() == [1.0, 1.0, 1.0]
+    assert patched['pitcher_fear_factor'].tolist() == [0.0, 0.0, 0.0]
+    assert patched['temp'].tolist() == [72.0, 72.0, 72.0]
