@@ -198,6 +198,17 @@ def test_calculate_probability_metrics_handles_single_class_labels():
     assert np.isnan(metrics['log_loss'])
 
 
+def test_probability_guardrails_keep_true_hr_candidates_visible():
+    caps = rdp.get_probability_guardrail_defaults()
+    shortlist = rdp.get_conservative_shortlist_defaults()
+
+    assert caps['hard_confidence_cap'] >= 0.45
+    assert caps['reliability_cap_high'] >= 0.50
+    assert caps['reliability_cap_medium'] >= 0.40
+    assert shortlist['min_prob'] <= 0.05
+    assert shortlist['max_prob'] >= 0.50
+
+
 print("\n" + "=" * 70)
 print("✅ ALL TESTS PASSED")
 print("=" * 70)

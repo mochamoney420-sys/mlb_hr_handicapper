@@ -112,6 +112,32 @@ def _env_float(name, default):
         return float(default)
 
 
+def get_probability_guardrail_defaults():
+    """Return default probability-cap settings that keep legitimate HR threats visible.
+
+    The production pipeline was clipping strong hitters too aggressively by default,
+    which hid real power bats before the final shortlist was even built.
+    """
+    return {
+        'reliability_cap_high': float(np.clip(_env_float('RELIABILITY_CAP_HIGH', 0.55), 0.20, 0.80)),
+        'reliability_cap_medium': float(np.clip(_env_float('RELIABILITY_CAP_MEDIUM', 0.42), 0.15, 0.70)),
+        'reliability_cap_low': float(np.clip(_env_float('RELIABILITY_CAP_LOW', 0.30), 0.10, 0.60)),
+        'hard_confidence_cap': float(np.clip(_env_float('HARD_CONFIDENCE_CAP', 0.48), 0.18, 0.60)),
+    }
+
+
+def get_conservative_shortlist_defaults():
+    """Return default shortlist settings that are strict enough to filter noise but
+    still permit real HR threats to surface in the model-driven shortlist."""
+    return {
+        'min_prob': float(np.clip(_env_float('CONSERVATIVE_MIN_PROB', 0.04), 0.01, 0.25)),
+        'max_prob': float(np.clip(_env_float('CONSERVATIVE_MAX_PROB', 0.50), 0.10, 0.99)),
+        'min_ev_pct': float(np.clip(_env_float('CONSERVATIVE_MIN_EV_PCT', 0.0), -50.0, 100.0)),
+        'min_edge_pct': float(np.clip(_env_float('CONSERVATIVE_MIN_EDGE_PCT', 0.0), -50.0, 100.0)),
+        'min_kelly': float(np.clip(_env_float('CONSERVATIVE_MIN_KELLY', 0.0), 0.0, 0.50)),
+    }
+
+
 def _safe_numeric_scalar(value, default=0.0):
     """Return a Python float from scalar or pandas-like numeric input.
 
@@ -2669,13 +2695,14 @@ def print_conservative_bet_ready_wagers(date_str=None, top_n=10):
         preds['best_market_odds_american'] = np.nan
     preds['has_market_odds'] = preds.get('best_market_odds_american', pd.Series([np.nan] * len(preds))).notna()
 
+    shortlist_defaults = get_conservative_shortlist_defaults()
     min_american = _env_int('CONSERVATIVE_MIN_AMERICAN_ODDS', -220)
     max_american = _env_int('CONSERVATIVE_MAX_AMERICAN_ODDS', 1200)
-    min_prob = _env_float('CONSERVATIVE_MIN_PROB', 0.07)
-    max_prob = _env_float('CONSERVATIVE_MAX_PROB', 0.40)
-    min_ev_pct = _env_float('CONSERVATIVE_MIN_EV_PCT', 2.5)
-    min_edge_pct = _env_float('CONSERVATIVE_MIN_EDGE_PCT', 4.0)
-    min_kelly = _env_float('CONSERVATIVE_MIN_KELLY', 0.01)
+    min_prob = _env_float('CONSERVATIVE_MIN_PROB', shortlist_defaults['min_prob'])
+    max_prob = _env_float('CONSERVATIVE_MAX_PROB', shortlist_defaults['max_prob'])
+    min_ev_pct = _env_float('CONSERVATIVE_MIN_EV_PCT', shortlist_defaults['min_ev_pct'])
+    min_edge_pct = _env_float('CONSERVATIVE_MIN_EDGE_PCT', shortlist_defaults['min_edge_pct'])
+    min_kelly = _env_float('CONSERVATIVE_MIN_KELLY', shortlist_defaults['min_kelly'])
 
     preds['odds_in_sanity_range'] = (
         preds['has_market_odds'] &
@@ -13512,7 +13539,7 @@ def generate_daily_predictions(date_str=None):
         )
         live = apply_poisson_hr_filter(live, k=5, p_threshold=0.04, min_game_prob=0.18)
         monotonic_gamma = _env_float('MONOTONIC_CALIBRATION_GAMMA', 1.20)
-        monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.30)
+        monotonic_cap = _env_float('MONOTONIC_CALIBRATION_CAP', 0.30) 
         monotonic_boost = _env_float('MONOTONIC_CALIBRATION_TOP_SIGNAL_BOOST', 0.010)
         live = apply_monotonic_prob_calibration(
             live,
@@ -13683,15 +13710,16 @@ def generate_daily_predictions(date_str=None):
     # Reliability-aware hard ceilings: keep them conservative enough to avoid 
     # unsupported top-end inflation without clipping legitimate HR signal.
     rel_upper = live['model_reliability'].astype(str).str.upper()
-    rel_cap_high = float(np.clip(_env_float('RELIABILITY_CAP_HIGH', 0.45), 0.20, 0.80))
-    rel_cap_medium = float(np.clip(_env_float('RELIABILITY_CAP_MEDIUM', 0.34), 0.15, rel_cap_high))
-    rel_cap_low = float(np.clip(_env_float('RELIABILITY_CAP_LOW', 0.24), 0.10, rel_cap_medium))
+    guard_defaults = get_probability_guardrail_defaults()
+    rel_cap_high = float(np.clip(_env_float('RELIABILITY_CAP_HIGH', guard_defaults['reliability_cap_high']), 0.20, 0.80))
+    rel_cap_medium = float(np.clip(_env_float('RELIABILITY_CAP_MEDIUM', guard_defaults['reliability_cap_medium']), 0.15, rel_cap_high))
+    rel_cap_low = float(np.clip(_env_float('RELIABILITY_CAP_LOW', guard_defaults['reliability_cap_low']), 0.10, rel_cap_medium))
     rel_cap = np.where(rel_upper == 'HIGH', rel_cap_high, np.where(rel_upper == 'MEDIUM', rel_cap_medium, rel_cap_low))
     live['reliability_prob_cap'] = rel_cap
     live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), rel_cap)
 
     hard_conf_cap_enabled = str(os.getenv('HARD_CONFIDENCE_CAP_ENABLED', 'true')).strip().lower() not in {'0', 'false', 'no'}
-    hard_conf_cap = float(np.clip(_env_float('HARD_CONFIDENCE_CAP', 0.40), 0.18, 0.60))
+    hard_conf_cap = float(np.clip(_env_float('HARD_CONFIDENCE_CAP', guard_defaults['hard_confidence_cap']), 0.18, 0.60))
     if hard_conf_cap_enabled:
         live['pred_hr_prob'] = np.minimum(pd.to_numeric(live['pred_hr_prob'], errors='coerce').fillna(0.0), hard_conf_cap)
     live['hard_confidence_cap'] = hard_conf_cap if hard_conf_cap_enabled else np.nan
