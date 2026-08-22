@@ -1,10 +1,10 @@
 {
-  "last_check": "2026-08-21T15:00:10.054108",
+  "last_check": "2026-08-21T23:00:05.732588",
   "main_pipeline_running": true,
   "live_monitor_running": false,
   "last_main_run": null,
   "last_live_run": null,
   "crash_count": 0,
-  "recovery_attempts": 14,
+  "recovery_attempts": 15,
   "status": "DEGRADED"
 }

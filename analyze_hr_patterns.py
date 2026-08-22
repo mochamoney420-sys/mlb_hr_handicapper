@@ -95,12 +95,93 @@ def _sanitize_pattern(pattern):
     clean['model_prob'] = _safe_float(clean.get('model_prob', 0.0), 0.0)
     return clean
 
+def load_frozen_pregame_predictions(date_str=None):
+    """Load the saved pregame everyday predictions without rebuilding features post-game.
+
+    This preserves the frozen inference state and later merges in actual outcomes only
+    for evaluation, preventing target leakage during Phase-0 learning.
+    """
+    date_str = date_str or (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+    pred_file = Path('data') / f'predictions_{date_str}.csv'
+
+    if not pred_file.exists():
+        return pd.DataFrame()
+
+    try:
+        preds = pd.read_csv(pred_file)
+    except Exception:
+        return pd.DataFrame()
+
+    if preds.empty:
+        return pd.DataFrame()
+
+    preds = preds.copy()
+    for candidate in ['pred_hr_prob', 'hr_probability', 'model_prob']:
+        if candidate in preds.columns:
+            preds['frozen_pregame_prediction'] = pd.to_numeric(preds[candidate], errors='coerce').fillna(0.0)
+            break
+    else:
+        preds['frozen_pregame_prediction'] = 0.0
+
+    for col in ['game_pk', 'batter', 'pitcher']:
+        if col in preds.columns:
+            preds[col] = pd.to_numeric(preds[col], errors='coerce')
+
+    if 'batter_name' not in preds.columns and 'player_name' in preds.columns:
+        preds['batter_name'] = preds['player_name']
+    if 'pitcher_name' not in preds.columns and 'pitcher_name' in preds.columns:
+        preds['pitcher_name'] = preds['pitcher_name']
+
+    preds['date'] = date_str
+    preds['source'] = 'frozen_pregame_prediction'
+    return preds.reset_index(drop=True)
+
+
 def load_yesterdays_home_runs():
-    """Load yesterday's complete home-run outcomes from Statcast and merge with any watcher feedback."""
+    """Load yesterday's actual HR outcomes, using frozen pregame predictions as the source of truth for evaluation."""
     yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
     feedback_file = Path('data') / f'live_feedback_{yesterday}.csv'
     evaluation_file = Path('data') / f'evaluation_{yesterday}.csv'
     statcast_file = Path('cache') / f'statcast_{yesterday}.csv'
+    frozen_preds = load_frozen_pregame_predictions(yesterday)
+
+    if not frozen_preds.empty:
+        actual_df = pd.DataFrame()
+        if evaluation_file.exists():
+            try:
+                eval_df = pd.read_csv(evaluation_file)
+                if not eval_df.empty and {'game_pk', 'batter', 'pitcher', 'actual_hr'}.issubset(eval_df.columns):
+                    actual_df = eval_df[['game_pk', 'batter', 'pitcher', 'actual_hr']].copy()
+            except Exception:
+                actual_df = pd.DataFrame()
+        if actual_df.empty and feedback_file.exists():
+            try:
+                fb = pd.read_csv(feedback_file)
+                if not fb.empty and {'game_pk', 'batter', 'pitcher', 'actual_hr'}.issubset(fb.columns):
+                    actual_df = fb[['game_pk', 'batter', 'pitcher', 'actual_hr']].copy()
+            except Exception:
+                actual_df = pd.DataFrame()
+        if not actual_df.empty:
+            actual_df = actual_df.copy()
+            for col in ['game_pk', 'batter', 'pitcher']:
+                actual_df[col] = pd.to_numeric(actual_df[col], errors='coerce')
+            actual_df['actual_hr'] = pd.to_numeric(actual_df.get('actual_hr', 0), errors='coerce').fillna(0).clip(0, 1)
+            actual_df = actual_df.dropna(subset=['game_pk', 'batter', 'pitcher']).drop_duplicates(subset=['game_pk', 'batter', 'pitcher'], keep='last')
+            merged = frozen_preds.merge(actual_df, on=['game_pk', 'batter', 'pitcher'], how='left')
+            merged['actual_hr'] = pd.to_numeric(merged['actual_hr'], errors='coerce').fillna(0).astype(int)
+            merged['model_prob'] = pd.to_numeric(merged['frozen_pregame_prediction'], errors='coerce').fillna(0.0)
+            merged['source'] = 'frozen_pregame_prediction'
+            if 'batter_name' not in merged.columns:
+                merged['batter_name'] = merged.get('player_name', 'Unknown')
+            if 'pitcher_name' not in merged.columns:
+                merged['pitcher_name'] = merged.get('pitcher_name', 'Unknown')
+            merged['batter_name'] = merged['batter_name'].apply(_safe_name)
+            merged['pitcher_name'] = merged['pitcher_name'].apply(_safe_name)
+            result_cols = [
+                c for c in ['date', 'game_pk', 'batter', 'pitcher', 'batter_name', 'pitcher_name', 'model_prob', 'actual_hr', 'source']
+                if c in merged.columns
+            ]
+            return merged[result_cols].reset_index(drop=True)
 
     # Canonical source: yesterday evaluation file when available.
     # This keeps pattern-learning counts aligned with scoring metrics.

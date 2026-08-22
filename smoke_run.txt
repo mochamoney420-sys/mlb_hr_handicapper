@@ -1,0 +1,1416 @@
+Historical 2026 coverage already verified today.
+Backfilling physics columns for last 30 days...
+Backfill complete: updated=0, skipped=34
+
+======================================================================
+MODEL HEALTH CHECK & SILENT FAILURE DETECTION
+======================================================================
+Γ£à Discord webhook configured and ready
+Γ£à Physics simulation module loaded
+Γ£à 30 prediction files valid
+
+≡ƒöì SCANNING FOR SILENT FAILURES...
+Γ£à Today's predictions: 270 rows, mean=0.032, q90=0.064, max=0.068
+Γ£à Learning evaluation ready: 162 rows
+Closed-loop check: samples=106, missed_hr=5, miss_rate=4.7%
+
+======================================================================
+Γ£à ALL CHECKS PASSED - System is healthy
+ΓÜí SMOKE TEST MODE ACTIVATED: trimming historical lookbacks and live slate to a minimal runtime sample.
+
+======================================================================
+PHASE 0: ANALYZING YESTERDAY'S HOME RUNS FOR PATTERN LEARNING
+======================================================================
+Phase-0 evaluation guardrail: 2026-08-20 ready (rows=162, source=existing)
+
+≡ƒºá AUTOMATIC HOME RUN PATTERN LEARNING
+======================================================================
+
+≡ƒôÑ Loading 60 days of Statcast data for pattern analysis...
+≡ƒöì Analyzing HR conditions and patterns...
+≡ƒÆí Generating learning insights...
+
+======================================================================
+≡ƒôÜ YESTERDAY'S HOME RUN LEARNING ANALYSIS
+======================================================================
+
+Analysis Date: 2026-08-20
+Total HRs Analyzed: 162
+Unique Batters: 162
+Missed by Model: 22
+Predicted Correctly: 140
+
+≡ƒöì KEY FINDINGS:
+   ≡ƒöÑ Hottest batters: Evan Carter (1 HRs), Wyatt Langford (1 HRs), Jake Burger (1 HRs)
+   ΓÜá∩╕Å  Model missed 22/162 HRs (threshold=0.08)
+   ≡ƒôì Barrel rate was high (24.2%) - quality of contact matters
+
+≡ƒôè DETAILED PATTERNS:
+
+   [1] Evan Carter vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 23.6%
+       Exit Velo: 84.9 mph
+       Barrel Rate: 0.0%
+
+   [2] Wyatt Langford vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 30.6%
+       Exit Velo: 91.5 mph
+       Barrel Rate: 33.3%
+
+   [3] Jake Burger vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 34.8%
+       Exit Velo: 108.0 mph
+       Barrel Rate: 100.0%
+
+   [4] Joc Pederson vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 18.5%
+       Exit Velo: 83.2 mph
+       Barrel Rate: 16.7%
+
+   [5] Corey Seager vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 19.9%
+       Exit Velo: 90.5 mph
+       Barrel Rate: 50.0%
+       Pitcher HR Rate: 12.5%
+
+   [6] Nicky Lopez vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 8.1%
+       Exit Velo: 80.3 mph
+       Barrel Rate: 0.0%
+
+   [7] Justin Foscue vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 66.3%
+       Exit Velo: 86.2 mph
+       Barrel Rate: 50.0%
+
+   [8] Ezequiel Duran vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 11.6%
+       Exit Velo: 88.0 mph
+       Barrel Rate: 0.0%
+
+   [9] Brandon Nimmo vs Andrew Alvarez
+       Category: PREDICTED
+       Model Prob: 28.6%
+       Exit Velo: 81.4 mph
+       Barrel Rate: 0.0%
+
+   [10] Brady House vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 46.2%
+       Exit Velo: 81.2 mph
+       Barrel Rate: 0.0%
+
+   [11] Abimelec Ortiz vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 83.5%
+       Exit Velo: 108.3 mph
+       Barrel Rate: 100.0%
+
+   [12] CJ Abrams vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 37.0%
+       Exit Velo: 83.5 mph
+       Barrel Rate: 0.0%
+
+   [13] Nasim Nu├▒ez vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 56.1%
+       Exit Velo: 89.6 mph
+       Barrel Rate: 0.0%
+
+   [14] Andr├⌐s Chaparro vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 56.5%
+       Exit Velo: 91.0 mph
+       Barrel Rate: 0.0%
+
+   [15] Jorbit Vivas vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 9.8%
+       Exit Velo: 84.4 mph
+       Barrel Rate: 0.0%
+
+   [16] Dylan Crews vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 21.6%
+       Exit Velo: 82.4 mph
+       Barrel Rate: 0.0%
+
+   [17] Daylen Lile vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 45.6%
+       Exit Velo: 92.0 mph
+       Barrel Rate: 66.7%
+
+   [18] Jos├⌐ Tena vs Jacob deGrom
+       Category: PREDICTED
+       Model Prob: 13.9%
+       Exit Velo: 74.2 mph
+       Barrel Rate: 0.0%
+
+   [19] Chandler Simpson vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 24.5%
+       Exit Velo: 85.5 mph
+       Barrel Rate: 0.0%
+
+   [20] Junior Caminero vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 52.4%
+       Exit Velo: 89.2 mph
+       Barrel Rate: 25.0%
+
+   [21] Jonathan Aranda vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 50.6%
+       Exit Velo: 87.4 mph
+       Barrel Rate: 25.0%
+
+   [22] Yandy D├¡az vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 22.3%
+       Exit Velo: 82.1 mph
+       Barrel Rate: 14.3%
+
+   [23] Cedric Mullins vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 24.2%
+       Exit Velo: 83.2 mph
+       Barrel Rate: 0.0%
+
+   [24] Jonny DeLuca vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 46.1%
+       Exit Velo: 85.8 mph
+       Barrel Rate: 16.7%
+
+   [25] Richie Palacios vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 27.1%
+       Exit Velo: 90.9 mph
+       Barrel Rate: 50.0%
+
+   [26] Jorge Mateo vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 50.8%
+       Exit Velo: 77.1 mph
+       Barrel Rate: 0.0%
+
+   [27] Nick Fortes vs Shane Bieber
+       Category: PREDICTED
+       Model Prob: 8.3%
+       Exit Velo: 88.2 mph
+       Barrel Rate: 0.0%
+
+   [28] Charles McAdoo vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 19.8%
+       Exit Velo: 81.2 mph
+       Barrel Rate: 0.0%
+
+   [29] Daz Cameron vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 15.9%
+       Exit Velo: 88.5 mph
+       Barrel Rate: 33.3%
+       Pitcher HR Rate: 7.7%
+
+   [30] Alejandro Kirk vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 66.3%
+       Exit Velo: 84.0 mph
+       Barrel Rate: 11.1%
+
+   [31] George Springer vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 57.5%
+       Exit Velo: 86.2 mph
+       Barrel Rate: 25.0%
+
+   [32] Kazuma Okamoto vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 68.6%
+       Exit Velo: 86.8 mph
+       Barrel Rate: 16.7%
+       Pitcher HR Rate: 7.7%
+
+   [33] Brandon Valenzuela vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 8.6%
+       Exit Velo: 95.9 mph
+       Barrel Rate: 75.0%
+       Pitcher HR Rate: 10.0%
+
+   [34] Ernie Clement vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 23.6%
+       Exit Velo: 94.2 mph
+       Barrel Rate: 0.0%
+
+   [35] Myles Straw vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 17.0%
+       Exit Velo: 83.9 mph
+       Barrel Rate: 25.0%
+
+   [36] Nathan Lukes vs Ian Seymour
+       Category: PREDICTED
+       Model Prob: 10.6%
+       Exit Velo: 91.8 mph
+       Barrel Rate: 0.0%
+       Pitcher HR Rate: 12.5%
+
+   [37] Brice Turang vs George Kirby
+       Category: PREDICTED
+       Model Prob: 45.5%
+       Exit Velo: 95.8 mph
+       Barrel Rate: 60.0%
+
+   [38] Jackson Chourio vs George Kirby
+       Category: PREDICTED
+       Model Prob: 34.5%
+       Exit Velo: 84.9 mph
+       Barrel Rate: 0.0%
+
+   [39] Jake Bauers vs George Kirby
+       Category: PREDICTED
+       Model Prob: 70.9%
+       Exit Velo: 108.5 mph
+       Barrel Rate: 100.0%
+
+   [40] Gary S├ínchez vs George Kirby
+       Category: PREDICTED
+       Model Prob: 84.6%
+       Exit Velo: 79.5 mph
+       Barrel Rate: 0.0%
+
+   [41] Christian Yelich vs George Kirby
+       Category: PREDICTED
+       Model Prob: 54.4%
+       Exit Velo: 81.0 mph
+       Barrel Rate: 25.0%
+
+   [42] Joey Ortiz vs George Kirby
+       Category: PREDICTED
+       Model Prob: 14.1%
+       Exit Velo: 101.2 mph
+       Barrel Rate: 50.0%
+
+   [43] Garrett Mitchell vs George Kirby
+       Category: PREDICTED
+       Model Prob: 15.7%
+       Exit Velo: 97.4 mph
+       Barrel Rate: 66.7%
+
+   [44] David Hamilton vs George Kirby
+       Category: PREDICTED
+       Model Prob: 40.7%
+       Exit Velo: 87.9 mph
+       Barrel Rate: 0.0%
+
+   [45] Luis Lara vs George Kirby
+       Category: MISSED (low prob)
+       Model Prob: 4.2%
+       Exit Velo: 99.9 mph
+       Barrel Rate: 100.0%
+
+   [46] Brendan Donovan vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 45.8%
+       Exit Velo: 86.2 mph
+       Barrel Rate: 33.3%
+
+   [47] Randy Arozarena vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 56.4%
+       Exit Velo: 107.6 mph
+       Barrel Rate: 100.0%
+
+   [48] Dominic Canzone vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 54.9%
+       Exit Velo: 89.3 mph
+       Barrel Rate: 0.0%
+
+   [49] Julio Rodr├¡guez vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 65.4%
+       Exit Velo: 85.0 mph
+       Barrel Rate: 33.3%
+
+   [50] Josh Naylor vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 55.9%
+       Exit Velo: 96.9 mph
+       Barrel Rate: 0.0%
+
+   [51] Taylor Ward vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 58.9%
+       Exit Velo: 88.0 mph
+       Barrel Rate: 0.0%
+
+   [52] Cole Young vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 62.6%
+       Exit Velo: 80.0 mph
+       Barrel Rate: 0.0%
+
+   [53] Jhonny Pereda vs Robert Gasser
+       Category: PREDICTED
+       Model Prob: 34.2%
+       Exit Velo: 97.4 mph
+       Barrel Rate: 0.0%
+
+   [54] Brock Rodden vs Robert Gasser
+       Category: MISSED (near hit threshold)
+       Model Prob: 6.2%
+       Exit Velo: 94.5 mph
+       Barrel Rate: 50.0%
+
+   [55] Nick Loftin vs Gage Jump
+       Category: PREDICTED
+       Model Prob: 11.9%
+       Exit Velo: 92.3 mph
+       Barrel Rate: 66.7%
+
+   [56] Bobby Witt Jr. vs Gage Jump
+       Category: PREDICTED
+       Model Prob: 14.2%
+       Exit Velo: 90.4 mph
+       Barrel Rate: 50.0%
+       Pitcher HR Rate: 6.7%
+
+   [57] John Rave vs Gage Jump
+       Category: PREDICTED
+       Model Prob: 9.7%
+       Exit Velo: 83.5 mph
+       Barrel Rate: 0.0%
+
+   [58] Salvador Perez vs Gage Jump
+       Category: PREDICTED
+       Model Prob: 11.2%
+       Exit Velo: 85.1 mph
+       Barrel Rate: 0.0%
+
+   [59] Vinnie Pasquantino vs Gage Jump
+       Category: PREDICTED
+       Model Prob: 14.8%
+       Exit Velo: 88.5 mph
+       Barrel Rate: 50.0%
+
+   [60] Isaac Collins vs Gage Jump
+       Category: MISSED (near hit threshold)
+       Model Prob: 7.8%
+       Exit Velo: 81.5 mph
+       Barrel Rate: 0.0%
+
+   [61] Tyler Tolbert vs Gage Jump
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.0%
+       Exit Velo: 81.0 mph
+       Barrel Rate: 0.0%
+
+   [62] Michael Massey vs Gage Jump
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.7%
+       Exit Velo: 72.3 mph
+       Barrel Rate: 0.0%
+
+   [63] Luke Maile vs Gage Jump
+       Category: MISSED (low prob)
+       Model Prob: 4.2%
+       Exit Velo: 77.9 mph
+       Barrel Rate: 0.0%
+
+   [64] Henry Bolte vs Randy Dobnak
+       Category: PREDICTED
+       Model Prob: 11.3%
+       Exit Velo: 86.9 mph
+       Barrel Rate: 20.0%
+
+   [65] Jeff McNeil vs Randy Dobnak
+       Category: PREDICTED
+       Model Prob: 8.7%
+       Exit Velo: 78.6 mph
+       Barrel Rate: 0.0%
+
+   [66] Zack Gelof vs Randy Dobnak
+       Category: PREDICTED
+       Model Prob: 8.4%
+       Exit Velo: 97.5 mph
+       Barrel Rate: 0.0%
+
+   [67] Lawrence Butler vs Randy Dobnak
+       Category: PREDICTED
+       Model Prob: 10.7%
+       Exit Velo: 73.3 mph
+       Barrel Rate: 0.0%
+
+   [68] Max Muncy vs Randy Dobnak
+       Category: MISSED (near hit threshold)
+       Model Prob: 7.0%
+       Exit Velo: 88.0 mph
+       Barrel Rate: 0.0%
+
+   [69] Carlos Cortes vs Randy Dobnak
+       Category: PREDICTED
+       Model Prob: 13.2%
+       Exit Velo: 92.0 mph
+       Barrel Rate: 50.0%
+
+   [70] Brian Serven vs Randy Dobnak
+       Category: MISSED (low prob)
+       Model Prob: 4.7%
+       Exit Velo: 88.0 mph
+       Barrel Rate: 0.0%
+
+   [71] Donovan Walton vs Randy Dobnak
+       Category: MISSED (low prob)
+       Model Prob: 4.3%
+       Exit Velo: 90.3 mph
+       Barrel Rate: 25.0%
+
+   [72] Darell Hernaiz vs Randy Dobnak
+       Category: MISSED (low prob)
+       Model Prob: 4.4%
+       Exit Velo: 101.1 mph
+       Barrel Rate: 100.0%
+
+   [73] Isaac Paredes vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 14.0%
+       Exit Velo: 88.5 mph
+       Barrel Rate: 33.3%
+
+   [74] Nick Allen vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 10.9%
+       Exit Velo: 88.4 mph
+       Barrel Rate: 25.0%
+
+   [75] Cam Smith vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 11.9%
+       Exit Velo: 77.0 mph
+       Barrel Rate: 0.0%
+
+   [76] Daulton Varsho vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 11.5%
+       Exit Velo: 85.5 mph
+       Barrel Rate: 0.0%
+
+   [77] Jose Altuve vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 11.9%
+       Exit Velo: 94.7 mph
+       Barrel Rate: 0.0%
+
+   [78] Taylor Trammell vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 17.4%
+       Exit Velo: 76.1 mph
+       Barrel Rate: 0.0%
+
+   [79] Jeremy Pe├▒a vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 10.1%
+       Exit Velo: 85.4 mph
+       Barrel Rate: 25.0%
+       Pitcher HR Rate: 7.1%
+
+   [80] LaMonte Wade Jr. vs Grayson Rodriguez
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.3%
+       Exit Velo: 79.1 mph
+       Barrel Rate: 0.0%
+
+   [81] Christian Walker vs Grayson Rodriguez
+       Category: PREDICTED
+       Model Prob: 14.9%
+       Exit Velo: 79.2 mph
+       Barrel Rate: 0.0%
+
+   [82] Adam Frazier vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 20.4%
+       Exit Velo: 92.2 mph
+       Barrel Rate: 50.0%
+
+   [83] Oswald Peraza vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 17.2%
+       Exit Velo: 88.0 mph
+       Barrel Rate: 33.3%
+
+   [84] Jose Siri vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 21.5%
+       Exit Velo: 95.6 mph
+       Barrel Rate: 50.0%
+
+   [85] Zach Neto vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 27.6%
+       Exit Velo: 88.1 mph
+       Barrel Rate: 42.9%
+
+   [86] Travis d'Arnaud vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 10.4%
+       Exit Velo: 83.7 mph
+       Barrel Rate: 0.0%
+
+   [87] Mike Trout vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 26.8%
+       Exit Velo: 84.9 mph
+       Barrel Rate: 33.3%
+
+   [88] Mois├⌐s Ballesteros vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 21.3%
+       Exit Velo: 87.5 mph
+       Barrel Rate: 50.0%
+
+   [89] Denzer Guzman vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 18.9%
+       Exit Velo: 86.9 mph
+       Barrel Rate: 20.0%
+
+   [90] Vaughn Grissom vs Peter Lambert
+       Category: PREDICTED
+       Model Prob: 26.6%
+       Exit Velo: 93.5 mph
+       Barrel Rate: 50.0%
+
+   [91] Steven Kwan vs Landen Roupp
+       Category: PREDICTED
+       Model Prob: 11.2%
+       Exit Velo: 71.4 mph
+       Barrel Rate: 0.0%
+
+   [92] Jo Adell vs Landen Roupp
+       Category: PREDICTED
+       Model Prob: 17.8%
+       Exit Velo: 96.5 mph
+       Barrel Rate: 57.1%
+
+   [93] Jos├⌐ Ram├¡rez vs Landen Roupp
+       Category: PREDICTED
+       Model Prob: 12.1%
+       Exit Velo: 94.4 mph
+       Barrel Rate: 0.0%
+
+   [94] Nathaniel Lowe vs Landen Roupp
+       Category: PREDICTED
+       Model Prob: 13.0%
+       Exit Velo: 87.4 mph
+       Barrel Rate: 0.0%
+
+   [95] Angel Genao vs Landen Roupp
+       Category: MISSED (low prob)
+       Model Prob: 4.9%
+       Exit Velo: 97.0 mph
+       Barrel Rate: 50.0%
+
+   [96] Angel Mart├¡nez vs Landen Roupp
+       Category: PREDICTED
+       Model Prob: 11.3%
+       Exit Velo: 88.4 mph
+       Barrel Rate: 0.0%
+
+   [97] Patrick Bailey vs Landen Roupp
+       Category: MISSED (near hit threshold)
+       Model Prob: 6.0%
+       Exit Velo: 89.6 mph
+       Barrel Rate: 20.0%
+
+   [98] Petey Halpin vs Landen Roupp
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.9%
+       Exit Velo: 82.8 mph
+       Barrel Rate: 0.0%
+
+   [99] Brayan Rocchio vs Landen Roupp
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.5%
+       Exit Velo: 81.0 mph
+       Barrel Rate: 0.0%
+
+   [100] Andrew Knizner vs Gavin Williams
+       Category: PREDICTED
+       Model Prob: 48.5%
+       Exit Velo: 81.4 mph
+       Barrel Rate: 0.0%
+
+   [101] Rafael Devers vs Gavin Williams
+       Category: PREDICTED
+       Model Prob: 59.4%
+       Exit Velo: 94.2 mph
+       Barrel Rate: 0.0%
+
+   [102] Willy Adames vs Gavin Williams
+       Category: PREDICTED
+       Model Prob: 50.3%
+       Exit Velo: 84.2 mph
+       Barrel Rate: 33.3%
+       Pitcher HR Rate: 9.1%
+
+   [103] Bryce Eldridge vs Gavin Williams
+       Category: PREDICTED
+       Model Prob: 17.0%
+       Exit Velo: 90.7 mph
+       Barrel Rate: 66.7%
+
+   [104] Jung Hoo Lee vs Gavin Williams
+       Category: PREDICTED
+       Model Prob: 40.1%
+       Exit Velo: 84.6 mph
+       Barrel Rate: 0.0%
+
+   [105] Osleivis Basabe vs Gavin Williams
+       Category: PREDICTED
+       Model Prob: 83.9%
+       Exit Velo: 99.3 mph
+       Barrel Rate: 100.0%
+
+   [106] Victor Bericoto vs Gavin Williams
+       Category: MISSED (near hit threshold)
+       Model Prob: 7.6%
+       Exit Velo: 94.8 mph
+       Barrel Rate: 20.0%
+
+   [107] Jonah Cox vs Gavin Williams
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.1%
+       Exit Velo: 79.8 mph
+       Barrel Rate: 0.0%
+
+   [108] Christian Koss vs Gavin Williams
+       Category: PREDICTED
+       Model Prob: 16.9%
+       Exit Velo: 72.1 mph
+       Barrel Rate: 0.0%
+
+   [109] Elly De La Cruz vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 38.0%
+       Exit Velo: 85.7 mph
+       Barrel Rate: 40.0%
+
+   [110] Sal Stewart vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 75.4%
+       Exit Velo: 92.4 mph
+       Barrel Rate: 0.0%
+
+   [111] JJ Bleday vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 64.1%
+       Exit Velo: 78.1 mph
+       Barrel Rate: 0.0%
+
+   [112] Tyler Stephenson vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 68.4%
+       Exit Velo: 93.1 mph
+       Barrel Rate: 0.0%
+
+   [113] Matt McLain vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 52.0%
+       Exit Velo: 84.0 mph
+       Barrel Rate: 33.3%
+
+   [114] Michael Toglia vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 9.4%
+       Exit Velo: 84.6 mph
+       Barrel Rate: 33.3%
+
+   [115] Dane Myers vs Michael McGreevy
+       Category: MISSED (near hit threshold)
+       Model Prob: 7.5%
+       Exit Velo: 90.0 mph
+       Barrel Rate: 0.0%
+
+   [116] TJ Friedl vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 26.9%
+       Exit Velo: 89.8 mph
+       Barrel Rate: 50.0%
+
+   [117] Ke'Bryan Hayes vs Michael McGreevy
+       Category: PREDICTED
+       Model Prob: 24.7%
+       Exit Velo: 92.0 mph
+       Barrel Rate: 50.0%
+
+   [118] JJ Wetherholt vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 59.0%
+       Exit Velo: 91.1 mph
+       Barrel Rate: 33.3%
+
+   [119] Iv├ín Herrera vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 75.2%
+       Exit Velo: 85.7 mph
+       Barrel Rate: 14.3%
+
+   [120] Alec Burleson vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 85.3%
+       Exit Velo: 90.4 mph
+       Barrel Rate: 0.0%
+
+   [121] Jordan Walker vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 74.3%
+       Exit Velo: 97.8 mph
+       Barrel Rate: 75.0%
+       Pitcher HR Rate: 8.3%
+
+   [122] Joshua B├íez vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 27.2%
+       Exit Velo: 81.1 mph
+       Barrel Rate: 0.0%
+
+   [123] Jos├⌐ Ferm├¡n vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 8.8%
+       Exit Velo: 90.3 mph
+       Barrel Rate: 25.0%
+
+   [124] Masyn Winn vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 32.1%
+       Exit Velo: 83.6 mph
+       Barrel Rate: 0.0%
+
+   [125] Blaze Jordan vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 9.9%
+       Exit Velo: 90.0 mph
+       Barrel Rate: 40.0%
+
+   [126] Everson Pereira vs Brady Singer
+       Category: PREDICTED
+       Model Prob: 22.8%
+       Exit Velo: 88.9 mph
+       Barrel Rate: 0.0%
+
+   [127] Sam Antonacci vs Grant Holmes
+       Category: PREDICTED
+       Model Prob: 14.1%
+       Exit Velo: 88.3 mph
+       Barrel Rate: 0.0%
+
+   [128] Munetaka Murakami vs Grant Holmes
+       Category: PREDICTED
+       Model Prob: 28.1%
+       Exit Velo: 92.6 mph
+       Barrel Rate: 33.3%
+
+   [129] Miguel Vargas vs Grant Holmes
+       Category: PREDICTED
+       Model Prob: 22.0%
+       Exit Velo: 85.6 mph
+       Barrel Rate: 25.0%
+
+   [130] Andrew Benintendi vs Grant Holmes
+       Category: PREDICTED
+       Model Prob: 26.5%
+       Exit Velo: 103.5 mph
+       Barrel Rate: 100.0%
+
+   [131] Braden Montgomery vs Grant Holmes
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.3%
+       Exit Velo: 87.1 mph
+       Barrel Rate: 33.3%
+
+   [132] Colson Montgomery vs Grant Holmes
+       Category: PREDICTED
+       Model Prob: 15.0%
+       Exit Velo: 88.0 mph
+       Barrel Rate: 0.0%
+
+   [133] Chase Meidroth vs Grant Holmes
+       Category: MISSED (near hit threshold)
+       Model Prob: 5.5%
+       Exit Velo: 91.4 mph
+       Barrel Rate: 33.3%
+
+   [134] Tristan Peters vs Grant Holmes
+       Category: PREDICTED
+       Model Prob: 18.6%
+       Exit Velo: 85.5 mph
+       Barrel Rate: 50.0%
+
+   [135] Drew Romo vs Grant Holmes
+       Category: PREDICTED
+       Model Prob: 17.8%
+       Exit Velo: 98.1 mph
+       Barrel Rate: 100.0%
+
+   [136] Ronald Acu├▒a Jr. vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 55.6%
+       Exit Velo: 73.1 mph
+       Barrel Rate: 0.0%
+
+   [137] Drake Baldwin vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 55.4%
+       Exit Velo: 99.2 mph
+       Barrel Rate: 66.7%
+
+   [138] Matt Olson vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 56.3%
+       Exit Velo: 79.9 mph
+       Barrel Rate: 0.0%
+
+   [139] Ozzie Albies vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 49.1%
+       Exit Velo: 83.7 mph
+       Barrel Rate: 0.0%
+
+   [140] Lane Thomas vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 21.7%
+       Exit Velo: 95.1 mph
+       Barrel Rate: 33.3%
+
+   [141] Michael Harris II vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 42.8%
+       Exit Velo: 80.3 mph
+       Barrel Rate: 0.0%
+
+   [142] Mauricio Dub├│n vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 33.7%
+       Exit Velo: 100.8 mph
+       Barrel Rate: 100.0%
+
+   [143] Austin Riley vs Anthony Kay
+       Category: PREDICTED
+       Model Prob: 17.3%
+       Exit Velo: 100.7 mph
+       Barrel Rate: 66.7%
+
+   [144] Sean Murphy vs Anthony Kay
+       Category: MISSED (near hit threshold)
+       Model Prob: 7.8%
+       Exit Velo: 81.1 mph
+       Barrel Rate: 0.0%
+
+   [145] Samuel Basallo vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 55.6%
+       Exit Velo: 86.2 mph
+       Barrel Rate: 50.0%
+
+   [146] Gunnar Henderson vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 60.3%
+       Exit Velo: 81.2 mph
+       Barrel Rate: 0.0%
+
+   [147] Leody Taveras vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 32.4%
+       Exit Velo: 93.7 mph
+       Barrel Rate: 50.0%
+
+   [148] Christian Franklin vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 58.2%
+       Exit Velo: 86.9 mph
+       Barrel Rate: 33.3%
+
+   [149] Dylan Beavers vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 31.9%
+       Exit Velo: 89.1 mph
+       Barrel Rate: 33.3%
+       Pitcher HR Rate: 10.0%
+
+   [150] Tyler O'Neill vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 44.5%
+       Exit Velo: 92.0 mph
+       Barrel Rate: 33.3%
+
+   [151] Yohel Pozo vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 54.3%
+       Exit Velo: 81.6 mph
+       Barrel Rate: 0.0%
+
+   [152] Pete Alonso vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 48.0%
+       Exit Velo: 91.6 mph
+       Barrel Rate: 33.3%
+
+   [153] Jackson Holliday vs Gerrit Cole
+       Category: PREDICTED
+       Model Prob: 37.3%
+       Exit Velo: 81.0 mph
+       Barrel Rate: 0.0%
+
+   [154] Ali S├ínchez vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 12.6%
+       Exit Velo: 90.2 mph
+       Barrel Rate: 25.0%
+       Pitcher HR Rate: 10.0%
+
+   [155] Heliot Ramos vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 28.2%
+       Exit Velo: 83.7 mph
+       Barrel Rate: 20.0%
+
+   [156] Jos├⌐ Caballero vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 23.1%
+       Exit Velo: 84.3 mph
+       Barrel Rate: 0.0%
+
+   [157] Spencer Jones vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 68.6%
+       Exit Velo: 98.2 mph
+       Barrel Rate: 50.0%
+       Pitcher HR Rate: 7.7%
+
+   [158] Amed Rosario vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 9.2%
+       Exit Velo: 86.8 mph
+       Barrel Rate: 14.3%
+       Pitcher HR Rate: 10.0%
+
+   [159] Ryan McMahon vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 11.8%
+       Exit Velo: 87.9 mph
+       Barrel Rate: 0.0%
+       Pitcher HR Rate: 10.0%
+
+   [160] Paul Goldschmidt vs Kyle Bradish
+       Category: MISSED (near hit threshold)
+       Model Prob: 7.7%
+       Exit Velo: 79.5 mph
+       Barrel Rate: 0.0%
+       Pitcher HR Rate: 10.0%
+
+   [161] Austin Wells vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 27.3%
+       Exit Velo: 91.0 mph
+       Barrel Rate: 50.0%
+
+   [162] Ben Rice vs Kyle Bradish
+       Category: PREDICTED
+       Model Prob: 46.9%
+       Exit Velo: 85.9 mph
+       Barrel Rate: 25.0%
+
+======================================================================
+
+Γ£à Learning report saved: data\hr_learning_report_2026-08-20.json
+
+≡ƒÜÇ Extracting feedback weights for model retraining...
+   ΓÇó 162 matchups flagged for weight adjustment
+
+Γ£à Learning Complete: 162 HRs analyzed
+   ΓÇó Model accuracy: 140/162 predicted
+   ΓÇó Missed predictions: 22 (will upweight in training)
+
+======================================================================
+PHASE 0.5: VERIFYING LINEUPS FROM BASEBALL SAVANT
+======================================================================
+
+======================================================================
+≡ƒîà MORNING LINEUP CHECK ΓÇö Verifying all today's lineups
+======================================================================
+Found 15 games today.
+
+  Game 823746: Atlanta Braves @ Milwaukee Brewers
+    First pitch: 2026-08-21T20:10:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 823420: St. Louis Cardinals @ Philadelphia Phillies
+    First pitch: 2026-08-21T22:40:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 823510: Toronto Blue Jays @ New York Yankees
+    First pitch: 2026-08-21T23:05:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 824721: San Francisco Giants @ Boston Red Sox
+    First pitch: 2026-08-21T23:10:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 823830: Washington Nationals @ Miami Marlins
+    First pitch: 2026-08-21T23:10:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 824800: Tampa Bay Rays @ Baltimore Orioles
+    First pitch: 2026-08-21T23:15:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 824559: New York Mets @ Chicago White Sox
+    First pitch: 2026-08-21T23:40:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 824072: Detroit Tigers @ Kansas City Royals
+    First pitch: 2026-08-22T00:10:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 824152: Athletics @ Houston Astros
+    First pitch: 2026-08-22T00:10:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 822857: Los Angeles Angels @ Texas Rangers
+    First pitch: 2026-08-22T00:15:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 824317: Cleveland Guardians @ Colorado Rockies
+    First pitch: 2026-08-22T00:40:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 825045: Cincinnati Reds @ Arizona Diamondbacks
+    First pitch: 2026-08-22T01:40:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 823262: Minnesota Twins @ San Diego Padres
+    First pitch: 2026-08-22T01:40:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 823911: Pittsburgh Pirates @ Los Angeles Dodgers
+    First pitch: 2026-08-22T02:10:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+  Game 823101: Chicago Cubs @ Seattle Mariners
+    First pitch: 2026-08-22T02:10:00Z
+    Away lineup: 9 batters confirmed
+    Home lineup: 9 batters confirmed
+
+Γ£ô Lineup report saved: data\lineup_report_2026-08-21_morning_check.json
+
+Γ£à Lineup verification complete: 15 games confirmed
+   ΓÇó All lineups from Baseball Savant verified
+   ΓÇó Report saved for prediction matching
+
+======================================================================
+PHASE 1: LOADING TRAINING DATA
+======================================================================
+Loading historical metrics from cache and Baseball Savant (last 14 days)...
+Γ£à Loaded 14 days from cache, fetched 0 days from Baseball Savant
+  Historical 2025: capped to 200,000 rows for speed
+  Historical 2025: 200,000 rows loaded from cache
+  Historical 2026: capped to 200,000 rows for speed
+  Historical 2026: 200,000 rows loaded from cache
+Γ£à Historical seasons 2025-2026: 400,000 total rows loaded
+Γ£à Combined dataset: 66,055 rows (recent + 400,000 historical after dedup)
+Historical weather enrichment: rows=13119, keys=470/539, cache_hits=470, fetched=0
+Γ£à Training data loaded: 30959 plate appearances (smoke_test=True)
+Historical matchup pool rows: 637,012 (lookback_days=365)
+Rolling training window: days=365, kept=28,987, dropped=1,972, cutoff=2025-08-20
+Evaluation guardrail: 2026-08-20 ready (rows=162, source=existing)
+Adaptive thresholds: miss<0.080, false_pos>0.200, skeptical<0.030, confident>0.150; deduped_rows=21
+Feedback matching diagnostics: rows=7516, matched=7282, unmatched=234, id_matches=4723, name_matches=0, id_and_game=4097, id_fallback_from_game=3185, skipped_nonpositive_non_hr=0
+Γ£à Asymmetric learning: 6338 heavily upweighted (FAILURES), 16311 penalized (FALSE CONFIDENCE)
+Mini-batch recency weights: days=7, multiplier=1.20, boosted_rows=4,005
+Feedback weights loaded ΓÇö 10614 training rows upweighted from past misses and physical leverage signals.
+Closed-loop backprop updated coefficients: temp=0.880, wind=0.961, spin=1.200, fatigue=1.200 (samples=124)
+H2H raw features disabled; using reliability-aware matchup context only.
+QUALITY_ONLY_STATCAST_MODE=true -> removed direct HR-count/rate features from training.
+Prior correction rates: real_pos_rate=0.03426, sampled_pos_rate=0.03426
+Class imbalance control (fit set): positive=993, negative=27994, raw_scale_pos_weight=28.19, multiplier=0.30, scale_pos_weight=8.46
+Linear models disabled: ENSEMBLE_INCLUDE_LINEAR_MODELS=false
+MLP model disabled: ENSEMBLE_INCLUDE_MLP_MODEL=false
+Ensemble base models trained: XGBoost, LightGBM, RandomForest
+Ensemble weights (fit-set fallback):
+  XGBoost                      logloss=0.20272 weight=0.423
+  LightGBM                     logloss=0.20368 weight=0.421
+  RandomForest                 logloss=0.42421 weight=0.156
+Training probability metrics: log_loss=0.2321, brier=0.0614
+
+Top 10 Feature Importances:
+  lineup_slot_pressure_score               0.0881
+  arsenal_vulnerability_score              0.0806
+  hot_streak_contact_score                 0.0405
+  pitch_barrel_allowed_rate                0.0241
+  ppci_dominance_score                     0.0208
+  pitch_arsenal_matchup_score              0.0175
+  split_advantage_score                    0.0167
+  pitch_30pa_barrel_allowed_rate           0.0163
+  batter_in_park_reliability               0.0162
+  pitch_pa_count                           0.0158
+Schedule: 15 games for 2026-08-21
+Pregame pitch-mix vulnerability proxy: pitchers_flagged=0/610
+ΓÜá∩╕Å Live scoring fail-closed: invalid rows due to missing source fields:
+  - row 1: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 2: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 3: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 4: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 5: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 6: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 7: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 8: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 9: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  - row 10: ['arsenal_vulnerability_score', 'ballpark_park_factor', 'breaking_pitch_vulnerability', 'bullpen_quality_score_away', 'bullpen_quality_score_home', 'death_valley_penalty', 'density_altitude_factor', 'dynamic_matchup_grade', 'flyball_pitcher_target_score', 'game_total_context_score', 'hot_streak_contact_score', 'is_elite_power_batter', 'left_on_right_fade_score', 'lineup_grab_window_score', 'lineup_slot_pressure_score', 'micro_weather_score', 'opp_bullpen_xfip_degradation', 'pitch_arsenal_matchup_score', 'pitcher_fear_factor', 'platoon_advantage_multiplier', 'porch_advantage_bonus', 'ppci_dominance_score', 'reverse_split_anomaly_score', 'split_advantage_score', 'sportsbook_value_score', 'umpire_called_strike_percentage', 'umpire_runs_created_per_game', 'umpire_strike_to_ball_ratio', 'umpire_strike_zone_impact', 'weather_extremes_multiplier', 'weather_hr_impact_score', 'weather_hr_penalty_score', 'would_be_hr_differential']
+  ... and 26 more rows
+No valid live rows remain after fail-closed source validation.
+Strict conservative filters returned no rows; falling back to a broader model-driven shortlist.
+Top raw HR candidates before fallback filter relaxation:
+      batter_name pitcher_name  pred_hr_prob model_reliability     weather_source  weather_is_fallback game_time
+    Justin Foscue Reid Detmers      0.067891            MEDIUM open-meteo-current                    0   8:15 PM
+     Corey Seager Reid Detmers      0.067366            MEDIUM open-meteo-current                    0   8:15 PM
+       Brett Baty   Sean Burke      0.066562              HIGH open-meteo-current                    0   7:40 PM
+  Luis Robert Jr.   Sean Burke      0.066562            MEDIUM open-meteo-current                    0   7:40 PM
+     Carson Benge   Sean Burke      0.066562              HIGH open-meteo-current                    0   7:40 PM
+ Francisco Lindor   Sean Burke      0.066562              HIGH open-meteo-current                    0   7:40 PM
+       A.J. Ewing   Sean Burke      0.066562              HIGH open-meteo-current                    0   7:40 PM
+Francisco Alvarez   Sean Burke      0.066562              HIGH open-meteo-current                    0   7:40 PM
+     Owen Caissie    Brad Lord      0.066557              HIGH open-meteo-current                    0   7:10 PM
+    Brandon Nimmo Reid Detmers      0.066544              HIGH open-meteo-current                    0   8:15 PM
+
+CONSERVATIVE BET-READY SHORTLIST:
+ game_pk game_time  batter    batter_name  pitcher   pitcher_name  has_platoon_advantage  park_factor  temp  apparent_temp  dew_point  wind_speed  wind_gust  wind_out_component  humidity  precipitation  pressure  cloud_cover     weather_source  weather_is_fallback  weather_hr_impact_score  weather_hr_penalty_score  pred_hr_prob  model_p_capped  edge_pct  kelly_fraction  ev_value  ev_percent  projected_pas  pa_distribution_std     pa_conversion_method  kelly_multiplier  ensemble_raw_prob  ensemble_prior_corrected_prob  pre_sidecar_prob  base_model_prob  physics_delta  blend_weight_physics probability_mode  physics_uplift_cap  reliability_prob_cap  sharp_book  sharp_market_odds_american  sharp_market_implied_prob retail_book  retail_market_odds_american  retail_market_implied_prob  sharp_retail_odds_gap  sharp_retail_implied_gap  adaptive_feedback_multiplier  pitcher_fear_factor  pitcher_intent_suppression  is_elite_power_batter  optimist_score  pessimist_score  debate_rounds  optimist_wins  pessimist_wins  adversarial_margin  adversarial_multiplier  stacked_boost_multiplier_raw  stacked_boost_multiplier_cap  stacked_boost_multiplier_final  best_book  best_market_odds_american  best_market_implied_prob  market_prob  ev_market_prob  market_edge_pct  no_hr_best_book  no_hr_best_market_odds_american  no_hr_market_prob  no_hr_model_prob  no_hr_fair_odds_american  no_hr_ev_value  no_hr_ev_percent  no_hr_kelly_fraction  no_hr_has_market_odds  fair_odds_american  prob_edge_abs  elite_ev_signal  arbitrage_value_pct  book_prob_dispersion  matched_book_count  positive_ev_arbitrage  arbitrage_score  release_window_sniper_signal  line_release_window_flag  nrfi_under_drag_score  physics_hr_prob  physics_per_pa_hr_prob  density_altitude_ft  air_density_kg_m3  drag_multiplier  pitch_micro_matchup_score  pitch_arsenal_matchup_score  pitch_physics_pressure_score  pitch_vaa_pressure_score  pitch_ssw_proxy  vaa_attack_angle_score  umpire_catcher_cascade  umpire_zone_drift_score  umpire_hotzone_overlap  umpire_tight_zone_score  umpire_zone_bias_multiplier  catcher_liability_score  catcher_liability_multiplier  climate_micro_movement_multiplier  fatigue_index  circadian_disruption_index  visual_fatigue_modifier  travel_distance_miles  rest_day_count  ballistic_hr_proxy_prob  ballistic_carry_distance_ft  ballistic_barrier_distance_ft  ballistic_carry_gap_ft  ballistic_multiplier  spin_decay_rpm  spin_decay_flag  release_pos_x_std_15  release_pos_z_std_15  release_extension_decay_ft  spin_velocity_ratio_decay  primary_weapon_vulnerable_pitch_count  recent_batter_woba_proxy  recent_pitcher_damage_proxy  bullpen_exposure_multiplier  lineup_protection_woba_proxy  context_multiplier  recent_calibration_multiplier  recent_calibration_ratio_raw  recent_calibration_pred_mean  recent_calibration_actual_mean  pitcher_damage_boost  daily_anchor_scale  daily_anchor_target_mean  daily_anchor_pre_mean  daily_anchor_post_mean  daily_anchor_final_cap  overconfidence_guardrail_applied  overconfidence_guardrail_multiplier  overconfidence_guardrail_dynamic_cap  sidecar_online_prob  sidecar_blend_applied  sidecar_blend_weight  sidecar_max_delta  sidecar_update_count  sidecar_training_applied  sidecar_training_update_count  confidence_lower_95pct  confidence_upper_95pct model_reliability  batter_consistency_score                    model_name       prediction_timestamp  is_positive_ev_bool  has_market_odds  odds_in_sanity_range  conservative_score  stake_usd  actionability_score
+  823911  10:10 PM  571970      Max Muncy   696149 Bubba Chandler                      0        100.0  88.0           72.0       55.0         8.2        0.0               -3.59      48.0            0.0    1012.6         50.0 open-meteo-current                    0                 0.982979                      0.00      0.040015        0.040015     304.2         0.01366  3.041515    304.1515           4.34                  0.7 poisson_weighted_pa_dist              0.75           0.105696                            NaN          0.097935         0.119613      -0.007761                  0.55          blended                0.13                  0.34         NaN                         NaN                        NaN     fanduel                      10000.0                    0.009901                    NaN                       NaN                      0.934189             0.646928                         1.0                    0.0        0.214455         1.484222         5000.0         1096.0          3904.0             -0.5616                0.876448                      0.818768                          1.70                        0.818768    fanduel                    10000.0                  0.009901     0.009901        0.009901        60.228020              NaN                              NaN                NaN          0.959985                     -2399             0.0               0.0                   0.0                  False                2399       0.030114            False            92.637803              0.249166                 2.0                    0.0       184.950691                         False                         0                    0.0         0.119613                     0.0                  0.0              1.225              1.0                        1.0                     0.949528                           0.5                       0.5              0.0                     1.0                     1.0                      1.0                     0.0                      0.5                          1.0                      0.0                           1.0                                1.0            0.0                         0.0                      1.0                    0.0             1.0                      0.0                          0.0                          370.0                     0.0                   1.0             0.0              0.0                   0.0                   0.0                         0.0                        0.0                                    0.0                  0.031896                     0.000000                          1.0                           0.1                 1.0                           0.25                      0.097654                      0.067727                        0.006614                   1.0            1.067479                  0.040643               0.037808                0.040359                     0.4                                 1                             0.805898                              0.158606                  NaN                      0                   0.0                0.0                     0                         0                              0                0.017042                0.078514            MEDIUM                  0.140766 XGBoost+LightGBM+RandomForest 2026-08-21T19:49:37.047970                 True             True                 False          457.617494        5.0           159.167156
+  823830   7:10 PM  669364 Xavier Edwards   695418      Brad Lord                      0        100.0  82.7           72.0       55.0         5.1        0.0               -3.85      75.0            0.0    1016.8         50.0 open-meteo-current                    0                 0.980750                      0.00      0.062739        0.062739      75.7         0.02100  0.756692     75.6692           4.34                  0.7 poisson_weighted_pa_dist              0.75           0.284887                            NaN          0.272632         0.297404      -0.012255                  0.55          blended                0.10                  0.45         NaN                         NaN                        NaN     fanduel                       2700.0                    0.035714                    NaN                       NaN                      0.961020             0.000000                         1.0                    0.0       -0.894650        -0.469219         5000.0         1976.0          3024.0             -0.2096                0.953888                      0.916705                          1.48                        0.916705    fanduel                     2700.0                  0.035714     0.035714        0.035714        54.049429              NaN                              NaN                NaN          0.937261                     -1494             0.0               0.0                   0.0                  False                1494       0.027025            False             0.000000              0.000000                 1.0                    0.0        38.239971                         False                         0                    0.0         0.297404                     0.0                  0.0              1.225              1.0                        1.0                     0.937597                           0.5                       0.5              0.0                     1.0                     1.0                      1.0                     0.0                      0.5                          1.0                      0.0                           1.0                                1.0            0.0                         0.0                      1.0                    0.0             1.0                      0.0                          0.0                          370.0                     0.0                   1.0             0.0              0.0                   0.0                   0.0                         0.0                        0.0                                    0.0                  0.042821                     0.000000                          1.0                           0.1                 1.0                           0.25                      0.097654                      0.067727                        0.006614                   1.0            1.067479                  0.040643               0.037808                0.040359                     0.4                                 1                             0.805898                              0.158606                  NaN                      0                   0.0                0.0                     0                         0                              0                0.040273                0.109727              HIGH                  0.500000 XGBoost+LightGBM+RandomForest 2026-08-21T19:49:37.047970                 True             True                 False          115.619200        5.0            49.528274
+  824072   8:10 PM  650402 Gleyber Torres   702070   Noah Cameron                      0         96.0  84.3           72.0       55.0         9.5        0.0                1.12      47.0            0.3    1014.3         50.0 open-meteo-current                    0                 0.969500                      0.24      0.061697        0.061697      23.4         0.00920  0.233940     23.3940           4.75                  0.7 poisson_weighted_pa_dist              0.75           0.412001                            NaN          0.196837         0.364348      -0.215164                  0.55          blended                0.07                  0.45         NaN                         NaN                        NaN  draftkings                       1900.0                    0.050000                    NaN                       NaN                      0.950508             0.000000                         1.0                    0.0       -0.937735        -0.449043         5000.0         1901.0          3099.0             -0.2396                0.947288                      0.900405                          1.32                        0.900405 draftkings                     1900.0                  0.050000     0.050000        0.050000        23.394000              NaN                              NaN                NaN          0.938303                     -1521             0.0               0.0                   0.0                  False                1521       0.011697            False            40.350877              0.067647                 2.0                    0.0        25.995262                         False                         0                    0.0         0.364348                     0.0                  0.0              1.225              1.0                        1.0                     0.968551                           0.5                       0.5              0.0                     1.0                     1.0                      1.0                     0.0                      0.5                          1.0                      0.0                           1.0                                1.0            0.0                         0.0                      1.0                    0.0             1.0                      0.0                          0.0                          370.0                     0.0                   1.0             0.0              0.0                   0.0                   0.0                         0.0                        0.0                                    0.0                  0.061318                     0.015873                          1.0                           0.1                 1.0                           0.25                      0.097654                      0.067727                        0.006614                   0.6            1.067479                  0.040643               0.037808                0.040359                     0.4                                 1                             0.805898                              0.158606                  NaN                      0                   0.0                0.0                     0                         0                              0                0.037548                0.112452              HIGH                  0.140419 XGBoost+LightGBM+RandomForest 2026-08-21T19:49:37.047970                 True             True                 False           36.014000        5.0            23.141570
+Saved conservative shortlist: data\conservative_bet_ready_2026-08-21.csv
+No single-straight discrepancy shortlist: no rows passed discrepancy filters.
+
+======================================================================
+PRE-GAME LINEUP CHECK ΓÇö Confirming final lineups before games
+======================================================================
+
+======================================================================
+ΓÜ╛ PRE-GAME LINEUP CHECK ΓÇö Confirming final lineups before games
+======================================================================
+
+  Game 823746: Atlanta Braves @ Milwaukee Brewers
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Ronald Acu├▒a Jr. (RF)
+      2. Drake Baldwin (C)
+      3. Matt Olson (1B)
+      4. Michael Harris II (CF)
+      5. Ozzie Albies (2B)
+      6. Mauricio Dub├│n (SS)
+      7. Dominic Smith (DH)
+      8. Austin Riley (3B)
+      9. Mike Yastrzemski (LF)
+
+  Game 823420: St. Louis Cardinals @ Philadelphia Phillies
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. JJ Wetherholt (2B)
+      2. Iv├ín Herrera (DH)
+      3. Jordan Walker (RF)
+      4. Joshua B├íez (LF)
+      5. Alec Burleson (1B)
+      6. Blaze Jordan (3B)
+      7. Jos├⌐ Ferm├¡n (CF)
+      8. Everson Pereira (CF)
+      9. Masyn Winn (SS)
+
+  Game 823510: Toronto Blue Jays @ New York Yankees
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Brett Bateman (CF)
+      2. Nathan Lukes (RF)
+      3. George Springer (PH)
+      4. Davis Schneider (LF)
+      5. Alejandro Kirk (C)
+      6. Jes├║s S├ínchez (DH)
+      7. Ernie Clement (SS)
+      8. Kazuma Okamoto (3B)
+      9. Brandon Valenzuela (1B)
+
+  Game 824721: San Francisco Giants @ Boston Red Sox
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Drew Gilbert (CF)
+      2. Jonah Cox (CF)
+      3. Rafael Devers (DH)
+      4. Willy Adames (SS)
+      5. Bryce Eldridge (1B)
+      6. Jung Hoo Lee (RF)
+      7. Osleivis Basabe (2B)
+      8. Turner Hill (LF)
+      9. Victor Bericoto (PH)
+
+  Game 823830: Washington Nationals @ Miami Marlins
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Daylen Lile (LF)
+      2. Jorbit Vivas (2B)
+      3. Andr├⌐s Chaparro (DH)
+      4. Abimelec Ortiz (1B)
+      5. Brady House (3B)
+      6. Keibert Ruiz (C)
+      7. Dylan Crews (RF)
+      8. Nasim Nu├▒ez (SS)
+      9. Jos├⌐ Tena (SS)
+
+  Game 824800: Tampa Bay Rays @ Baltimore Orioles
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Yandy D├¡az (DH)
+      2. Ryan Vilade (RF)
+      3. Jonny DeLuca (CF)
+      4. Jonathan Aranda (1B)
+      5. Junior Caminero (3B)
+      6. Chandler Simpson (LF)
+      7. Jorge Mateo (2B)
+      8. Kenny Piper (C)
+      9. Cedric Mullins (CF)
+
+  Game 824559: New York Mets @ Chicago White Sox
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. A.J. Ewing (CF)
+      2. Francisco Lindor (SS)
+      3. Bo Bichette (DH)
+      4. Carson Benge (RF)
+      5. Jared Young (1B)
+      6. Luis Robert Jr. (LF)
+      7. Brett Baty (3B)
+      8. Marcus Semien (2B)
+      9. Francisco Alvarez (C)
+
+  Game 824072: Detroit Tigers @ Kansas City Royals
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Gleyber Torres (2B)
+      2. Hao-Yu Lee (3B)
+      3. Zach McKinstry (RF)
+      4. Kevin McGonigle (3B)
+      5. Dillon Dingler (C)
+      6. Eduardo Valencia (DH)
+      7. Colt Keith (DH)
+      8. Spencer Torkelson (1B)
+      9. Ben Malgeri (RF)
+
+  Game 824152: Athletics @ Houston Astros
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Henry Bolte (CF)
+      2. Jeff McNeil (1B)
+      3. Zack Gelof (LF)
+      4. Carlos Cortes (LF)
+      5. Alika Williams (SS)
+      6. Lawrence Butler (RF)
+      7. Tommy White (3B)
+      8. Jonah Heim (C)
+      9. Donovan Walton (2B)
+
+  Game 822857: Los Angeles Angels @ Texas Rangers
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Zach Neto (SS)
+      2. Mike Trout (CF)
+      3. Mois├⌐s Ballesteros (DH)
+      4. Vaughn Grissom (1B)
+      5. Jose Siri (LF)
+      6. Denzer Guzman (3B)
+      7. Josh Lowe (RF)
+      8. Travis d'Arnaud (C)
+      9. Adam Frazier (PR)
+
+  Game 824317: Cleveland Guardians @ Colorado Rockies
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Steven Kwan (LF)
+      2. Chase DeLauter (RF)
+      3. Angel Mart├¡nez (RF)
+      4. Jos├⌐ Ram├¡rez (3B)
+      5. Jo Adell (DH)
+      6. Nathaniel Lowe (1B)
+      7. Angel Genao (SS)
+      8. Travis Bazzana (2B)
+      9. Patrick Bailey (C)
+
+  Game 825045: Cincinnati Reds @ Arizona Diamondbacks
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Elly De La Cruz (SS)
+      2. Sal Stewart (1B)
+      3. Dane Myers (CF)
+      4. Eugenio Su├írez (DH)
+      5. Matt McLain (2B)
+      6. JJ Bleday (RF)
+      7. Jose Trevino (C)
+      8. Michael Toglia (LF)
+      9. TJ Friedl (LF)
+
+  Game 823262: Minnesota Twins @ San Diego Padres
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Luke Keaschall (RF)
+      2. Byron Buxton (CF)
+      3. Josh Bell (DH)
+      4. Ryan Jeffers (C)
+      5. Kody Clemens (2B)
+      6. Royce Lewis (1B)
+      7. Trevor Larnach (LF)
+      8. Brooks Lee (3B)
+      9. Kaelen Culpepper (SS)
+
+  Game 823911: Pittsburgh Pirates @ Los Angeles Dodgers
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Spencer Horwitz (1B)
+      2. Brandon Lowe (2B)
+      3. Bryan Reynolds (LF)
+      4. Nick Gonzales (DH)
+      5. Oneil Cruz (CF)
+      6. Rafael Flores Jr. (C)
+      7. Jake Mangum (RF)
+      8. Jacob Gonzalez (SS)
+      9. Jared Triolo (3B)
+
+  Game 823101: Chicago Cubs @ Seattle Mariners
+    Γ£ô Away lineup: 9 batters
+    Γ£ô Home lineup: 9 batters
+      1. Pete Crow-Armstrong (CF)
+      2. Seiya Suzuki (RF)
+      3. Michael Busch (1B)
+      4. Alex Bregman (3B)
+      5. Ian Happ (LF)
+      6. Nico Hoerner (SS)
+      7. Pedro Ram├¡rez (2B)
+      8. Michael Conforto (DH)
+      9. Carson Kelly (C)
+
+Γ£ô Lineup report saved: data\lineup_report_2026-08-21_pregame_check.json
+
+Γ£à Pre-game lineup check complete: 15 games verified
+
+≡ƒôí Ensuring live home run monitor is running in background...
+Γ£à Live monitor launched in background (PID 23204). Log: data\live_monitor.log
+≡ƒôê RLM line-movement monitor already running today.
